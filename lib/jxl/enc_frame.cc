@@ -109,6 +109,10 @@ Status ParamsPostInit(CompressParams* p) {
       // TODO(Jonnyawsom3): Explore 4x4 resampling at distance 25. Lower bpp
       // but results are inconsistent and images under 4K become far too blurry.
       p->resampling = 2;
+      // Modular seems to do better at such high distances.
+      // TODO(Jonnyawsom3): VarDCT may need re-tuning towards v0.8 to regain
+      // low quality range performance.
+      if (p->butteraugli_distance >= 20) cparams.modular_mode;
       // Adding 0.25 balances photo with non-photo, shifting towards lower bpp
       // to avoid large overshoot while maintaining quality equal to before.
       p->butteraugli_distance = (p->butteraugli_distance * 0.25) + 0.25;

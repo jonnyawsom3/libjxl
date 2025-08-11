@@ -1795,7 +1795,12 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
                              "Option value has to be in [-1..11]");
       }
       if (value == -1) {
-        frame_settings->values.cparams.options.max_properties = 0;
+        if (frame_settings->values.cparams.speed_tier < SpeedTier::kTortoise &&
+          frame_settings->values.cparams.decoding_speed_tier == 0) {
+          frame_settings->values.cparams.options.max_properties = 1;
+        } else {
+          frame_settings->values.cparams.options.max_properties = 0;
+        }
       } else {
         frame_settings->values.cparams.options.max_properties = value;
       }

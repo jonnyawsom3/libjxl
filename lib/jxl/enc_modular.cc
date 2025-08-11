@@ -565,6 +565,8 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
         cparams_.options.max_property_values = 96;
         break;
       case SpeedTier::kGlacier:
+        // max_properties is increased to 1 when faster decoding is disabled
+        // in lib/jxl/encode.cc#L1798
       case SpeedTier::kTortoise:
         cparams_.options.splitting_heuristics_properties = prop_order;
         cparams_.options.max_property_values = 256;

@@ -1645,8 +1645,8 @@ Status ComputeEncodingData(
     // If checks pass here, a Global MA tree is used.
     if (cparams.speed_tier < SpeedTier::kTortoise ||
         !cparams.ModularPartIsLossless() || cparams.lossy_palette ||
-        (cparams.responsive == 1 && !cparams.IsLossless()) ||
         // Allow Local trees for progressive lossless but not lossy.
+        (cparams.responsive == 1 && !cparams.IsLossless()) ||
         (cparams.buffering && cparams.responsive < 0) ||
         !cparams.custom_fixed_tree.empty()) {
       // Use local trees if doing lossless modular, unless at very slow speeds.

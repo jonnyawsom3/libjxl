@@ -1796,7 +1796,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       }
       if (value == -1) {
         if (frame_settings->values.cparams.speed_tier < SpeedTier::kTortoise &&
-          frame_settings->values.cparams.decoding_speed_tier == 0) {
+          frame_settings->values.cparams.decoding_speed_tier < 2) {
           frame_settings->values.cparams.options.max_properties = 1;
         } else {
           frame_settings->values.cparams.options.max_properties = 0;

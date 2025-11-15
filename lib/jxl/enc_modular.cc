@@ -614,17 +614,15 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
 
   if (cparams_.options.predictor == kUndefinedPredictor) {
     // no explicit predictor(s) given, set a good default
-    if ((cparams_.speed_tier <= SpeedTier::kGlacier ||
-         cparams_.modular_mode == false) &&
+    if (cparams_.lossy_palette) {
+      // zero predictor for lossy palette indices
+      cparams_.options.predictor = Predictor::Zero;
+      } else if ((cparams_.speed_tier <= SpeedTier::kGlacier ||
+        cparams_.modular_mode == false) &&
         cparams_.IsLossless() && cparams_.responsive == JXL_FALSE) {
       // TODO(veluca): allow all predictors that don't break residual
       // multipliers in lossy mode.
       cparams_.options.predictor = Predictor::Variable;
-    } else if (cparams_.responsive || cparams_.lossy_palette) {
-      // zero predictor for Squeeze residues and lossy palette indices
-      // TODO: Try adding 'Squeezed' predictor set, with the most
-      // common predictors used by Variable in squeezed images, including none.
-      cparams_.options.predictor = Predictor::Zero;
     } else if (!cparams_.IsLossless()) {
       // If not responsive and lossy. TODO(veluca): use near_lossless instead?
       cparams_.options.predictor = Predictor::Gradient;
@@ -638,9 +636,16 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
       // just gradient predictor in thunder mode
       cparams_.options.predictor = Predictor::Gradient;
     }
-  } else {
-    if (cparams_.lossy_palette) cparams_.options.predictor = Predictor::Zero;
   }
+if (cparams_.responsive && cparams_.IsLossless()) {
+    for (uint32_t i = gi.nb_meta_channels; i < gi.channel.size(); i++) {
+        Channel& ch = gi.channel[i];
+        int shift = ch.hshift + ch.vshift;  // number of pixel halvings
+        if (shift >= 2) {
+            cparams_.options.predictor = Predictor::Zero;
+        }
+    }
+}
   if (!cparams_.ModularPartIsLossless()) {
     if (cparams_.options.predictor == Predictor::Weighted ||
         cparams_.options.predictor == Predictor::Variable ||

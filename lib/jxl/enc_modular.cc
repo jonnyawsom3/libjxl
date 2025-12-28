@@ -94,8 +94,11 @@ const float squeeze_xyb_qtable[3][16] = {
      0.08, 0.04, 0.02, 0.01, 0.005},  // Y
     {1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
      0.5},  // X
-    {2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5,
+    {1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
      0.5},  // B-Y
+    // X table is copied for B to retain highly saturated colors.
+    // TODO(Jonnyawsom3): Find better values for HF Chroma and
+    // make the same adjustment for VarDCT.
 };
 
 const float squeeze_luma_qtable[16] = {163.84, 81.92, 40.96, 20.48, 10.24, 5.12,

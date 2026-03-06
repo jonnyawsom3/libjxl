@@ -317,7 +317,7 @@ Status LoopFilterFromParams(const CompressParams& cparams, bool streaming_mode,
     loop_filter->epf_iters = 0;
     return true;
   } else {
-    if (frame_header->encoding == FrameEncoding::kModular) {
+    if (cparams.IsLossless()) {
       loop_filter->epf_iters = 0;
     } else {
       constexpr float kThresholds[3] = {0.7, 1.5, 4.0};

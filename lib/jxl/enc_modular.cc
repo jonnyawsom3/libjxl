@@ -80,7 +80,7 @@ namespace {
 // these quantization factors are for -Q 50  (other qualities simply scale the
 // factors; things are rounded down and obviously cannot get below 1)
 const float squeeze_quality_factor =
-    0.33;  // for easy tweaking of the quality range (decrease this number for
+    0.34;  // for easy tweaking of the quality range (decrease this number for
            // higher quality)
 const float squeeze_luma_factor =
     1.0;  // for easy tweaking of the balance between luma (or anything
@@ -92,9 +92,9 @@ const float squeeze_quality_factor_y = 1.5f;
 const float squeeze_xyb_qtable[3][16] = {
     {163.84, 81.92, 40.96, 20.48, 10.24, 5.12, 2.56, 1.28, 0.64, 0.32, 0.16,
      0.08, 0.04, 0.02, 0.01, 0.005},  // Y
-    {512, 256, 128, 64, 48, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
+    {384, 256, 128, 64, 48, 24, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
      0.5},  // X
-    {768, 512, 256, 128, 64, 48, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5,
+    {512, 384, 256, 128, 64, 48, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5,
      0.5},  // B-Y
     // TODO(Jonnyawsom3): Find better values for HF Chroma and
     // make the same adjustments for VarDCT.

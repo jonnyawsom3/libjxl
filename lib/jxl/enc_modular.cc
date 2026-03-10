@@ -83,7 +83,7 @@ const float squeeze_quality_factor =
     0.33;  // for easy tweaking of the quality range (decrease this number for
            // higher quality)
 const float squeeze_luma_factor =
-    1.0;  // for easy tweaking of the balance between luma (or anything
+    1.2;  // for easy tweaking of the balance between luma (or anything
           // non-chroma) and chroma (decrease this number for higher quality
           // luma)
 const float squeeze_quality_factor_xyb = 4.0f;
@@ -94,7 +94,7 @@ const float squeeze_xyb_qtable[3][16] = {
      0.08, 0.04, 0.02, 0.01, 0.005},  // Y
     {512, 256, 128, 64, 48, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
      0.5},  // X
-    {768, 512, 256, 128, 64, 48, 24, 12, 4, 2, 1, 0.5, 0.5, 0.5, 0.5,
+    {768, 512, 256, 128, 64, 48, 32, 16, 8, 4, 2, 1, 0.5, 0.5, 0.5,
      0.5},  // B-Y
     // TODO(Jonnyawsom3): Find better values for HF Chroma and
     // make the same adjustments for VarDCT.

@@ -888,8 +888,9 @@ Status ModularFrameEncoder::ComputeEncodingData(
        (do_color && metadata.bit_depth.bits_per_sample > 8))) {
     channel_colors_percent = cparams_.channel_colors_pre_transform_percent;
   }
-  if (!groupwise &&
-     (!(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
+  if (!groupwise && (cparams.lossy_palette ||
+      // Disable palette for progressive lossless.
+     (!(cparams_.responsive && cparams_.ModularPartIsLossless())))) {
     JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams_,
                                      channel_colors_percent, pool));
   }

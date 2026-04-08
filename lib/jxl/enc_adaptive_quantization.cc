@@ -834,7 +834,7 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
 
 const float kDcQuantPow = 0.83f;
 const float kDcQuant = 1.095924047623553f;
-const float kAcQuant = 0.765f;
+const float kAcQuant = 0.80751132443618624f;
 
 // Computes the decoded image for a given set of compression parameters.
 StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,

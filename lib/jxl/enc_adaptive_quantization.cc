@@ -210,49 +210,72 @@ V GammaModulation(const D d, const size_t x, const size_t y,
   return MulAdd(kGamma, FastLog2f(d, overall_ratio), out_val);
 }
 
-// Change precision in 8x8 blocks that have significant amounts of blue
-// content (but are not close to solid blue).
-// This is based on the idea that M and L cone activations saturate the
-// S (blue) receptors, and the S reception becomes more important when
-// both M and L levels are low. In that case M and L receptors may be
-// observing S-spectra instead and viewing them with higher spatial
-// accuracy, justifying spending more bits here.
 template <class D, class V>
-V BlueModulation(const D d, const size_t x, const size_t y,
-                 const ImageF& planex, const ImageF& planey,
-                 const ImageF& planeb, const Rect& rect, const V out_val) {
-  auto sum = Zero(d);
-  static const float kLimit = 0.010474084867598155;
-  static const float kOffset = 0.0031994768654636393;
+V ColorModulation(const D d, const size_t x, const size_t y,
+                  const ImageF& xyb_x, const ImageF& xyb_y, const ImageF& xyb_b,
+                  const double butteraugli_target, V out_val) {
+  static const float kStrengthMul = 4.2456542701250122f;
+  static const float kRedRampStart = 0.18748564245760829f;
+  static const float kRedRampLength = 0.16701783842516479f;
+  static const float kBlueRampLength = 0.16117602661852037f;
+  static const float kBlueRampStart = 0.47897504338287333f;
+  const float strength = kStrengthMul * (1.0f - 0.15f * butteraugli_target);
+  if (strength < 0) {
+    return out_val;
+  }
+  // x values are smaller than y and b values, need to take the difference into
+  // account.
+  const float red_strength = strength * 6.0f;
+  const float blue_strength = strength;
+  {
+    // Reduce some bits from areas not blue or red.
+    const float offset = strength * -0.007;  // 9174542291185913f;
+    out_val = Add(out_val, Set(d, offset));
+  }
+  // Calculate how much of the 8x8 block is covered with blue or red.
+  auto blue_coverage = Zero(d);
+  auto red_coverage = Zero(d);
+  auto bias_y = Set(d, 0.2f);
+  auto bias_y_add = Set(d, 0.1f);
   for (size_t dy = 0; dy < 8; ++dy) {
-    const float* JXL_RESTRICT row_in_x = rect.ConstRow(planex, y + dy) + x;
-    const float* JXL_RESTRICT row_in_y = rect.ConstRow(planey, y + dy) + x;
-    const float* JXL_RESTRICT row_in_b = rect.ConstRow(planeb, y + dy) + x;
+    const float* const JXL_RESTRICT row_in_x = xyb_x.Row(y + dy);
+    const float* const JXL_RESTRICT row_in_y = xyb_y.Row(y + dy);
+    const float* const JXL_RESTRICT row_in_b = xyb_b.Row(y + dy);
     for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
-      const auto p_x = Load(d, row_in_x + dx);
-      const auto p_b = Load(d, row_in_b + dx);
-      const auto p_y_raw = Add(Load(d, row_in_y + dx), Set(d, kOffset));
-      const auto p_y_effective = Add(p_y_raw, Abs(p_x));
-      sum = Add(sum,
-                IfThenElseZero(Gt(p_b, p_y_effective),
-                               Min(Sub(p_b, p_y_effective), Set(d, kLimit))));
+      const auto pixel_y = Load(d, row_in_y + x + dx);
+      // Estimate redness-greeness relative to the intensity.
+      const auto pixel_xpy = Div(Abs(Load(d, row_in_x + x + dx)),
+                                 Max(Add(bias_y_add, pixel_y), bias_y));
+      const auto pixel_x =
+          Max(Set(d, 0.0f), Sub(pixel_xpy, Set(d, kRedRampStart)));
+      const auto pixel_b =
+          Max(Set(d, 0.0f), Sub(Load(d, row_in_b + x + dx),
+                                Add(pixel_y, Set(d, kBlueRampStart))));
+      const auto blue_slope = Min(pixel_b, Set(d, kBlueRampLength));
+      const auto red_slope = Min(pixel_x, Set(d, kRedRampLength));
+      red_coverage = Add(red_coverage, red_slope);
+      blue_coverage = Add(blue_coverage, blue_slope);
     }
   }
-  static const float kMul = 0.90590804735610064;
-  sum = SumOfLanes(d, sum);
-  float scalar_sum = GetLane(sum);
-  // If it is all blue, don't boost the quantization.
-  // All blue likely means low frequency blue. Let's not make the most
-  // perfect sky ever.
-  if (scalar_sum >= 32 * kLimit) {
-    scalar_sum = 64 * kLimit - scalar_sum;
-  }
-  static const float kMaxLimit = 15.463398341612438;
-  if (scalar_sum >= kMaxLimit * kLimit) {
-    scalar_sum = kMaxLimit * kLimit;
-  }
-  scalar_sum *= kMul;
-  return Add(Set(d, scalar_sum), out_val);
+
+  // Saturate when the high red or high blue coverage is above a level.
+  // The idea here is that if a certain fraction of the block is red or
+  // blue we consider as if it was fully red or blue.
+  static const float ratio = 28.0f;  // out of 64 pixels.
+
+  auto overall_red_coverage = SumOfLanes(d, red_coverage);
+  overall_red_coverage =
+      Min(overall_red_coverage, Set(d, ratio * kRedRampLength));
+  overall_red_coverage =
+      Mul(overall_red_coverage, Set(d, red_strength / ratio));
+
+  auto overall_blue_coverage = SumOfLanes(d, blue_coverage);
+  overall_blue_coverage =
+      Min(overall_blue_coverage, Set(d, ratio * kBlueRampLength));
+  overall_blue_coverage =
+      Mul(overall_blue_coverage, Set(d, blue_strength / ratio));
+
+  return Add(overall_red_coverage, Add(overall_blue_coverage, out_val));
 }
 
 // Change precision in 8x8 blocks that have high frequency content.
@@ -338,8 +361,8 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
       mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
       auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
+      out_val = ColorModulation(df, x, y, xyb_x, xyb_y, xyb_b,
+                                butteraugli_target, out_val);
       // We want multiplicative quantization field, so everything
       // until this point has been modulating the exponent.
       row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
@@ -1058,7 +1081,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
     double cur_pow = 0.0;
     if (i < 7) {
-      cur_pow = kPow[i] + (butteraugli_target - 1.0) * kPowMod[i];
+      cur_pow = kPow[i] + (original_butteraugli - 1.0) * kPowMod[i];
       if (cur_pow < 0) {
         cur_pow = 0;
       }
@@ -1068,7 +1091,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
-          const float diff = row_dist[x] / butteraugli_target;
+          const float diff = row_dist[x] / original_butteraugli;
           if (diff > 1.0f) {
             float old = row_q[x];
             row_q[x] *= diff;

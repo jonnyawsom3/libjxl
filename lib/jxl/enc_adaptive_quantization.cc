@@ -834,7 +834,7 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
 
 const float kDcQuantPow = 0.83f;
 const float kDcQuant = 1.095924047623553f;
-const float kAcQuant = 0.80751132443618624f;
+const float kAcQuant = 0.765f;
 
 // Computes the decoded image for a given set of compression parameters.
 StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
@@ -1058,7 +1058,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
     double cur_pow = 0.0;
     if (i < 7) {
-      cur_pow = kPow[i] + (original_butteraugli - 1.0) * kPowMod[i];
+      cur_pow = kPow[i] + (butteraugli_target - 1.0) * kPowMod[i];
       if (cur_pow < 0) {
         cur_pow = 0;
       }
@@ -1068,7 +1068,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
         const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
         float* const JXL_RESTRICT row_q = quant_field.Row(y);
         for (size_t x = 0; x < quant_field.xsize(); ++x) {
-          const float diff = row_dist[x] / original_butteraugli;
+          const float diff = row_dist[x] / butteraugli_target;
           if (diff > 1.0f) {
             float old = row_q[x];
             row_q[x] *= diff;

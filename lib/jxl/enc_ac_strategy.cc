@@ -493,7 +493,7 @@ const auto quant = Set(df, quant_norm8);
   float loss_scalar =
       pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
           1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm16;
+      (num_blocks * kDCTBlockSize) / quant_norm8;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
   return true;

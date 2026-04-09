@@ -381,38 +381,27 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
   const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
   // avoid large blocks when there is a lot going on in red-green.
-  float quant_norm16 = 0;
-  if (num_blocks == 1) {
-    // When it is only one 8x8, we don't need aggregation of values.
-    quant_norm16 = config.Quant(x / 8, y / 8);
-  } else if (num_blocks == 2) {
-    // Taking max instead of 8th norm seems to work
-    // better for smallest blocks up to 16x8. Jyrki couldn't get
-    // improvements in trying the same for 16x16 blocks.
-    if (acs.covered_blocks_y() == 2) {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8, y / 8 + 1));
-    } else {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8 + 1, y / 8));
+  float quant_norm8 = 0;
+
+if (num_blocks == 1) {
+  quant_norm8 = config.Quant(x / 8, y / 8);
+} else if (num_blocks == 2) {
+  quant_norm8 = std::max(
+      config.Quant(x / 8, y / 8),
+      config.Quant(x / 8 + (acs.covered_blocks_x() > 1), 
+                   y / 8 + (acs.covered_blocks_y() > 1)));
+} else {
+  for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
+    for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+      float qval = config.Quant(x / 8 + ix, y / 8 + iy);
+      quant_norm8 += qval * qval * qval * qval;
     }
-  } else {
-    // Load QF value, calculate empirical heuristic on masking field
-    // for weighting the information loss. Information loss manifests
-    // itself as ringing, and masking could hide it.
-    for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-      for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-        float qval = config.Quant(x / 8 + ix, y / 8 + iy);
-        qval *= qval;
-        qval *= qval;
-        qval *= qval;
-        quant_norm16 += qval * qval;
-      }
-    }
-    quant_norm16 /= num_blocks;
-    quant_norm16 = FastPowf(quant_norm16, 1.0f / 16.0f);
   }
-  const auto quant = Set(df, quant_norm16);
+  quant_norm8 /= num_blocks;
+  quant_norm8 = FastPowf(quant_norm8, 1.0f / 8.0f);
+}
+
+const auto quant = Set(df, quant_norm8);
 
   // Compute entropy.
   const HWY_CAPPED(float, 8) df8;

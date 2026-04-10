@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <limits>
 
 #include "lib/jxl/chroma_from_luma.h"
@@ -69,10 +68,11 @@ namespace {
 
 const std::shared_ptr<cpptoml::table>& GetTomlConfig() {
   static const std::shared_ptr<cpptoml::table> config = []() {
-    if (!std::filesystem::exists(TUNING_CONFIG_TOML)) {
-      return std::make_shared<cpptoml::table>();
+    try {
+      return cpptoml::parse_file(TUNING_CONFIG_TOML);
+    } catch (...) {
+      return cpptoml::make_table();  // correct empty table factory
     }
-    return cpptoml::parse_file(TUNING_CONFIG_TOML);
   }();
   return config;
 }

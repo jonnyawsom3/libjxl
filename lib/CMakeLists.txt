@@ -196,6 +196,12 @@ include(jxl_threads.cmake)
 # together at build time.
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/jxl
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  
+  configure_file(
+  ${CMAKE_SOURCE_DIR}/cfg/enc_ac_strategy.toml
+  ${CMAKE_BINARY_DIR}/enc_ac_strategy.toml
+  COPYONLY
+)
 
 # Tests for the jxl library.
 include(jxl_tests.cmake)

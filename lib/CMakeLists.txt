@@ -128,7 +128,7 @@ else ()
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
       list(APPEND JPEGXL_INTERNAL_FLAGS
         -fnew-alignment=8
-        -fno-cxx-exceptions
+        # -fno-cxx-exceptions # Disabled for TOML parsing library
         -fno-slp-vectorize
         -fno-vectorize
 

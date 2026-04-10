@@ -66,6 +66,12 @@
 namespace jxl {
 namespace {
 
+const std::shared_ptr<cpptoml::table>& GetTomlConfig() {
+  static const std::shared_ptr<cpptoml::table> config =
+      cpptoml::parse_file(TUNING_CONFIG_TOML);
+  return config;
+}
+
 // Debugging utilities.
 
 // Returns a linear sRGB color (as bytes) for each AC strategy.
@@ -384,38 +390,26 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
   const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
   // avoid large blocks when there is a lot going on in red-green.
-  float quant_norm16 = 0;
-  if (num_blocks == 1) {
-    // When it is only one 8x8, we don't need aggregation of values.
-    quant_norm16 = config.Quant(x / 8, y / 8);
-  } else if (num_blocks == 2) {
-    // Taking max instead of 8th norm seems to work
-    // better for smallest blocks up to 16x8. Jyrki couldn't get
-    // improvements in trying the same for 16x16 blocks.
-    if (acs.covered_blocks_y() == 2) {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8, y / 8 + 1));
+  // norm8 avoids smoothing real details and retains sharp edges.
+  float quant_norm8 = 0;
+    if (num_blocks == 1) {
+      quant_norm8 = config.Quant(x / 8, y / 8);
+    } else if (num_blocks == 2) {
+      quant_norm8 = std::max(
+        config.Quant(x / 8, y / 8),
+        config.Quant(x / 8 + (acs.covered_blocks_x() > 1), 
+        y / 8 + (acs.covered_blocks_y() > 1)));
     } else {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8 + 1, y / 8));
-    }
-  } else {
-    // Load QF value, calculate empirical heuristic on masking field
-    // for weighting the information loss. Information loss manifests
-    // itself as ringing, and masking could hide it.
-    for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-      for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-        float qval = config.Quant(x / 8 + ix, y / 8 + iy);
-        qval *= qval;
-        qval *= qval;
-        qval *= qval;
-        quant_norm16 += qval * qval;
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+          float qval = config.Quant(x / 8 + ix, y / 8 + iy);
+          quant_norm8 += qval * qval * qval * qval;
+        }
       }
+      quant_norm8 /= num_blocks;
+      quant_norm8 = FastPowf(quant_norm8, 1.0f / 8.0f);
     }
-    quant_norm16 /= num_blocks;
-    quant_norm16 = FastPowf(quant_norm16, 1.0f / 16.0f);
-  }
-  const auto quant = Set(df, quant_norm16);
+    const auto quant = Set(df, quant_norm8);
 
   // Compute entropy.
   const HWY_CAPPED(float, 8) df8;
@@ -507,7 +501,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   float loss_scalar =
       pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
           1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm16;
+      (num_blocks * kDCTBlockSize) / quant_norm8;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
   return true;
@@ -521,7 +515,7 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
                             uint32_t* quantized, float* entropy_out,
                             AcStrategyType& best_tx) {
 
-  auto toml_config = cpptoml::parse_file(TUNING_CONFIG_TOML);
+  auto& toml_config = GetTomlConfig();
                               
   struct TransformTry8x8 {
     AcStrategyType type;
@@ -895,7 +889,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // ringing next to sky etc. Optimization will find smaller numbers
   // and produce more ringing than is ideal. Larger numbers will
   // help stop ringing.
-  auto toml_config = cpptoml::parse_file(TUNING_CONFIG_TOML);
+  auto& toml_config = GetTomlConfig();
   auto table = toml_config->get_table_qualified("merge-try.entropy-mul");
 
   const float entropy_mul16X8 = table->get_as<double>("16x8").value_or(1.21);
@@ -1080,7 +1074,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
                                   const ImageF& quant_field, const ImageF& mask,
                                   const ImageF& mask1x1,
                                   DequantMatrices* matrices) {
-  auto toml_config = cpptoml::parse_file(TUNING_CONFIG_TOML); 
+  auto& toml_config = GetTomlConfig();
   auto table = toml_config->get_table_qualified("strategy-heuristics");
 
   config.dequant = matrices;

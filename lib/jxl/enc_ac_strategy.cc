@@ -38,7 +38,7 @@
 #include "lib/jxl/simd_util.h"
 
 #include "third_party/toml/cpptoml.h"
-#define TUNING_CONFIG_TOML "../../cfg/enc_ac_strategy.toml"
+#define TUNING_CONFIG_TOML "enc_ac_strategy.toml"
 
 // Some of the floating point constants in this file and in other
 // files in the libjxl project have been obtained using the

@@ -67,8 +67,12 @@ namespace jxl {
 namespace {
 
 const std::shared_ptr<cpptoml::table>& GetTomlConfig() {
-  static const std::shared_ptr<cpptoml::table> config =
-      cpptoml::parse_file(TUNING_CONFIG_TOML);
+  static const std::shared_ptr<cpptoml::table> config = []() {
+    if (!std::filesystem::exists(TUNING_CONFIG_TOML)) {
+      return std::make_shared<cpptoml::table>();
+    }
+    return cpptoml::parse_file(TUNING_CONFIG_TOML);
+  }();
   return config;
 }
 

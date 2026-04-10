@@ -71,7 +71,8 @@ const std::shared_ptr<cpptoml::table>& GetTomlConfig() {
     try {
       return cpptoml::parse_file(TUNING_CONFIG_TOML);
     } catch (...) {
-      return cpptoml::make_table();  // correct empty table factory
+      return cpptoml::make_table();  // This doesn't work
+      // figure out how to make x64-static builds not fail during benchmarking step
     }
   }();
   return config;

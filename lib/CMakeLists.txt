@@ -197,10 +197,10 @@ include(jxl_threads.cmake)
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/jxl
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
   
-  configure_file(
-  ${CMAKE_SOURCE_DIR}/cfg/enc_ac_strategy.toml
-  ${CMAKE_BINARY_DIR}/enc_ac_strategy.toml
-  COPYONLY
+add_custom_command(TARGET benchmark_xl POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/cfg/enc_ac_strategy.toml
+    $<TARGET_FILE_DIR:benchmark_xl>/enc_ac_strategy.toml
 )
 
 # Tests for the jxl library.

@@ -452,10 +452,10 @@ const auto quant = Set(df, quant_norm8);
                                           (acs.covered_blocks_x() * kBlockDim) +
                                       ix * kBlockDim + dx);
               if (x + ix * 8 + dx + Lanes(df8) <= config.mask1x1_xsize) {
-                auto mask = Load(df8, config.MaskingPtr1x1(...));
-                mask = Max(mask, Set(df8, 1e-3f));
-                mask = Div(Set(df8, 1.0f), mask);
-                auto masku = Add(mask, masku_off);
+                auto masku =
+                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
+                                                       y + iy * 8 + dy)),
+                        masku_off);
                 in = Mul(masku, in);
                 in = Mul(in, in);
                 in = Mul(in, in);

@@ -436,7 +436,7 @@ const auto quant = Set(df, quant_norm8);
   // Compute entropy.
   const HWY_CAPPED(float, 8) df8;
     
-  const float loss = 0
+  const float loss = 0;
   auto info_loss = Zero(df);
   auto info_loss2 = Zero(df);
   for (size_t c = 0; c < 3; c++) {

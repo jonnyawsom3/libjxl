@@ -490,7 +490,7 @@ const auto quant = Set(df, quant_norm8);
   const float kRegulateSurface = 11.5f;
   float large_surface_error_mul =
       (kRegulateSurface + sqrt(num_blocks)) * (1.0f / (kRegulateSurface + 1));
-  return entropy + large_surface_error_mul * masking * loss;
+  return entropy + large_surface_error_mul * loss;
 }
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,

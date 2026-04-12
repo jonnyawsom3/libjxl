@@ -436,7 +436,6 @@ const auto quant = Set(df, quant_norm8);
   // Compute entropy.
   const HWY_CAPPED(float, 8) df8;
 
-  float loss = Zero(df8);
   auto info_loss = Zero(df);
   auto info_loss2 = Zero(df);
   for (size_t c = 0; c < 3; c++) {
@@ -473,8 +472,8 @@ const auto quant = Set(df, quant_norm8);
     // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
     // bias.
     entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
-    if (c == 0 && num_blocks >= 2) {
-      // It is X channel (red-green) and we often see ringing
+    if (c != 1 && num_blocks >= 2) {
+      // It is chroma channel (red-green/blue-yellow) and we often see ringing
       // in the large blocks. Let's punish that more here.
       float w = 1.0 + std::min(3.0, num_blocks / 8.0);
       entropy *= w;
@@ -485,7 +484,7 @@ const auto quant = Set(df, quant_norm8);
   const float loss1 = GetLane(SumOfLanes(df, info_loss));
   const float loss2 =
       sqrt(GetLane(SumOfLanes(df, info_loss2)) * (num_blocks * 64));
-  loss = kMixLoss * (config.info_loss_multiplier * loss1) +
+  const float loss = kMixLoss * (config.info_loss_multiplier * loss1) +
                      (1.0 - kMixLoss) * (config.info_loss_multiplier2 * loss2);
   const float kRegulateSurface = 11.5f;
   float large_surface_error_mul =

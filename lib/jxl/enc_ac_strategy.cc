@@ -437,6 +437,8 @@ const auto quant = Set(df, quant_norm8);
   const HWY_CAPPED(float, 8) df8;
 
   auto loss = Zero(df8);
+  auto info_loss = Zero(df);
+  auto info_loss2 = Zero(df);
   for (size_t c = 0; c < 3; c++) {
     const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
     const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
@@ -451,6 +453,8 @@ const auto quant = Set(df, quant_norm8);
       const auto val = Mul(Sub(in, in_y), Mul(im, quant));
       const auto rval = Round(val);
       const auto diff = Sub(val, rval);
+      info_loss = Add(info_loss, diff);
+      info_loss2 = MulAdd(diff, diff, info_loss2);
       const auto m = Load(df, matrix + i);
       Store(Mul(m, diff), df, &mem[i]);
       const auto q = Abs(rval);
@@ -1088,19 +1092,10 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   //  - estimate of the number of bits that will be used by the block
   //  - information loss due to quantization
   // The following constant controls the relative weights of these components.
-  config.info_loss_multiplier = 1.3;
-  config.zeros_mul = 9.31;
-  config.cost_delta = 10.8;
-
-  static const float kBias = 0.14;
-  const float ratio = (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
-
-  static const float kPow1 = 0.337;
-  static const float kPow2 = 0.51;
-  static const float kPow3 = 0.367;
-  config.info_loss_multiplier *= std::pow(ratio, kPow1);
-  config.zeros_mul *= std::pow(ratio, kPow2);
-  config.cost_delta *= std::pow(ratio, kPow3);
+  config.info_loss_multiplier = 58.67516723857484f;
+  config.info_loss_multiplier2 = 43.0f;
+  config.zeros_mul = 2.55f;
+  config.cost_delta = 4.9425062806007478f;
   return true;
 }
 

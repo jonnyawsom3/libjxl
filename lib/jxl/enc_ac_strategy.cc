@@ -431,50 +431,7 @@ const auto quant = Set(df, quant_norm8);
       entropy_v = Add(Sqrt(q), entropy_v);
       nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
-
-    {
-      float masku_lut[3] = {
-          12.0,
-          0.0,
-          4.0,
-      };
-      auto masku_off = Set(df8, masku_lut[c]);
-      auto lossc = Zero(df8);
-      TransformToPixels(acs.Strategy(), &mem[0], block,
-                        acs.covered_blocks_x() * 8, scratch_space);
-
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          for (size_t dy = 0; dy < kBlockDim; ++dy) {
-            for (size_t dx = 0; dx < kBlockDim; dx += Lanes(df8)) {
-              auto in = Load(df8, block +
-                                      (iy * kBlockDim + dy) *
-                                          (acs.covered_blocks_x() * kBlockDim) +
-                                      ix * kBlockDim + dx);
-              if (x + ix * 8 + dx + Lanes(df8) <= config.mask1x1_xsize) {
-                auto masku =
-                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
-                                                       y + iy * 8 + dy)),
-                        masku_off);
-                in = Mul(masku, in);
-                in = Mul(in, in);
-                in = Mul(in, in);
-                in = Mul(in, in);
-                lossc = Add(lossc, in);
-              }
-            }
-          }
-        }
-      }
-      static const double kChannelMul[3] = {
-          pow(8.2, 8.0),
-          pow(1.0, 8.0),
-          pow(1.03, 8.0),
-      };
-      lossc = Mul(Set(df8, kChannelMul[c]), lossc);
-      loss = Add(loss, lossc);
-    }
-    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+    entropy += config.cost_delta * cmul[c] * GetLane(SumOfLanes(df, entropy_v));
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
     // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
     // number of non-zeros of the block.

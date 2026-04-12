@@ -485,7 +485,7 @@ const auto quant = Set(df, quant_norm8);
   const float loss1 = GetLane(SumOfLanes(df, info_loss));
   const float loss2 =
       sqrt(GetLane(SumOfLanes(df, info_loss2)) * (num_blocks * 64));
-  const float loss = kMixLoss * (config.info_loss_multiplier * loss1) +
+  loss = kMixLoss * (config.info_loss_multiplier * loss1) +
                      (1.0 - kMixLoss) * (config.info_loss_multiplier2 * loss2);
   const float kRegulateSurface = 11.5f;
   float large_surface_error_mul =

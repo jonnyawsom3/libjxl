@@ -431,7 +431,7 @@ const auto quant = Set(df, quant_norm8);
       entropy_v = Add(Sqrt(q), entropy_v);
       nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
-    entropy += config.cost_delta * cmul[c] * GetLane(SumOfLanes(df, entropy_v));
+    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
     // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
     // number of non-zeros of the block.

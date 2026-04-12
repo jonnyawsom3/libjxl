@@ -436,7 +436,7 @@ const auto quant = Set(df, quant_norm8);
   // Compute entropy.
   const HWY_CAPPED(float, 8) df8;
 
-  auto loss = Zero(df8);
+  float loss = Zero(df8);
   auto info_loss = Zero(df);
   auto info_loss2 = Zero(df);
   for (size_t c = 0; c < 3; c++) {
@@ -478,7 +478,7 @@ const auto quant = Set(df, quant_norm8);
       // in the large blocks. Let's punish that more here.
       float w = 1.0 + std::min(3.0, num_blocks / 8.0);
       entropy *= w;
-      loss = Mul(loss, Set(df8, w));
+      loss *= w;
     }
   }
   const float kMixLoss = kMixLossTable[acs.RawStrategy()];

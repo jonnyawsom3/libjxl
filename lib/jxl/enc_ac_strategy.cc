@@ -361,6 +361,36 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   return false;
 }
 
+static const float kMixLossTable[AcStrategy::kNumValidStrategies] = {
+    1.0f,   // DCT = 0,
+    0.45f,  // IDENTITY = 1,
+    0.45f,  // DCT2X2 = 2,
+    0.7f,   // DCT4X4 = 3,
+    1.0f,   // DCT16X16 = 4,
+    1.0f,   // DCT32X32 = 5,
+    1.0f,   // DCT16X8 = 6,
+    1.0f,   // DCT8X16 = 7,
+    1.0f,   // DCT32X8 = 8,
+    1.0f,   // DCT8X32 = 9,
+    1.0f,   // DCT32X16 = 10,
+    1.0f,   // DCT16X32 = 11,
+    0.96f,  // DCT4X8 = 12,
+    0.96f,  // DCT8X4 = 13,
+    0.94f,  // AFV0 = 14,
+    0.94f,  // AFV1 = 15,
+    0.94f,  // AFV2 = 16,
+    0.94f,  // AFV3 = 17,
+    1.0f,   // DCT64X64 = 18,
+    1.0f,   // DCT64X32 = 19,
+    1.0f,   // DCT32X64 = 20,
+    1.0f,   // DCT128X128 = 21,
+    1.0f,   // DCT128X64 = 22,
+    1.0f,   // DCT64X128 = 23,
+    1.0f,   // DCT256X256 = 24,
+    1.0f,   // DCT256X128 = 25,
+    1.0f,   // DCT128X256 = 26,
+};
+
 Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
@@ -447,13 +477,16 @@ const auto quant = Set(df, quant_norm8);
       loss = Mul(loss, Set(df8, w));
     }
   }
-  float loss_scalar =
-      pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
-          1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm8;
-  entropy *= entropy_mul;
-  entropy += config.info_loss_multiplier * loss_scalar;
-  return true;
+  const float kMixLoss = kMixLossTable[acs.RawStrategy()];
+  const float loss1 = GetLane(SumOfLanes(df, info_loss));
+  const float loss2 =
+      sqrt(GetLane(SumOfLanes(df, info_loss2)) * (num_blocks * 64));
+  const float loss = kMixLoss * (config.info_loss_multiplier * loss1) +
+                     (1.0 - kMixLoss) * (config.info_loss_multiplier2 * loss2);
+  const float kRegulateSurface = 11.5f;
+  float large_surface_error_mul =
+      (kRegulateSurface + sqrt(num_blocks)) * (1.0f / (kRegulateSurface + 1));
+  return entropy + large_surface_error_mul * masking * loss;
 }
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,

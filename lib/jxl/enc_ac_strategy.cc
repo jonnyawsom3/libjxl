@@ -361,6 +361,71 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   return false;
 }
 
+static const float kChromaErrorWeight[AcStrategy::kNumValidStrategies] = {
+    0.95f,  // DCT = 0,
+    1.0f,   // IDENTITY = 1,
+    0.5f,   // DCT2X2 = 2,
+    1.0f,   // DCT4X4 = 3,
+    2.0f,   // DCT16X16 = 4,
+    2.0f,   // DCT32X32 = 5,
+    1.4f,   // DCT16X8 = 6,
+    1.4f,   // DCT8X16 = 7,
+    2.0f,   // DCT32X8 = 8,
+    2.0f,   // DCT8X32 = 9,
+    2.0f,   // DCT32X16 = 10,
+    2.0f,   // DCT16X32 = 11,
+    2.0f,   // DCT4X8 = 12,
+    2.0f,   // DCT8X4 = 13,
+    1.7f,   // AFV0 = 14,
+    1.7f,   // AFV1 = 15,
+    1.7f,   // AFV2 = 16,
+    1.7f,   // AFV3 = 17,
+    2.0f,   // DCT64X64 = 18,
+    2.0f,   // DCT64X32 = 19,
+    2.0f,   // DCT32X64 = 20,
+    2.0f,   // DCT128X128 = 21,
+    2.0f,   // DCT128X64 = 22,
+    2.0f,   // DCT64X128 = 23,
+    2.0f,   // DCT256X256 = 24,
+    2.0f,   // DCT256X128 = 25,
+    2.0f,   // DCT128X256 = 26,
+};
+
+// For DCT the maximum error is roughly a sum of the values.
+// For some transforms, especially IDENTITY and DCT2X2, not all
+// the coefficients affect the maximum error. Probably would
+// be better to do transforms back and forth and look at the pixels
+// but that would significantly slow down the computation.
+static const float kMixLossTable[AcStrategy::kNumValidStrategies] = {
+    1.0f,   // DCT = 0,
+    0.45f,  // IDENTITY = 1,
+    0.45f,  // DCT2X2 = 2,
+    0.7f,   // DCT4X4 = 3,
+    1.0f,   // DCT16X16 = 4,
+    1.0f,   // DCT32X32 = 5,
+    1.0f,   // DCT16X8 = 6,
+    1.0f,   // DCT8X16 = 7,
+    1.0f,   // DCT32X8 = 8,
+    1.0f,   // DCT8X32 = 9,
+    1.0f,   // DCT32X16 = 10,
+    1.0f,   // DCT16X32 = 11,
+    0.96f,  // DCT4X8 = 12,
+    0.96f,  // DCT8X4 = 13,
+    0.94f,  // AFV0 = 14,
+    0.94f,  // AFV1 = 15,
+    0.94f,  // AFV2 = 16,
+    0.94f,  // AFV3 = 17,
+    1.0f,   // DCT64X64 = 18,
+    1.0f,   // DCT64X32 = 19,
+    1.0f,   // DCT32X64 = 20,
+    1.0f,   // DCT128X128 = 21,
+    1.0f,   // DCT128X64 = 22,
+    1.0f,   // DCT64X128 = 23,
+    1.0f,   // DCT256X256 = 24,
+    1.0f,   // DCT256X128 = 25,
+    1.0f,   // DCT128X256 = 26,
+};
+
 Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
@@ -381,6 +446,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
   const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
   // avoid large blocks when there is a lot going on in red-green.
+  float cmul[3] = {kChromaErrorWeight[acs.RawStrategy()], 1.0f, 1.0f};
   float quant_norm8 = 0;
 
 if (num_blocks == 1) {
@@ -407,6 +473,7 @@ const auto quant = Set(df, quant_norm8);
   const HWY_CAPPED(float, 8) df8;
 
   auto loss = Zero(df8);
+  auto loss2 = Zero(df8);
   for (size_t c = 0; c < 3; c++) {
     const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
     const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
@@ -421,6 +488,8 @@ const auto quant = Set(df, quant_norm8);
       const auto val = Mul(Sub(in, in_y), Mul(im, quant));
       const auto rval = Round(val);
       const auto diff = Sub(val, rval);
+      loss = Add(loss, diff);
+      loss2 = MulAdd(diff, diff, loss2);
       const auto m = Load(df, matrix + i);
       Store(Mul(m, diff), df, &mem[i]);
       const auto q = Abs(rval);
@@ -431,7 +500,7 @@ const auto quant = Set(df, quant_norm8);
       entropy_v = Add(Sqrt(q), entropy_v);
       nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
-    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+    entropy += config.cost_delta * cmul[c] * GetLane(SumOfLanes(df, entropy_v));
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
     // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
     // number of non-zeros of the block.
@@ -447,13 +516,18 @@ const auto quant = Set(df, quant_norm8);
       loss = Mul(loss, Set(df8, w));
     }
   }
-  float loss_scalar =
-      pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
-          1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm8;
-  entropy *= entropy_mul;
-  entropy += config.info_loss_multiplier * loss_scalar;
-  return true;
+  const float kMixLoss = kMixLossTable[acs.RawStrategy()];
+  const float info_loss1 = GetLane(SumOfLanes(df, loss));
+  const float info_loss2 =
+      sqrt(GetLane(SumOfLanes(df, loss2)) * (num_blocks * 64));
+  const float loss_scalar = kMixLoss * (config.info_loss_multiplier * info_loss1) +
+                     (1.0 - kMixLoss) * (config.info_loss_multiplier2 * info_loss2);
+  const float kRegulateSurface = 11.5f;
+  float large_surface_error_mul =
+      (kRegulateSurface + sqrt(num_blocks)) * (1.0f / (kRegulateSurface + 1));
+    entropy *= entropy_mul;
+    entropy += config.info_loss_multiplier * loss_scalar * large_surface_error_mul;
+    return true
 }
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
@@ -1055,19 +1129,10 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   //  - estimate of the number of bits that will be used by the block
   //  - information loss due to quantization
   // The following constant controls the relative weights of these components.
-  config.info_loss_multiplier = 1.3;
-  config.zeros_mul = 9.31;
-  config.cost_delta = 10.8;
-
-  static const float kBias = 0.14;
-  const float ratio = (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
-
-  static const float kPow1 = 0.337;
-  static const float kPow2 = 0.51;
-  static const float kPow3 = 0.367;
-  config.info_loss_multiplier *= std::pow(ratio, kPow1);
-  config.zeros_mul *= std::pow(ratio, kPow2);
-  config.cost_delta *= std::pow(ratio, kPow3);
+  config.info_loss_multiplier = 58.67516723857484f;
+  config.info_loss_multiplier2 = 43.0f;
+  config.zeros_mul = 2.55f;
+  config.cost_delta = 4.9425062806007478f;
   return true;
 }
 

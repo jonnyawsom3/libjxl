@@ -527,7 +527,7 @@ const auto quant = Set(df, quant_norm8);
       (kRegulateSurface + sqrt(num_blocks)) * (1.0f / (kRegulateSurface + 1));
     entropy *= entropy_mul;
     entropy += config.info_loss_multiplier * loss_scalar * large_surface_error_mul;
-    return true
+    return true;
 }
 
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,

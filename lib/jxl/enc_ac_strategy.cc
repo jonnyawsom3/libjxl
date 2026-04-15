@@ -546,52 +546,62 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   static const TransformTry8x8 kTransforms8x8[] = {
       {
           AcStrategyType::DCT,
+          9,
           3.0f,
           0.785f,
       },
       {
           AcStrategyType::DCT4X4,
+          5,
           4.0f,
           0.7f,
       },
       {
           AcStrategyType::DCT2X2,
+          5,
           0.0f,
           0.685f,
       },
       {
           AcStrategyType::DCT4X8,
+          4,
           3.0f,
           0.745f,
       },
       {
           AcStrategyType::DCT8X4,
+          4,
           3.0f,
           0.745f,
       },
       {
           // Hornuss
           AcStrategyType::IDENTITY,
+          5,
           8.0f,
           0.81217614513585534f,
       },
       {
           AcStrategyType::AFV0,
+          4,
           3.0f,
           0.70086131125719425f,
       },
       {
           AcStrategyType::AFV1,
+          4,
           3.0f,
           0.70086131125719425f,
       },
       {
           AcStrategyType::AFV2,
+          4,
           3.0f,
           0.70086131125719425f,
       },
       {
           AcStrategyType::AFV3,
+          4,
           3.0f,
           0.70086131125719425f,
       },

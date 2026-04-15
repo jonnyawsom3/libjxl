@@ -540,8 +540,8 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   struct TransformTry8x8 {
     AcStrategyType type;
     int encoding_speed_tier_max_limit;
-    float entropy_add;
-    float entropy_mul;
+    double entropy_add;
+    double entropy_mul;
   };
   static const TransformTry8x8 kTransforms8x8[] = {
       {

@@ -526,7 +526,7 @@ const auto quant = Set(df, quant_norm8);
   float large_surface_error_mul =
       (kRegulateSurface + sqrt(num_blocks)) * (1.0f / (kRegulateSurface + 1));
     entropy *= entropy_mul;
-    entropy += config.info_loss_multiplier * loss_scalar * large_surface_error_mul;
+    entropy += loss_scalar * large_surface_error_mul;
     return true;
 }
 

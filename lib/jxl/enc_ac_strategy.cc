@@ -540,59 +540,60 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   struct TransformTry8x8 {
     AcStrategyType type;
     int encoding_speed_tier_max_limit;
-    double entropy_mul;
+    float entropy_add;
+    float entropy_mul;
   };
   static const TransformTry8x8 kTransforms8x8[] = {
       {
           AcStrategyType::DCT,
-          9,
-          0.84,
+          3.0f,
+          0.785f,
       },
       {
           AcStrategyType::DCT4X4,
-          5,
-          0.79,
+          4.0f,
+          0.7f,
       },
       {
           AcStrategyType::DCT2X2,
-          5,
-          0.86,
+          0.0f,
+          0.685f,
       },
       {
           AcStrategyType::DCT4X8,
-          4,
-          0.745,
+          3.0f,
+          0.745f,
       },
       {
           AcStrategyType::DCT8X4,
-          4,
-          0.745,
+          3.0f,
+          0.745f,
       },
       {
           // Hornuss
           AcStrategyType::IDENTITY,
-          5,
-          1.2,
+          8.0f,
+          0.81217614513585534f,
       },
       {
           AcStrategyType::AFV0,
-          4,
-          0.78,
+          3.0f,
+          0.70086131125719425f,
       },
       {
           AcStrategyType::AFV1,
-          4,
-          0.78,
+          3.0f,
+          0.70086131125719425f,
       },
       {
           AcStrategyType::AFV2,
-          4,
-          0.78,
+          3.0f,
+          0.70086131125719425f,
       },
       {
           AcStrategyType::AFV3,
-          4,
-          0.78,
+          3.0f,
+          0.70086131125719425f,
       },
   };
   double best = 1e30;
@@ -624,6 +625,7 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
     JXL_RETURN_IF_ERROR(EstimateEntropy(acs, entropy_mul, x, y, config,
                                         cmap_factors, block, scratch_space,
                                         quantized, entropy));
+    entropy += tx.entropy_add;
     if (entropy < best) {
       best_tx = tx.type;
       best = entropy;
@@ -881,7 +883,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   float entropy_estimate[64] = {};
   // Favor all 8x8 transforms (against 16x8 and larger transforms)) at
   // low butteraugli_target distances.
-  static const float k8x8mul1 = -0.4;
+  static const float k8x8mul1 = -0.55;
   static const float k8x8mul2 = 1.0;
   static const float k8x8base = 1.4;
   const float mul8x8 = k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base);
@@ -906,16 +908,29 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     uint8_t encoding_speed_tier_max_limit;
     float entropy_mul;
   };
-  // These numbers need to be figured out manually and looking at
-  // ringing next to sky etc. Optimization will find smaller numbers
-  // and produce more ringing than is ideal. Larger numbers will
-  // help stop ringing.
-  const float entropy_mul16X8 = 1.05;
-  const float entropy_mul16X16 = 1.4;
-  const float entropy_mul16X32 = 2.35;
-  const float entropy_mul32X32 = 3.45;
-  const float entropy_mul64X32 = 5.6;
-  const float entropy_mul64X64 = 9.0;
+  static const float k8X16mul1 = -0.55;
+  static const float k8X16mul2 = 0.885;
+  static const float k8X16base = 1.6;
+  const float entropy_mul16X8 =
+      k8X16mul2 + k8X16mul1 / (butteraugli_target + k8X16base);
+  //  const float entropy_mul16X8 = mul8X16 * 0.91195782912371126f;
+
+  static const float k16X16mul1 = -0.35;
+  static const float k16X16mul2 = 0.808;
+  static const float k16X16base = 2.0;
+  const float entropy_mul16X16 =
+      k16X16mul2 + k16X16mul1 / (butteraugli_target + k16X16base);
+  //  const float entropy_mul16X16 = mul16X16 * 0.83183417727960129f;
+
+  static const float k32X16mul1 = -0.1;
+  static const float k32X16mul2 = 0.854;
+  static const float k32X16base = 2.5;
+  const float entropy_mul16X32 =
+      k32X16mul2 + k32X16mul1 / (butteraugli_target + k32X16base);
+  
+  const float entropy_mul32X32 = 0.93;
+  const float entropy_mul64X32 = 1.29;
+  const float entropy_mul64X64 = 1.52;
   // TODO(jyrki): Consider this feedback in further changes:
   // Also effectively when the multipliers for smaller blocks are
   // below 1, this raises the bar for the bigger blocks even higher

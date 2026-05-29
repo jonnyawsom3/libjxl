@@ -136,6 +136,8 @@ class JxlCodec : public ImageCodec {
         stats_(nullptr, JxlEncoderStatsDestroy) {}
 
   Status ParseParam(const std::string& param) override {
+    //Full image needs to be buffered for debug images to work
+    cparams_.AddOption(JXL_ENC_FRAME_SETTING_BUFFERING, 0);
     const std::string kMaxPassesPrefix = "max_passes=";
     const std::string kDownsamplingPrefix = "downsampling=";
     const std::string kResamplingPrefix = "resampling=";

@@ -52,7 +52,7 @@
 
 // Set JXL_DEBUG_AC_STRATEGY to 1 to enable debugging.
 #ifndef JXL_DEBUG_AC_STRATEGY
-#define JXL_DEBUG_AC_STRATEGY 0
+#define JXL_DEBUG_AC_STRATEGY 1
 #endif
 
 // This must come before the begin/end_target, but HWY_ONCE is only true

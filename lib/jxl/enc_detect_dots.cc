@@ -35,7 +35,7 @@
 
 // Set JXL_DEBUG_DOT_DETECT to 1 to enable debugging.
 #ifndef JXL_DEBUG_DOT_DETECT
-#define JXL_DEBUG_DOT_DETECT 0
+#define JXL_DEBUG_DOT_DETECT 1
 #endif
 
 HWY_BEFORE_NAMESPACE();

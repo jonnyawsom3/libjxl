@@ -22,7 +22,7 @@ namespace jxl {
 
 // The Verbose level for the library
 #ifndef JXL_DEBUG_V_LEVEL
-#define JXL_DEBUG_V_LEVEL 0
+#define JXL_DEBUG_V_LEVEL 10
 #endif  // JXL_DEBUG_V_LEVEL
 
 #ifdef USE_ANDROID_LOGGER

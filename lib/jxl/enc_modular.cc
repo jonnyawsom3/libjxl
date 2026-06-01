@@ -468,13 +468,6 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   size_t num_streams =
       ModularStreamId::Num(frame_dim_, frame_header.passes.num_passes);
 
-  // Progressive lossless only benefits from levels 2 and higher
-  // Lower levels of faster decoding can outperform higher tiers
-  // depending on the PC
-  if (cparams_.responsive == 1 && cparams_.IsLossless() &&
-      cparams_.decoding_speed_tier == 1) {
-    cparams_.decoding_speed_tier = 2;
-  }
   if (cparams_.responsive == 1 && cparams_.IsLossless()) {
     // RCT selection seems bugged with Squeeze, YCoCg works well.
     if (cparams_.colorspace < 0) {
@@ -482,7 +475,12 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     }
   }
 
-  if (cparams_.ModularPartIsLossless()) {
+// No MA tree doubles progressive lossless decode speed.
+// At decoding speed 2+, Group size 3 is defined in enc_frame.cc
+if (cparams_.responsive == 1 && cparams_.IsLossless() &&
+    cparams_.decoding_speed_tier >= 1) {
+    cparams_.options.nb_repeats = 0;
+} else if (cparams_.ModularPartIsLossless()) {
     const auto disable_wp = [this] () {
         cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
         if (cparams_.options.predictor == Predictor::Weighted) {

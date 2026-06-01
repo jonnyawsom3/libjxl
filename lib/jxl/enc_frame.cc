@@ -139,10 +139,12 @@ uint32_t GetGroupSizeShift(size_t xsize, size_t ysize,
   // By default, use the smallest group size for faster decoding 2
   // and higher. Greatly speeds up decoding via multithreading at
   // the cost of density.
-  if (cparams.decoding_speed_tier >= 2 &&
-    // Progressive lossless gets harmed due to the amount of
-    // channels squeeze creates.
-      !(cparams.responsive == 1 && cparams.IsLossless())) {
+  if (cparams.decoding_speed_tier >= 2) {
+    // Larger group size helps progressive lossless when already
+    // using LZ77 only fast paths.
+    if (cparams.responsive == 1 && cparams.IsLossless()) {
+      return 3;
+    }
     return 0;
   }
   // No point using groups when only one group is full and the others are

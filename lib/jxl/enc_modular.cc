@@ -477,6 +477,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
 
 // No MA tree doubles progressive lossless decode speed.
 // At decoding speed 2+, Group size 3 is defined in enc_frame.cc
+// Normal lossless presets have minimal impact or harm speed.
 if (cparams_.responsive == 1 && cparams_.IsLossless() &&
     cparams_.decoding_speed_tier >= 1) {
     cparams_.options.nb_repeats = 0;

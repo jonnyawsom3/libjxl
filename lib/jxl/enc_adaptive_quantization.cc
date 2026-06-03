@@ -718,7 +718,7 @@ HWY_EXPORT(AdaptiveQuantizationMap);
 namespace {
 
 // If true, prints the quantization maps at each iteration.
-constexpr bool FLAGS_dump_quant_state = false;
+constexpr bool FLAGS_dump_quant_state = true;
 
 Status DumpHeatmap(const CompressParams& cparams, const AuxOut* aux_out,
                    const std::string& label, const ImageF& image,

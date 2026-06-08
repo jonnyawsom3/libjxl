@@ -1677,10 +1677,8 @@ Status ComputeEncodingData(
     // a Global MA tree is used.
     if (cparams.speed_tier < SpeedTier::kTortoise ||
         !cparams.ModularPartIsLossless() || cparams.lossy_palette ||
-        // Allow Local trees for progressive lossless.
-        // TODO(Jonnyawsom3): Figure out how to allow local trees for
-        // extra channels on VarDCT images without failing tests.
-        (!(cparams.responsive == 1 && cparams.IsLossless()) &&
+        // Use Local trees for progressive lossless.
+        (!(cparams.responsive == 1 && cparams.ModularPartIsLossless()) &&
         cparams.buffering < 3) || !cparams.custom_fixed_tree.empty()) {
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTree(pool));
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTokens(pool));
@@ -1788,14 +1786,6 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
                             const JxlEncoderChunkedFrameAdapter& frame_data) {
   if (cparams.buffering == -1) {
     if (cparams.speed_tier < SpeedTier::kTortoise) return false;
-    if (cparams.speed_tier < SpeedTier::kSquirrel &&
-        cparams.butteraugli_distance > 0.5f) {
-      return false;
-    }
-    if (cparams.speed_tier == SpeedTier::kSquirrel &&
-        cparams.butteraugli_distance >= 3.f) {
-      return false;
-    }
   }
   if (cparams.buffering == 0) {
     return false;
@@ -1836,7 +1826,7 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
     return false;
   }
   // Progressive lossless uses Local MA trees, but requires a full
-  // buffer to compress well, so no special check.
+  // buffer to compress well, so still return false for Responsive.
   if (!cparams.ModularPartIsLossless() || cparams.responsive > 0) {
     if (metadata.m.num_extra_channels > 0 || cparams.modular_mode) {
       return false;

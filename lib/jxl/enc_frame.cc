@@ -510,7 +510,7 @@ Status MakeFrameHeader(size_t xsize, size_t ysize,
 
   if (jpeg_data) {
     frame_header->UpdateFlag(false, FrameHeader::kUseDcFrame);
-    if (!frame_header.chroma_subsampling.Is444()) {
+    if (!frame_header->chroma_subsampling.Is444()) {
       frame_header->UpdateFlag(true, FrameHeader::kSkipAdaptiveDCSmoothing);
     }
   }

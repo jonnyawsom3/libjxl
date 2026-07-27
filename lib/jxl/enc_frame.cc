@@ -2678,6 +2678,7 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
   if (frame_data.IsJPEG()) {
     cparams.gaborish = Override::kOff;
     cparams.modular_mode = false;
+    cparams.epf = 0;
   }
 
   if (frame_data.xsize == 0 || frame_data.ysize == 0) {

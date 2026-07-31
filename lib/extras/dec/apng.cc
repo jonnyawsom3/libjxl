@@ -69,7 +69,6 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
 #include <csetjmp>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -884,6 +883,7 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
     const RectT<uint64_t>& vp = current_frame.viewport;
     size_t xsize = static_cast<size_t>(vp.xsize());
     size_t ysize = static_cast<size_t>(vp.ysize());
+    JXL_ENSURE(ysize <= ctx.frameRaw.rows.size());
     JXL_ASSIGN_OR_RETURN(PackedImage image,
                          PackedImage::Create(xsize, ysize, format));
     for (size_t y = 0; y < ysize; ++y) {
@@ -968,7 +968,7 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
             /*delay_den=*/png_get_uint_16(payload.data() + 22), raw_viewport,
             static_cast<DisposeOp>(dispose_op), static_cast<BlendOp>(blend_op)};
 
-        if (!raw_viewport.Intersection(image_rect).IsSame(raw_viewport)) {
+        if (!raw_viewport.IsInside(image_rect)) {
           // Cropping happened.
           return JXL_FAILURE("PNG frame is outside of image rect");
         }
@@ -1010,20 +1010,23 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
           png_color_8p sig_bits = nullptr;
           // Error is OK -> sig_bits remains nullptr.
           png_get_sBIT(ctx.png_ptr, ctx.info_ptr, &sig_bits);
+          uint8_t bit_depth = png_get_bit_depth(ctx.png_ptr, ctx.info_ptr);
           SetColorData(ppf, png_get_color_type(ctx.png_ptr, ctx.info_ptr),
-                       png_get_bit_depth(ctx.png_ptr, ctx.info_ptr), sig_bits,
+                       bit_depth, sig_bits,
                        png_get_valid(ctx.png_ptr, ctx.info_ptr, PNG_INFO_tRNS));
           num_channels =
               ppf->info.num_color_channels + (ppf->info.alpha_bits ? 1 : 0);
+          JxlDataType data_type =
+              bit_depth > 8 ? JXL_TYPE_UINT16 : JXL_TYPE_UINT8;
           format = {
               /*num_channels=*/num_channels,
-              /*data_type=*/ppf->info.bits_per_sample > 8 ? JXL_TYPE_UINT16
-                                                          : JXL_TYPE_UINT8,
+              /*data_type=*/data_type,
               /*endianness=*/JXL_BIG_ENDIAN,
               /*align=*/0,
           };
-          bytes_per_pixel =
-              num_channels * (format.data_type == JXL_TYPE_UINT16 ? 2 : 1);
+          size_t bytes_per_sample =
+              (format.data_type == JXL_TYPE_UINT16) ? 2 : 1;
+          bytes_per_pixel = bytes_per_sample * num_channels;
           size_t row_bytes;
           size_t total_bytes;
           if (!SafeMul(image_rect.xsize(), bytes_per_pixel, row_bytes) ||
@@ -1237,9 +1240,9 @@ Status DecodeImageAPNG(const Span<const uint8_t> bytes,
         for (size_t y = 0; y < ysize; y++) {
           JXL_RETURN_IF_ERROR(
               PackedImage::ValidateDataType(new_data.format.data_type));
-          size_t pixel_stride =
-              PackedImage::BitsPerChannel(new_data.format.data_type) *
-              new_data.format.num_channels / 8;
+          size_t bytes_per_sample =
+              PackedImage::BitsPerChannel(new_data.format.data_type) / 8;
+          size_t pixel_stride = bytes_per_sample * new_data.format.num_channels;
           memcpy(
               static_cast<uint8_t*>(new_data.pixels()) +
                   new_data.stride * (y + y0 - py0) + pixel_stride * (x0 - px0),

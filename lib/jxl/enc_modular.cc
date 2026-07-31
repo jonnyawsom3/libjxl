@@ -79,14 +79,14 @@ namespace {
 // these quantization factors are for -Q 50  (other qualities simply scale the
 // factors; things are rounded down and obviously cannot get below 1)
 const float squeeze_quality_factor =
-    0.33;  // for easy tweaking of the quality range (decrease this number for
+    0.35;  // for easy tweaking of the quality range (decrease this number for
            // higher quality)
 const float squeeze_luma_factor =
-    1.2;  // for easy tweaking of the balance between luma (or anything
+    1.1;  // for easy tweaking of the balance between luma (or anything
           // non-chroma) and chroma (decrease this number for higher quality
           // luma)
-const float squeeze_quality_factor_xyb = 4.0f;
-const float squeeze_quality_factor_y = 1.5f;
+const float squeeze_quality_factor_xyb = 3.7f;
+const float squeeze_quality_factor_y = 1.75f;
 
 const float squeeze_xyb_qtable[3][16] = {
     {163.84, 81.92, 40.96, 20.48, 10.24, 5.12, 2.56, 1.28, 0.64, 0.32, 0.16,

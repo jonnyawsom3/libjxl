@@ -1655,6 +1655,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_EXIF:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_XMP:
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_JUMBF:
+    case JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS:
       if (value < -1 || value > 1) {
         return JXL_API_ERROR(
             frame_settings->enc, JXL_ENC_ERR_API_USAGE,
@@ -1920,6 +1921,10 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
                              "Output mode has to be in [-1..2]");
       }
       frame_settings->values.cparams.output_mode = value;
+      break;
+    case JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS:
+      frame_settings->values.cparams.force_lfs_jpeg_recompression =
+          default_to_false(value);
       break;
 
     default:

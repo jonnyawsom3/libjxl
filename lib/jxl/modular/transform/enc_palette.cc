@@ -186,7 +186,6 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
 
   size_t w = input.channel[begin_c].w;
   size_t h = input.channel[begin_c].h;
-  if (input.bitdepth >= 32) return false;
   if (!lossy && nb_colors < 2) return false;
 
   if (!lossy && nb == 1) {
@@ -277,6 +276,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     input.channel.insert(input.channel.begin(), std::move(pch));
     return true;
   }
+  if (input.bitdepth >= 32) return false;
 
   Image quantized_input(memory_manager);
   if (lossy) {

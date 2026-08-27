@@ -639,14 +639,23 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     } else if (!cparams_.IsLossless()) {
       // If not responsive and lossy. TODO(veluca): use near_lossless instead?
       cparams_.options.predictor = Predictor::Gradient;
-    } else if (cparams_.speed_tier < SpeedTier::kFalcon) {
-      // try median and weighted predictor for anything else
-      cparams_.options.predictor = Predictor::Best;
+    // Assign effort levels to their respective predictor sets.
+    } else if (cparams_.speed_tier == SpeedTier::kTortoise) {
+      cparams_.options.predictor = Predictor::Effort9;
+    } else if (cparams_.speed_tier == SpeedTier::kKitten) {
+      cparams_.options.predictor = Predictor::Effort8;
+    } else if (cparams_.speed_tier == SpeedTier::kSquirrel) {
+      cparams_.options.predictor = Predictor::Effort7;
+    } else if (cparams_.speed_tier == SpeedTier::kWombat) {
+      cparams_.options.predictor = Predictor::Effort6;
+    } else if (cparams_.speed_tier == SpeedTier::kHare) {
+      cparams_.options.predictor = Predictor::Effort5;
+        // Weighted predictor for fixed tree effort 3.
     } else if (cparams_.speed_tier == SpeedTier::kFalcon) {
-      // just weighted predictor in falcon mode
       cparams_.options.predictor = Predictor::Weighted;
-    } else if (cparams_.speed_tier > SpeedTier::kFalcon) {
-      // just gradient predictor in thunder mode
+        // Gradient predictor for fixed tree effort 2 and effort 4.
+    } else if (cparams_.speed_tier > SpeedTier::kFalcon ||
+        cparams_.speed_tier == SpeedTier::kHare) {
       cparams_.options.predictor = Predictor::Gradient;
     }
   } else {

@@ -37,11 +37,11 @@ enum class Predictor : uint32_t {
   Best = 14,  // Best of Gradient and Weighted
   Variable =
       15,  // Find the best decision tree for predictors/predictor per row
-  Effort5 = 16
-  Effort6 = 17
-  Effort7 = 18
-  Effort8 = 19
-  Effort9 = 20
+  Effort5 = 16,
+  Effort6 = 17,
+  Effort7 = 18,
+  Effort8 = 19,
+  Effort9 = 20,
 };
 
 constexpr Predictor kUndefinedPredictor = static_cast<Predictor>(~0u);

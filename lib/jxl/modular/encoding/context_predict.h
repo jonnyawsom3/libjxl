@@ -308,7 +308,12 @@ inline bool PredictorHasWeighted(Predictor predictor) {
     case Predictor::Average2:
     case Predictor::Average3:
     case Predictor::Average4:
+    case Predictor::Effort5:
+    case Predictor::Effort6:
+    case Predictor::Effort7:
+    case Predictor::Effort8:
       return false;
+    case Predictor::Effort9:
     case Predictor::Best:
     case Predictor::Variable:
       return true;

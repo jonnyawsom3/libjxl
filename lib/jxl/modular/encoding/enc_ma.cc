@@ -554,20 +554,23 @@ Status TreeSamples::SetPredictor(Predictor predictor,
     }
     std::swap(predictors[0], predictors[static_cast<int>(Predictor::Weighted)]);
     std::swap(predictors[1], predictors[static_cast<int>(Predictor::Gradient)]);
+  } else if (predictor == Predictor::Effort4) {
+    predictors = {Predictor::Gradient, Predictor::Left};
   } else if (predictor == Predictor::Effort5) {
-    predictors = {Predictor::Gradient, Predictor::Select};
+    predictors = {Predictor::Gradient, Predictor::Left, Predictor::Top};
   } else if (predictor == Predictor::Effort6) {
-    predictors = {Predictor::Gradient, Predictor::Select, Predictor::Left};
+    predictors = {Predictor::Gradient, Predictor::Left, Predictor::Top,
+      Predictor::Select};
   } else if (predictor == Predictor::Effort7) {
-    predictors = {Predictor::Gradient, Predictor::Select, Predictor::Left,
-      Predictor::Top, Predictor::Average0,};
+    predictors = {Predictor::Gradient, Predictor::Left, Predictor::Top,
+      Predictor::Select, Predictor::Average0};
   } else if (predictor == Predictor::Effort8) {
-    predictors = {Predictor::Gradient, Predictor::Select, Predictor::Left,
-      Predictor::Top, Predictor::Average0, Predictor::LeftLeft,
+    predictors = {Predictor::Gradient, Predictor::Left, Predictor::Top,
+      Predictor::Select, Predictor::Average0, Predictor::LeftLeft,
       Predictor::TopRight};
   } else if (predictor == Predictor::Effort9) {
-    predictors = {Predictor::Gradient, Predictor::Select, Predictor::Left,
-      Predictor::Top, Predictor::Average0, Predictor::LeftLeft,
+    predictors = {Predictor::Gradient, Predictor::Left, Predictor::Top,
+      Predictor::Select, Predictor::Average0, Predictor::LeftLeft,
       Predictor::TopRight, Predictor::TopLeft, Predictor::Weighted};
   } else if (predictor == Predictor::Best) {
     predictors = {Predictor::Weighted, Predictor::Gradient};

@@ -639,23 +639,30 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     } else if (!cparams_.IsLossless()) {
       // If not responsive and lossy. TODO(veluca): use near_lossless instead?
       cparams_.options.predictor = Predictor::Gradient;
-    // Assign effort levels to their respective predictor sets.
+      // Assign effort levels to their respective predictor sets.
+      // Use kNoWP for much higher decode speed.
     } else if (cparams_.speed_tier == SpeedTier::kTortoise) {
       cparams_.options.predictor = Predictor::Effort9;
     } else if (cparams_.speed_tier == SpeedTier::kKitten) {
       cparams_.options.predictor = Predictor::Effort8;
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
     } else if (cparams_.speed_tier == SpeedTier::kSquirrel) {
       cparams_.options.predictor = Predictor::Effort7;
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
     } else if (cparams_.speed_tier == SpeedTier::kWombat) {
       cparams_.options.predictor = Predictor::Effort6;
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
     } else if (cparams_.speed_tier == SpeedTier::kHare) {
       cparams_.options.predictor = Predictor::Effort5;
-        // Weighted predictor for fixed tree effort 3.
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+    } else if (cparams_.speed_tier == SpeedTier::kCheetah) {
+      cparams_.options.predictor = Predictor::Gradient;
+      cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+      // Weighted predictor for fixed tree effort 3.
     } else if (cparams_.speed_tier == SpeedTier::kFalcon) {
       cparams_.options.predictor = Predictor::Weighted;
-        // Gradient predictor for fixed tree effort 2 and effort 4.
-    } else if (cparams_.speed_tier > SpeedTier::kFalcon ||
-        cparams_.speed_tier == SpeedTier::kHare) {
+      // Gradient predictor for fixed tree effort 2.
+    } else if (cparams_.speed_tier > SpeedTier::kFalcon) {
       cparams_.options.predictor = Predictor::Gradient;
     }
   } else {

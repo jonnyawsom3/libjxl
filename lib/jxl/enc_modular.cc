@@ -656,7 +656,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
       cparams_.options.predictor = Predictor::Effort5;
       cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
     } else if (cparams_.speed_tier == SpeedTier::kCheetah) {
-      cparams_.options.predictor = Predictor::Gradient;
+      cparams_.options.predictor = Predictor::Effort4;
       cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
       // Weighted predictor for fixed tree effort 3.
     } else if (cparams_.speed_tier == SpeedTier::kFalcon) {

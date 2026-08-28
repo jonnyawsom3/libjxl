@@ -679,7 +679,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
 
   stream_options_[0] = cparams_.options;
   if (cparams_.speed_tier == SpeedTier::kFalcon) {
-    stream_options_[0].tree_kind = ModularOptions::TreeKind::kWPFixedDC;
+    stream_options_[0].tree_kind = ModularOptions::TreeKind::kGradientFixedDC;
   } else if (cparams_.speed_tier == SpeedTier::kThunder) {
     stream_options_[0].tree_kind = ModularOptions::TreeKind::kGradientFixedDC;
   }
@@ -1235,10 +1235,7 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
         total_pixels += ch.w * ch.h;
       }
     }
-    if (cparams_.speed_tier <= SpeedTier::kFalcon) {
-      tree_ = PredefinedTree(ModularOptions::TreeKind::kWPFixedDC, total_pixels,
-                             max_bitdepth, stream_options_[0].max_properties);
-    } else if (cparams_.speed_tier <= SpeedTier::kThunder) {
+    if (cparams_.speed_tier <= SpeedTier::kThunder) {
       tree_ = PredefinedTree(ModularOptions::TreeKind::kGradientFixedDC,
                              total_pixels, max_bitdepth,
                              stream_options_[0].max_properties);
@@ -1593,7 +1590,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
   stream_options_[stream_id].predictor = Predictor::Weighted;
   stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kWPOnly;
   if (cparams_.speed_tier >= SpeedTier::kSquirrel) {
-    stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kWPFixedDC;
+    stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kGradientFixedDC;
   }
   if (cparams_.speed_tier < SpeedTier::kSquirrel && !nl_dc) {
     stream_options_[stream_id].predictor =

@@ -361,8 +361,8 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   return false;
 }
 
-Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
-                       size_t y, const ACSConfig& config,
+Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, float butteraugli_target,
+                       size_t x, size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
                        float& entropy) {
@@ -434,13 +434,23 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
   const auto q = Set(df, quant_norm8);
 
+  // Older coefficient pricing: +1/-1 coefficients are intentionally cheaper
+  // at high quality, while larger coefficients are penalized with a fixed
+  // second-tier cost. The value is supplied by the caller, avoiding a pow()
+  // per candidate/block.
+  const float slope =
+      std::min(1.0f, std::max(0.0f, butteraugli_target / 3.0f));
+  const float cost1 = 1.0f + slope * 8.8703248061477744f;
+  const auto cost2_v = Set(df, 4.4628149885273363f);
+  const auto cost_delta_v = Set(df, config.cost_delta);
+
   // DCT-domain quantization error. This is the critical detail-preservation
   // term: broad low-level rounding errors accumulate even when the entropy
   // estimate says that a large transform is cheap. The second moment catches
   // isolated high-error coefficients while the first moment catches diffuse
   // fine texture/noise. No inverse transform is needed.
-  auto info_loss = Zero(df);
-  auto info_loss2 = Zero(df);
+  float info_loss_sum = 0.0f;
+  float info_loss2_sum = 0.0f;
 
   // Relative per-channel weighting used by the older selector. In particular,
   // larger transforms do not get to hide X/chroma detail behind Y correlation.
@@ -455,6 +465,8 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     const auto cmap_factor = Set(df, cmap_factors[c]);
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
+    auto channel_loss_v = Zero(df);
+    auto channel_loss2_v = Zero(df);
 
     for (size_t i = 0; i < num_blocks * kDCTBlockSize;
          i += Lanes(df)) {
@@ -464,34 +476,45 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       const auto val = Mul(Sub(in, in_y), Mul(im, q));
       const auto rval = Round(val);
       const auto diff = AbsDiff(val, rval);
-
-      info_loss = Add(info_loss, diff);
-      info_loss2 = MulAdd(diff, diff, info_loss2);
+      channel_loss_v = Add(channel_loss_v, diff);
+      channel_loss2_v = MulAdd(diff, diff, channel_loss2_v);
 
       const auto qr = Abs(rval);
       const auto q_is_zero = Eq(qr, Zero(df));
-      // Keep the current branch's inexpensive coefficient cost model. The
-      // older loss term below is responsible for protecting fine detail; this
-      // avoids adding a second expensive entropy model on top of it.
-      entropy_v = Add(entropy_v, Sqrt(qr));
+      entropy_v = Add(
+          entropy_v, IfThenElseZero(Ge(qr, Set(df, 1.5f)), cost2_v));
+      entropy_v = MulAdd(Sqrt(qr), cost_delta_v, entropy_v);
       nzeros_v = Add(nzeros_v,
                      IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
 
     const float cmul = kChromaErrorWeight[acs.RawStrategy()];
-    entropy += config.cost_delta * cmul *
-               GetLane(SumOfLanes(df, entropy_v));
+    float channel_loss = GetLane(SumOfLanes(df, channel_loss_v));
+    float channel_loss2 = GetLane(SumOfLanes(df, channel_loss2_v));
+    if (c == 0 && num_blocks >= 2) {
+      const float w = 1.0f + std::min(3.0f, num_blocks / 8.0f);
+      channel_loss *= w;
+      channel_loss2 *= w;
+    }
+    info_loss_sum += channel_loss;
+    info_loss2_sum += channel_loss2;
+    entropy += cmul * GetLane(SumOfLanes(df, entropy_v));
 
-    const size_t num_nzeros =
-        GetLane(SumOfLanes(df, nzeros_v));
+    // Protect X/chroma information in larger transforms, matching the old
+    // selector's explicit large-block ringing penalty, but entirely in DCT
+    // space. This is especially important for saturated colour edges.
+    // Accumulate quantization error by channel so only X receives this extra
+    // weighting.
+    // (The current loop keeps diff live until the end of the channel.)
+    const size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
+    entropy += cost1 * static_cast<float>(num_nzeros);
     const size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
     entropy += config.zeros_mul *
                (CeilLog2Nonzero(nbits + 17) + nbits);
   }
 
-  const float loss1 = GetLane(SumOfLanes(df, info_loss));
-  const float loss2 =
-      std::sqrt(num_blocks * GetLane(SumOfLanes(df, info_loss2)));
+  const float loss1 = info_loss_sum;
+  const float loss2 = std::sqrt(num_blocks * info_loss2_sum);
   static constexpr float kInfoLossMultiplier2 = 50.46839691767866f;
   const float detail_loss =
       masking * (config.info_loss_multiplier * loss1 +
@@ -534,7 +557,7 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       continue;
     }
     AcStrategy acs = AcStrategy::FromRawStrategy(tx.type);
-    float entropy_mul = tx.entropy_mul / kTransforms8x8[0].entropy_mul;
+    float entropy_mul = static_cast<float>(tx.entropy_mul);
     if ((tx.type == AcStrategyType::DCT2X2 ||
          tx.type == AcStrategyType::IDENTITY) &&
         butteraugli_target < 5.0) {
@@ -553,7 +576,7 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       entropy_mul += kAvoidEntropyOfTransforms * mul;
     }
     float entropy;
-    JXL_RETURN_IF_ERROR(EstimateEntropy(acs, 1.0f, x, y, config,
+    JXL_RETURN_IF_ERROR(EstimateEntropy(acs, 1.0f, butteraugli_target, x, y, config,
                                         cmap_factors, block, scratch_space,
                                         quantized, entropy));
     entropy = static_cast<float>(tx.entropy_add + entropy_mul * entropy);
@@ -573,7 +596,8 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
                    size_t cy, const ACSConfig& config,
                    const float* JXL_RESTRICT cmap_factors,
                    AcStrategyImage* JXL_RESTRICT ac_strategy,
-                   const float entropy_mul, const uint8_t candidate_priority,
+                   const float entropy_mul, const float butteraugli_target,
+                   const uint8_t candidate_priority,
                    uint8_t* priority, float* JXL_RESTRICT entropy_estimate,
                    float* block, float* scratch_space, uint32_t* quantized) {
   AcStrategy acs = AcStrategy::FromRawStrategy(acs_raw);
@@ -591,7 +615,7 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
   }
   float entropy_candidate;
   JXL_RETURN_IF_ERROR(EstimateEntropy(
-      acs, entropy_mul, (bx + cx) * 8, (by + cy) * 8, config, cmap_factors,
+      acs, entropy_mul, butteraugli_target, (bx + cx) * 8, (by + cy) * 8, config, cmap_factors,
       block, scratch_space, quantized, entropy_candidate));
   if (entropy_candidate >= entropy_current) return true;
   // Accept the candidate.
@@ -656,7 +680,8 @@ AcStrategyType AcsHorizontalSplit(size_t blocks) {
 // of blocks X blocks size, where a block is 8x8 pixels.
 Status FindBestFirstLevelDivisionForSquare(
     size_t blocks, bool allow_square_transform, size_t bx, size_t by, size_t cx,
-    size_t cy, const ACSConfig& config, const float* JXL_RESTRICT cmap_factors,
+    size_t cy, const ACSConfig& config, float butteraugli_target,
+    const float* JXL_RESTRICT cmap_factors,
     AcStrategyImage* JXL_RESTRICT ac_strategy, const float entropy_mul_JXK,
     const float entropy_mul_JXJ, float* JXL_RESTRICT entropy_estimate,
     float* block, float* scratch_space, uint32_t* quantized) {
@@ -709,12 +734,14 @@ Status FindBestFirstLevelDivisionForSquare(
   if (allow_JXK) {
     if (row0[bx + cx + 0].Strategy() != acs_rawJXK) {
       JXL_RETURN_IF_ERROR(EstimateEntropy(
-          acsJXK, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
+          acsJXK, entropy_mul_JXK, butteraugli_target,
+          (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
           cmap_factors, block, scratch_space, quantized, entropy_JXK_left));
     }
     if (row0[bx + cx + blocks_half].Strategy() != acs_rawJXK) {
       JXL_RETURN_IF_ERROR(
-          EstimateEntropy(acsJXK, entropy_mul_JXK, (bx + cx + blocks_half) * 8,
+          EstimateEntropy(acsJXK, entropy_mul_JXK, butteraugli_target,
+                          (bx + cx + blocks_half) * 8,
                           (by + cy + 0) * 8, config, cmap_factors, block,
                           scratch_space, quantized, entropy_JXK_right));
     }
@@ -722,12 +749,14 @@ Status FindBestFirstLevelDivisionForSquare(
   if (allow_KXJ) {
     if (row0[bx + cx].Strategy() != acs_rawKXJ) {
       JXL_RETURN_IF_ERROR(EstimateEntropy(
-          acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
+          acsKXJ, entropy_mul_JXK, butteraugli_target,
+          (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
           cmap_factors, block, scratch_space, quantized, entropy_KXJ_top));
     }
     if (row1[bx + cx].Strategy() != acs_rawKXJ) {
       JXL_RETURN_IF_ERROR(
-          EstimateEntropy(acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8,
+          EstimateEntropy(acsKXJ, entropy_mul_JXK, butteraugli_target,
+                          (bx + cx + 0) * 8,
                           (by + cy + blocks_half) * 8, config, cmap_factors,
                           block, scratch_space, quantized, entropy_KXJ_bottom));
     }
@@ -737,7 +766,8 @@ Status FindBestFirstLevelDivisionForSquare(
     // we can turn it off at high decoding speeds for 32x32, but still allow
     // exploring 16x32 and 32x16.
     JXL_RETURN_IF_ERROR(EstimateEntropy(
-        acsJXJ, entropy_mul_JXJ, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
+        acsJXJ, entropy_mul_JXJ, butteraugli_target,
+        (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
         cmap_factors, block, scratch_space, quantized, entropy_JXJ));
   }
 
@@ -907,7 +937,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 8 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  8, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+                  8, true, bx, by, cx, cy, config, butteraugli_target, cmap_factors,
+                  ac_strategy,
                   mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
                   scratch_space, quantized));
             }
@@ -931,8 +962,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 4 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  4, enable_32x32, bx, by, cx, cy, config, cmap_factors,
-                  ac_strategy, mt.entropy_mul, entropy_mul32X32,
+                  4, enable_32x32, bx, by, cx, cy, config, butteraugli_target,
+                  cmap_factors, ac_strategy, mt.entropy_mul, entropy_mul32X32,
                   entropy_estimate, block, scratch_space, quantized));
             }
             continue;
@@ -954,7 +985,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 2 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+                  2, true, bx, by, cx, cy, config, butteraugli_target,
+                  cmap_factors, ac_strategy,
                   mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
                   scratch_space, quantized));
             }
@@ -979,7 +1011,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         // normal integral transform merging process.
         JXL_RETURN_IF_ERROR(
             TryMergeAcs(mt.type, bx, by, cx, cy, config, cmap_factors,
-                        ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
+                        ac_strategy, mt.entropy_mul, butteraugli_target, mt.priority,
+                        &priority[0],
                         entropy_estimate, block, scratch_space, quantized));
       }
     }
@@ -993,7 +1026,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     for (size_t cx = 0; cx + 1 < rect.xsize(); ++cx) {
       if ((cy | cx) % 2 != 0) {
         JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-            2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+            2, true, bx, by, cx, cy, config, butteraugli_target,
+                  cmap_factors, ac_strategy,
             entropy_mul16X8, entropy_mul16X16, entropy_estimate, block,
             scratch_space, quantized));
       }
@@ -1007,7 +1041,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         continue;  // Already tried with loop above (DCT16X32 case).
       }
       JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-          4, enable_32x32, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+          4, enable_32x32, bx, by, cx, cy, config, butteraugli_target,
+          cmap_factors, ac_strategy,
           entropy_mul16X32, entropy_mul32X32, entropy_estimate, block,
           scratch_space, quantized));
     }
@@ -1061,18 +1096,12 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   config.src_rows[2] = rect_in.ConstPlaneRow(src, 2, 0);
   config.src_stride = src.PixelsPerRow();
 
-  // Entropy estimate is composed of two factors:
-  //  - estimate of the number of bits that will be used by the block
-  //  - information loss due to quantization
-  // The following constant controls the relative weights of these components.
+  // Older selector calibration. These constants are intentionally kept close
+  // to the older branch; quality dependence lives in the coefficient pricing
+  // (cost1), while these terms remain fixed.
   config.info_loss_multiplier = 138.0f;
   config.zeros_mul = 7.565053364251793f;
-
-  // Preserve the older selector's coefficient-domain cost calibration.
-  // This intentionally avoids an extra per-candidate spatial loss pass.
-  // cost_delta controls the inexpensive coefficient entropy proxy; keep it
-  // quality-dependent, but do not rescale the DCT-domain loss terms.
-  config.cost_delta = 5.335918493451634f;
+  config.cost_delta = 5.3359184934516337f;
   return true;
 }
 

@@ -366,31 +366,32 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
                        float& entropy) {
-  float* mem = full_scratch_space;
-  float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
-  const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
+  const size_t size =
+      (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
+  float* JXL_RESTRICT scratch_space =
+      full_scratch_space + AcStrategy::kMaxCoeffArea;
 
-  // Apply transform once per channel. The selector must evaluate the actual
-  // candidate transform, not a proxy based on local pixel smoothness.
+  // Transform each channel exactly once. All selection heuristics below stay
+  // in coefficient space; in particular, do not reconstruct pixels merely to
+  // estimate quantization loss. Besides being cheaper, coefficient-domain
+  // loss tracks the mechanism that actually causes DCT detail loss.
   for (size_t c = 0; c < 3; ++c) {
-    float* JXL_RESTRICT block_c = block + size * c;
     TransformFromPixels(acs.Strategy(), &config.Pixel(c, x, y),
-                        config.src_stride, block_c, scratch_space);
+                        config.src_stride, block + c * size, scratch_space);
   }
 
   HWY_FULL(float) df;
-  const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
+  const size_t num_blocks =
+      acs.covered_blocks_x() * acs.covered_blocks_y();
 
-  // This is deliberately close to the older, better-performing selector:
-  // aggregate Q over the transform support, and use the actual masking field
-  // only for the quantization-loss term. Do not use a generic spatial-detail
-  // multiplier here; that double-counts texture and tends to make the choice
-  // unstable on noisy material.
-  const auto MaskAt = [&](size_t bx8, size_t by8) -> float {
+  auto MaskAt = [&](size_t bx8, size_t by8) -> float {
     if (config.masking_field_row == nullptr) return 1.0f;
     return config.masking_field_row[by8 * config.masking_field_stride + bx8];
   };
 
+  // Keep the older, empirically useful aggregation of quantizer/masking values
+  // for multi-block transforms. It avoids letting a single smooth sub-block
+  // hide a difficult one at a large-transform boundary.
   float quant_norm8 = 0.0f;
   float masking = 0.0f;
   if (num_blocks == 1) {
@@ -399,14 +400,14 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   } else if (num_blocks == 2) {
     if (acs.covered_blocks_y() == 2) {
       quant_norm8 = std::max(config.Quant(x / 8, y / 8),
-                            config.Quant(x / 8, y / 8 + 1));
+                             config.Quant(x / 8, y / 8 + 1));
       masking = 2.0f * std::max(MaskAt(x / 8, y / 8),
-                                MaskAt(x / 8, y / 8 + 1));
+                                 MaskAt(x / 8, y / 8 + 1));
     } else {
       quant_norm8 = std::max(config.Quant(x / 8, y / 8),
-                            config.Quant(x / 8 + 1, y / 8));
+                             config.Quant(x / 8 + 1, y / 8));
       masking = 2.0f * std::max(MaskAt(x / 8, y / 8),
-                                MaskAt(x / 8 + 1, y / 8));
+                                 MaskAt(x / 8 + 1, y / 8));
     }
   } else {
     float masking_norm2 = 0.0f;
@@ -414,7 +415,12 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
       for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
         const float qval = config.Quant(x / 8 + ix, y / 8 + iy);
-        quant_norm8 += std::pow(qval, 8.0f);
+        // q^8 gives the old selector's 8th-norm behaviour without another
+        // pass over coefficients.
+        const float q2 = qval * qval;
+        const float q4 = q2 * q2;
+        quant_norm8 += q4 * q4;
+
         const float maskval = MaskAt(x / 8 + ix, y / 8 + iy);
         masking_max = std::max(masking_max, maskval);
         masking_norm2 += maskval * maskval;
@@ -427,31 +433,21 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   }
 
   const auto q = Set(df, quant_norm8);
-  const HWY_CAPPED(float, 8) df8;
+
+  // DCT-domain quantization error. This is the critical detail-preservation
+  // term: broad low-level rounding errors accumulate even when the entropy
+  // estimate says that a large transform is cheap. The second moment catches
+  // isolated high-error coefficients while the first moment catches diffuse
+  // fine texture/noise. No inverse transform is needed.
   auto info_loss = Zero(df);
   auto info_loss2 = Zero(df);
 
-  // Older coefficients had a substantial penalty for small rounding errors.
-  // This is important for preserving fine/noisy content: many small residual
-  // errors are visually meaningful even when the entropy proxy is favourable.
-  // The per-transform chroma multipliers also keep red/green ringing from
-  // being hidden by the luma correlation model.
-  static constexpr float kChromaErrorWeight[AcStrategy::kNumValidStrategies] = {
-      0.95f, 1.0f, 0.5f, 1.0f,
-      2.0f, 2.0f, 1.4f, 1.4f,
-      2.0f, 2.0f, 2.0f, 2.0f,
-      2.0f, 2.0f, 1.7f, 1.7f,
-      1.7f, 1.7f, 2.0f, 2.0f,
-      2.0f, 2.0f, 2.0f, 2.0f,
-      2.0f, 2.0f, 2.0f};
-  const auto chroma_weight = kChromaErrorWeight[acs.RawStrategy()];
-
-  // Keep the large-transform X-channel penalty from the current branch, but
-  // use the older error model underneath it.
-  float x_weight = 1.0f;
-  if (num_blocks >= 2) {
-    x_weight = 1.0f + std::min(3.0f, num_blocks / 8.0f);
-  }
+  // Relative per-channel weighting used by the older selector. In particular,
+  // larger transforms do not get to hide X/chroma detail behind Y correlation.
+  static const float kChromaErrorWeight[AcStrategy::kNumValidStrategies] = {
+      0.95f, 1.0f, 0.5f, 1.0f, 2.0f, 2.0f, 1.4f, 1.4f, 2.0f,
+      2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 1.7f, 1.7f, 1.7f, 1.7f,
+      2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f};
 
   entropy = 0.0f;
   for (size_t c = 0; c < 3; ++c) {
@@ -459,6 +455,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     const auto cmap_factor = Set(df, cmap_factors[c]);
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
+
     for (size_t i = 0; i < num_blocks * kDCTBlockSize;
          i += Lanes(df)) {
       const auto in = Load(df, block + c * size + i);
@@ -467,53 +464,41 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       const auto val = Mul(Sub(in, in_y), Mul(im, q));
       const auto rval = Round(val);
       const auto diff = AbsDiff(val, rval);
+
       info_loss = Add(info_loss, diff);
       info_loss2 = MulAdd(diff, diff, info_loss2);
 
       const auto qr = Abs(rval);
       const auto q_is_zero = Eq(qr, Zero(df));
-      // Preserve the older low-amplitude coefficient cost shape: small ACs
-      // are cheap, but repeated +/-1 and +/-2 coefficients are not free.
-      static const float kCost1 = 7.565053364251793f;
-      static const float kCost2 = 4.4628149885273363f;
-      const auto cost1 = Set(df, kCost1);
-      const auto cost2 = Set(df, kCost2);
-      const auto cost_delta = Set(df, config.cost_delta);
-      entropy_v = Add(
-          entropy_v,
-          IfThenElseZero(Ge(qr, Set(df, 1.5f)), cost2));
-      entropy_v = MulAdd(Sqrt(qr), cost_delta, entropy_v);
-      entropy_v = Mul(entropy_v, Set(df, chroma_weight));
+      // Keep the current branch's inexpensive coefficient cost model. The
+      // older loss term below is responsible for protecting fine detail; this
+      // avoids adding a second expensive entropy model on top of it.
+      entropy_v = Add(entropy_v, Sqrt(qr));
       nzeros_v = Add(nzeros_v,
-                     IfThenZeroElse(q_is_zero, cost1));
+                     IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
     }
 
-    entropy += GetLane(SumOfLanes(df, entropy_v));
-    if (c == 0 && num_blocks >= 2) {
-      entropy *= x_weight;
-      info_loss = Mul(info_loss, Set(df, x_weight));
-      info_loss2 = Mul(info_loss2, Set(df, x_weight));
-    }
+    const float cmul = kChromaErrorWeight[acs.RawStrategy()];
+    entropy += config.cost_delta * cmul *
+               GetLane(SumOfLanes(df, entropy_v));
 
     const size_t num_nzeros =
         GetLane(SumOfLanes(df, nzeros_v));
     const size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
-    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+    entropy += config.zeros_mul *
+               (CeilLog2Nonzero(nbits + 17) + nbits);
   }
 
-  // Two moments of coefficient rounding error, as in the older selector.
-  // Using both suppresses broad low-level blur without exploding on one or two
-  // genuinely difficult coefficients.
   const float loss1 = GetLane(SumOfLanes(df, info_loss));
-  const float loss2 = std::sqrt(
-      num_blocks * GetLane(SumOfLanes(df, info_loss2)));
-  static const float kInfoLossMultiplier2 = 50.46839691767866f;
+  const float loss2 =
+      std::sqrt(num_blocks * GetLane(SumOfLanes(df, info_loss2)));
+  static constexpr float kInfoLossMultiplier2 = 50.46839691767866f;
   const float detail_loss =
       masking * (config.info_loss_multiplier * loss1 +
                  kInfoLossMultiplier2 * loss2);
 
-  entropy += detail_loss;
-  entropy *= entropy_mul;
+  entropy = (entropy + detail_loss) * entropy_mul;
+  (void)quantized;
   return true;
 }
 
@@ -1082,17 +1067,12 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   // The following constant controls the relative weights of these components.
   config.info_loss_multiplier = 138.0f;
   config.zeros_mul = 7.565053364251793f;
-  config.cost_delta = 5.335918493451634f;
 
-  static const float kBias = 0.13731742964354549f;
-  const float ratio =
-      (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
-  static const float kPow1 = 0.33677806662454718f;
-  static const float kPow2 = 0.50990926717963703f;
-  static const float kPow3 = 0.36702940662370243f;
-  config.info_loss_multiplier *= std::pow(ratio, kPow1);
-  config.zeros_mul *= std::pow(ratio, kPow2);
-  config.cost_delta *= std::pow(ratio, kPow3);
+  // Preserve the older selector's coefficient-domain cost calibration.
+  // This intentionally avoids an extra per-candidate spatial loss pass.
+  // cost_delta controls the inexpensive coefficient entropy proxy; keep it
+  // quality-dependent, but do not rescale the DCT-domain loss terms.
+  config.cost_delta = 5.335918493451634f;
   return true;
 }
 

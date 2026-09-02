@@ -366,147 +366,154 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
                        float& entropy) {
-  entropy = 0.0f;
   float* mem = full_scratch_space;
   float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
 
-  // Apply transform.
-  for (size_t c = 0; c < 3; c++) {
+  // Apply transform once per channel. The selector must evaluate the actual
+  // candidate transform, not a proxy based on local pixel smoothness.
+  for (size_t c = 0; c < 3; ++c) {
     float* JXL_RESTRICT block_c = block + size * c;
     TransformFromPixels(acs.Strategy(), &config.Pixel(c, x, y),
                         config.src_stride, block_c, scratch_space);
   }
-  HWY_FULL(float) df;
 
+  HWY_FULL(float) df;
   const size_t num_blocks = acs.covered_blocks_x() * acs.covered_blocks_y();
-  // avoid large blocks when there is a lot going on in red-green.
-  float quant_norm16 = 0;
+
+  // This is deliberately close to the older, better-performing selector:
+  // aggregate Q over the transform support, and use the actual masking field
+  // only for the quantization-loss term. Do not use a generic spatial-detail
+  // multiplier here; that double-counts texture and tends to make the choice
+  // unstable on noisy material.
+  const auto MaskAt = [&](size_t bx8, size_t by8) -> float {
+    if (config.masking_field_row == nullptr) return 1.0f;
+    return config.masking_field_row[by8 * config.masking_field_stride + bx8];
+  };
+
+  float quant_norm8 = 0.0f;
+  float masking = 0.0f;
   if (num_blocks == 1) {
-    // When it is only one 8x8, we don't need aggregation of values.
-    quant_norm16 = config.Quant(x / 8, y / 8);
+    quant_norm8 = config.Quant(x / 8, y / 8);
+    masking = 2.0f * MaskAt(x / 8, y / 8);
   } else if (num_blocks == 2) {
-    // Taking max instead of 8th norm seems to work
-    // better for smallest blocks up to 16x8. Jyrki couldn't get
-    // improvements in trying the same for 16x16 blocks.
     if (acs.covered_blocks_y() == 2) {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8, y / 8 + 1));
+      quant_norm8 = std::max(config.Quant(x / 8, y / 8),
+                            config.Quant(x / 8, y / 8 + 1));
+      masking = 2.0f * std::max(MaskAt(x / 8, y / 8),
+                                MaskAt(x / 8, y / 8 + 1));
     } else {
-      quant_norm16 =
-          std::max(config.Quant(x / 8, y / 8), config.Quant(x / 8 + 1, y / 8));
+      quant_norm8 = std::max(config.Quant(x / 8, y / 8),
+                            config.Quant(x / 8 + 1, y / 8));
+      masking = 2.0f * std::max(MaskAt(x / 8, y / 8),
+                                MaskAt(x / 8 + 1, y / 8));
     }
   } else {
-    // Load QF value, calculate empirical heuristic on masking field
-    // for weighting the information loss. Information loss manifests
-    // itself as ringing, and masking could hide it.
-    for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-      for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-        float qval = config.Quant(x / 8 + ix, y / 8 + iy);
-        qval *= qval;
-        qval *= qval;
-        qval *= qval;
-        quant_norm16 += qval * qval;
+    float masking_norm2 = 0.0f;
+    float masking_max = 0.0f;
+    for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+      for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
+        const float qval = config.Quant(x / 8 + ix, y / 8 + iy);
+        quant_norm8 += std::pow(qval, 8.0f);
+        const float maskval = MaskAt(x / 8 + ix, y / 8 + iy);
+        masking_max = std::max(masking_max, maskval);
+        masking_norm2 += maskval * maskval;
       }
     }
-    quant_norm16 /= num_blocks;
-    quant_norm16 = FastPowf(quant_norm16, 1.0f / 16.0f);
+    quant_norm8 /= num_blocks;
+    quant_norm8 = FastPowf(quant_norm8, 1.0f / 8.0f);
+    masking_norm2 = std::sqrt(masking_norm2 / num_blocks);
+    masking = masking_norm2 + masking_max;
   }
-  const auto quant = Set(df, quant_norm16);
 
-  // Compute entropy.
+  const auto q = Set(df, quant_norm8);
   const HWY_CAPPED(float, 8) df8;
+  auto info_loss = Zero(df);
+  auto info_loss2 = Zero(df);
 
-  auto loss = Zero(df8);
-  for (size_t c = 0; c < 3; c++) {
+  // Older coefficients had a substantial penalty for small rounding errors.
+  // This is important for preserving fine/noisy content: many small residual
+  // errors are visually meaningful even when the entropy proxy is favourable.
+  // The per-transform chroma multipliers also keep red/green ringing from
+  // being hidden by the luma correlation model.
+  static constexpr float kChromaErrorWeight[AcStrategy::kNumValidStrategies] = {
+      0.95f, 1.0f, 0.5f, 1.0f,
+      2.0f, 2.0f, 1.4f, 1.4f,
+      2.0f, 2.0f, 2.0f, 2.0f,
+      2.0f, 2.0f, 1.7f, 1.7f,
+      1.7f, 1.7f, 2.0f, 2.0f,
+      2.0f, 2.0f, 2.0f, 2.0f,
+      2.0f, 2.0f, 2.0f};
+  const auto chroma_weight = kChromaErrorWeight[acs.RawStrategy()];
+
+  // Keep the large-transform X-channel penalty from the current branch, but
+  // use the older error model underneath it.
+  float x_weight = 1.0f;
+  if (num_blocks >= 2) {
+    x_weight = 1.0f + std::min(3.0f, num_blocks / 8.0f);
+  }
+
+  entropy = 0.0f;
+  for (size_t c = 0; c < 3; ++c) {
     const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
-    const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
     const auto cmap_factor = Set(df, cmap_factors[c]);
-
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
-    for (size_t i = 0; i < num_blocks * kDCTBlockSize; i += Lanes(df)) {
+    for (size_t i = 0; i < num_blocks * kDCTBlockSize;
+         i += Lanes(df)) {
       const auto in = Load(df, block + c * size + i);
       const auto in_y = Mul(Load(df, block + size + i), cmap_factor);
       const auto im = Load(df, inv_matrix + i);
-      const auto val = Mul(Sub(in, in_y), Mul(im, quant));
+      const auto val = Mul(Sub(in, in_y), Mul(im, q));
       const auto rval = Round(val);
-      const auto diff = Sub(val, rval);
-      const auto m = Load(df, matrix + i);
-      Store(Mul(m, diff), df, &mem[i]);
-      const auto q = Abs(rval);
-      const auto q_is_zero = Eq(q, Zero(df));
-      // We used to have q * C here, but that cost model seems to
-      // be punishing large values more than necessary. Sqrt tries
-      // to avoid large values less aggressively.
-      entropy_v = Add(Sqrt(q), entropy_v);
-      nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, Set(df, 1.0f)));
+      const auto diff = AbsDiff(val, rval);
+      info_loss = Add(info_loss, diff);
+      info_loss2 = MulAdd(diff, diff, info_loss2);
+
+      const auto qr = Abs(rval);
+      const auto q_is_zero = Eq(qr, Zero(df));
+      // Preserve the older low-amplitude coefficient cost shape: small ACs
+      // are cheap, but repeated +/-1 and +/-2 coefficients are not free.
+      static const float kCost1 = 7.565053364251793f;
+      static const float kCost2 = 4.4628149885273363f;
+      const auto cost1 = Set(df, kCost1);
+      const auto cost2 = Set(df, kCost2);
+      const auto cost_delta = Set(df, config.cost_delta);
+      entropy_v = Add(
+          entropy_v,
+          IfThenElseZero(Ge(qr, Set(df, 1.5f)), cost2));
+      entropy_v = MulAdd(Sqrt(qr), cost_delta, entropy_v);
+      entropy_v = Mul(entropy_v, Set(df, chroma_weight));
+      nzeros_v = Add(nzeros_v,
+                     IfThenZeroElse(q_is_zero, cost1));
     }
 
-    {
-      float masku_lut[3] = {
-          12.0,
-          0.0,
-          4.0,
-      };
-      auto masku_off = Set(df8, masku_lut[c]);
-      auto lossc = Zero(df8);
-      TransformToPixels(acs.Strategy(), &mem[0], block,
-                        acs.covered_blocks_x() * 8, scratch_space);
-
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          for (size_t dy = 0; dy < kBlockDim; ++dy) {
-            for (size_t dx = 0; dx < kBlockDim; dx += Lanes(df8)) {
-              auto in = Load(df8, block +
-                                      (iy * kBlockDim + dy) *
-                                          (acs.covered_blocks_x() * kBlockDim) +
-                                      ix * kBlockDim + dx);
-              if (x + ix * 8 + dx + Lanes(df8) <= config.mask1x1_xsize) {
-                auto masku =
-                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
-                                                       y + iy * 8 + dy)),
-                        masku_off);
-                in = Mul(masku, in);
-                in = Mul(in, in);
-                in = Mul(in, in);
-                in = Mul(in, in);
-                lossc = Add(lossc, in);
-              }
-            }
-          }
-        }
-      }
-      static const double kChannelMul[3] = {
-          pow(8.2, 8.0),
-          pow(1.0, 8.0),
-          pow(1.03, 8.0),
-      };
-      lossc = Mul(Set(df8, kChannelMul[c]), lossc);
-      loss = Add(loss, lossc);
-    }
-    entropy += config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
-    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
-    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
-    // number of non-zeros of the block.
-    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
-    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
-    // bias.
-    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+    entropy += GetLane(SumOfLanes(df, entropy_v));
     if (c == 0 && num_blocks >= 2) {
-      // It is X channel (red-green) and we often see ringing
-      // in the large blocks. Let's punish that more here.
-      float w = 1.0 + std::min(3.0, num_blocks / 8.0);
-      entropy *= w;
-      loss = Mul(loss, Set(df8, w));
+      entropy *= x_weight;
+      info_loss = Mul(info_loss, Set(df, x_weight));
+      info_loss2 = Mul(info_loss2, Set(df, x_weight));
     }
+
+    const size_t num_nzeros =
+        GetLane(SumOfLanes(df, nzeros_v));
+    const size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
+    entropy += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
   }
-  float loss_scalar =
-      pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
-          1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm16;
+
+  // Two moments of coefficient rounding error, as in the older selector.
+  // Using both suppresses broad low-level blur without exploding on one or two
+  // genuinely difficult coefficients.
+  const float loss1 = GetLane(SumOfLanes(df, info_loss));
+  const float loss2 = std::sqrt(
+      num_blocks * GetLane(SumOfLanes(df, info_loss2)));
+  static const float kInfoLossMultiplier2 = 50.46839691767866f;
+  const float detail_loss =
+      masking * (config.info_loss_multiplier * loss1 +
+                 kInfoLossMultiplier2 * loss2);
+
+  entropy += detail_loss;
   entropy *= entropy_mul;
-  entropy += config.info_loss_multiplier * loss_scalar;
   return true;
 }
 
@@ -520,59 +527,20 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   struct TransformTry8x8 {
     AcStrategyType type;
     int encoding_speed_tier_max_limit;
+    double entropy_add;
     double entropy_mul;
   };
   static const TransformTry8x8 kTransforms8x8[] = {
-      {
-          AcStrategyType::DCT,
-          9,
-          0.8,
-      },
-      {
-          AcStrategyType::DCT4X4,
-          5,
-          1.08,
-      },
-      {
-          AcStrategyType::DCT2X2,
-          5,
-          0.95,
-      },
-      {
-          AcStrategyType::DCT4X8,
-          4,
-          0.85931637428340035,
-      },
-      {
-          AcStrategyType::DCT8X4,
-          4,
-          0.85931637428340035,
-      },
-      {
-          AcStrategyType::IDENTITY,
-          5,
-          1.0427542510634957,
-      },
-      {
-          AcStrategyType::AFV0,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV1,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV2,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV3,
-          4,
-          0.81779489591359944,
-      },
+      {AcStrategyType::DCT, 9, 3.0, 0.745},
+      {AcStrategyType::DCT4X4, 5, 4.0, 0.70},
+      {AcStrategyType::DCT2X2, 5, 0.0, 0.66},
+      {AcStrategyType::DCT4X8, 4, 0.0, 0.700754622182473063},
+      {AcStrategyType::DCT8X4, 4, 0.0, 0.700754622182473063},
+      {AcStrategyType::IDENTITY, 5, 8.0, 0.81217614585585534},
+      {AcStrategyType::AFV0, 4, 3.0, 0.70086131125719425},
+      {AcStrategyType::AFV1, 4, 3.0, 0.70086131125719425},
+      {AcStrategyType::AFV2, 4, 3.0, 0.70086131125719425},
+      {AcStrategyType::AFV3, 4, 3.0, 0.70086131125719425},
   };
   double best = 1e30;
   best_tx = kTransforms8x8[0].type;
@@ -600,9 +568,10 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       entropy_mul += kAvoidEntropyOfTransforms * mul;
     }
     float entropy;
-    JXL_RETURN_IF_ERROR(EstimateEntropy(acs, entropy_mul, x, y, config,
+    JXL_RETURN_IF_ERROR(EstimateEntropy(acs, 1.0f, x, y, config,
                                         cmap_factors, block, scratch_space,
                                         quantized, entropy));
+    entropy = static_cast<float>(tx.entropy_add + entropy_mul * entropy);
     if (entropy < best) {
       best_tx = tx.type;
       best = entropy;
@@ -860,7 +829,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   float entropy_estimate[64] = {};
   // Favor all 8x8 transforms (against 16x8 and larger transforms)) at
   // low butteraugli_target distances.
-  static const float k8x8mul1 = -0.4;
+  static const float k8x8mul1 = -0.55;
   static const float k8x8mul2 = 1.0;
   static const float k8x8base = 1.4;
   const float mul8x8 = k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base);
@@ -889,12 +858,15 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // ringing next to sky etc. Optimization will find smaller numbers
   // and produce more ringing than is ideal. Larger numbers will
   // help stop ringing.
-  const float entropy_mul16X8 = 1.21;
-  const float entropy_mul16X16 = 1.34;
-  const float entropy_mul16X32 = 1.49;
-  const float entropy_mul32X32 = 1.48;
-  const float entropy_mul64X32 = 2.25;
-  const float entropy_mul64X64 = 2.25;
+  const float entropy_mul16X8 =
+      0.867f - 0.55f / (butteraugli_target + 1.6f);
+  const float entropy_mul16X16 =
+      0.80f - 0.35f / (butteraugli_target + 2.0f);
+  const float entropy_mul16X32 =
+      0.86f - 0.10f / (butteraugli_target + 2.5f);
+  const float entropy_mul32X32 = 0.94f;
+  const float entropy_mul64X32 = 1.29f;
+  const float entropy_mul64X64 = 1.52f;
   // TODO(jyrki): Consider this feedback in further changes:
   // Also effectively when the multipliers for smaller blocks are
   // below 1, this raises the bar for the bigger blocks even higher
@@ -1108,16 +1080,16 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   //  - estimate of the number of bits that will be used by the block
   //  - information loss due to quantization
   // The following constant controls the relative weights of these components.
-  config.info_loss_multiplier = 1.2;
-  config.zeros_mul = 9.3089059022677905;
-  config.cost_delta = 10.833273317067883;
+  config.info_loss_multiplier = 138.0f;
+  config.zeros_mul = 7.565053364251793f;
+  config.cost_delta = 5.335918493451634f;
 
-  static const float kBias = 0.13731742964354549;
-  const float ratio = (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
-
-  static const float kPow1 = 0.33677806662454718;
-  static const float kPow2 = 0.50990926717963703;
-  static const float kPow3 = 0.36702940662370243;
+  static const float kBias = 0.13731742964354549f;
+  const float ratio =
+      (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
+  static const float kPow1 = 0.33677806662454718f;
+  static const float kPow2 = 0.50990926717963703f;
+  static const float kPow3 = 0.36702940662370243f;
   config.info_loss_multiplier *= std::pow(ratio, kPow1);
   config.zeros_mul *= std::pow(ratio, kPow2);
   config.cost_delta *= std::pow(ratio, kPow3);

@@ -361,6 +361,99 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   return false;
 }
 
+// AV1-style variance partition hints. The supplied AV1 code provides the
+// per-block variance primitives, while AOM's variance-tree partitioner uses
+// them to force splits when a block is substantially more active than its
+// children or when child variances are highly imbalanced.
+//
+// JPEG XL does not expose the AV1 qindex/variance thresholds, so we preserve
+// the structure of the heuristic but normalize it by the variance of the
+// candidate's children. This makes the test independent of XYB's signal
+// scale and keeps it compatible with the existing entropy-based cost model.
+struct Av1VarianceMap {
+  float mean[64] = {};
+  float variance[64] = {};
+};
+
+static float AggregateVariance(const Av1VarianceMap& map, size_t x, size_t y,
+                               size_t blocks_x, size_t blocks_y) {
+  const size_t count = blocks_x * blocks_y;
+  if (count == 0) return 0.0f;
+
+  double sum_mean = 0.0;
+  double sum_second_moment = 0.0;
+  for (size_t iy = 0; iy < blocks_y; ++iy) {
+    for (size_t ix = 0; ix < blocks_x; ++ix) {
+      const float mean = map.mean[(y + iy) * 8 + x + ix];
+      const float var = map.variance[(y + iy) * 8 + x + ix];
+      sum_mean += mean;
+      sum_second_moment += static_cast<double>(var) +
+                           static_cast<double>(mean) * mean;
+    }
+  }
+  const double mean = sum_mean / count;
+  const double variance = sum_second_moment / count - mean * mean;
+  return static_cast<float>(std::max(0.0, variance));
+}
+
+// Returns true when the AV1-style variance tree would classify this square as
+// split-only at the current level. The thresholds are intentionally expressed
+// as ratios because JXL's XYB values and AV1's 8-bit luma variance have
+// different units. The most important AV1 behaviors are retained:
+//   * large parent-vs-child variance forces a split;
+//   * strong min/max child imbalance forces a split;
+//   * the test becomes more sensitive at larger tree levels.
+static bool Av1ShouldForceSplitSquare(const Av1VarianceMap& map, size_t x,
+                                      size_t y, size_t blocks) {
+  if (blocks < 2 || blocks > 8 || (blocks & (blocks - 1)) != 0) {
+    return false;
+  }
+
+  const size_t half = blocks / 2;
+  float child_var[4];
+  child_var[0] = AggregateVariance(map, x, y, half, half);
+  child_var[1] = AggregateVariance(map, x + half, y, half, half);
+  child_var[2] = AggregateVariance(map, x, y + half, half, half);
+  child_var[3] = AggregateVariance(map, x + half, y + half, half, half);
+
+  float min_var = child_var[0];
+  float max_var = child_var[0];
+  float avg_var = 0.0f;
+  for (float var : child_var) {
+    min_var = std::min(min_var, var);
+    max_var = std::max(max_var, var);
+    avg_var += var;
+  }
+  avg_var *= 0.25f;
+
+  const float parent_var = AggregateVariance(map, x, y, blocks, blocks);
+  const float eps = 1e-12f;
+  const float parent_ratio = parent_var / (avg_var + eps);
+  const float spread_ratio = (max_var - min_var) / (avg_var + eps);
+
+  if (blocks == 2) {
+    // AV1's 16x16 stage uses the largest contrast between 8x8 children as a
+    // split signal. A ratio threshold is the scale-free equivalent.
+    return spread_ratio > 4.0f || parent_ratio > 3.0f;
+  }
+  if (blocks == 4) {
+    // AV1 additionally compares 32x32 variance against its average 16x16
+    // activity and forces the upper levels when it is clearly too complex.
+    return parent_ratio > 2.25f ||
+           (spread_ratio > 3.0f && max_var > 1.5f * (avg_var + eps));
+  }
+
+  // 64x64: AV1 pays particular attention to heterogeneous 32x32 children.
+  return parent_ratio > 2.0f ||
+         (spread_ratio > 2.5f && max_var > 1.4f * (avg_var + eps));
+}
+
+static bool IsSquareMerge(AcStrategyType type) {
+  return type == AcStrategyType::DCT16X16 ||
+         type == AcStrategyType::DCT32X32 ||
+         type == AcStrategyType::DCT64X64;
+}
+
 Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
@@ -618,6 +711,7 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
 Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
                    size_t cy, const ACSConfig& config,
                    const float* JXL_RESTRICT cmap_factors,
+                   const Av1VarianceMap& av1_variance,
                    AcStrategyImage* JXL_RESTRICT ac_strategy,
                    const float entropy_mul, const uint8_t candidate_priority,
                    uint8_t* priority, float* JXL_RESTRICT entropy_estimate,
@@ -635,6 +729,16 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
       entropy_current += entropy_estimate[(cy + iy) * 8 + (cx + ix)];
     }
   }
+  // Preserve AV1's split-only behavior for square partition levels.
+  // Rectangular candidates remain available so the entropy model can still
+  // select an orientation-aligned split.
+  if (IsSquareMerge(acs_raw)) {
+    const size_t blocks = acs.covered_blocks_x();
+    if (Av1ShouldForceSplitSquare(av1_variance, cx, cy, blocks)) {
+      return true;
+    }
+  }
+
   float entropy_candidate;
   JXL_RETURN_IF_ERROR(EstimateEntropy(
       acs, entropy_mul, (bx + cx) * 8, (by + cy) * 8, config, cmap_factors,
@@ -703,6 +807,7 @@ AcStrategyType AcsHorizontalSplit(size_t blocks) {
 Status FindBestFirstLevelDivisionForSquare(
     size_t blocks, bool allow_square_transform, size_t bx, size_t by, size_t cx,
     size_t cy, const ACSConfig& config, const float* JXL_RESTRICT cmap_factors,
+    const Av1VarianceMap& av1_variance,
     AcStrategyImage* JXL_RESTRICT ac_strategy, const float entropy_mul_JXK,
     const float entropy_mul_JXJ, float* JXL_RESTRICT entropy_estimate,
     float* block, float* scratch_space, uint32_t* quantized) {
@@ -778,7 +883,13 @@ Status FindBestFirstLevelDivisionForSquare(
                           block, scratch_space, quantized, entropy_KXJ_bottom));
     }
   }
-  if (allow_square_transform) {
+  // Match AV1's PART_EVAL_ONLY_SPLIT at the square tree levels. We still
+  // evaluate both rectangular orientations below, so this does not remove
+  // the entropy model's ability to select a directional split.
+  const bool allow_av1_square =
+      allow_square_transform &&
+      !Av1ShouldForceSplitSquare(av1_variance, cx, cy, blocks);
+  if (allow_av1_square) {
     // We control the exploration of the square transform separately so that
     // we can turn it off at high decoding speeds for 32x32, but still allow
     // exploring 16x32 and 32x16.
@@ -853,6 +964,33 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       cmap.base().YtoBRatio(cmap.ytob_map.ConstRow(ty)[tx]),
   };
   if (cparams.speed_tier > SpeedTier::kHare) return true;
+
+  // Build the luma variance tree once for this 64x64 working tile. In JXL,
+  // channel 1 is the Y-like component used by the existing Y-to-X/Y-to-B
+  // correlation model, so it is the closest analogue of AV1 luma. Keeping
+  // this cache local avoids rescanning pixels for every merge candidate.
+  Av1VarianceMap av1_variance;
+  for (size_t iy = 0; iy < rect.ysize(); ++iy) {
+    for (size_t ix = 0; ix < rect.xsize(); ++ix) {
+      const size_t px = 8 * (bx + ix);
+      const size_t py = 8 * (by + iy);
+      double sum = 0.0;
+      double sum_sq = 0.0;
+      for (size_t dy = 0; dy < 8; ++dy) {
+        for (size_t dx = 0; dx < 8; ++dx) {
+          const double v = config.Pixel(1, px + dx, py + dy);
+          sum += v;
+          sum_sq += v * v;
+        }
+      }
+      const double mean = sum / 64.0;
+      const double variance = std::max(0.0, sum_sq / 64.0 - mean * mean);
+      av1_variance.mean[iy * 8 + ix] = static_cast<float>(mean);
+      av1_variance.variance[iy * 8 + ix] =
+          static_cast<float>(variance);
+    }
+  }
+
   // First compute the best 8x8 transform for each square. Later, we do not
   // experiment with different combinations, but only use the best of the 8x8s
   // when DCT8X8 is specified in the tree search.
@@ -950,8 +1088,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 8 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  8, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-                  mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
+                  8, true, bx, by, cx, cy, config, cmap_factors, av1_variance,
+                  ac_strategy, mt.entropy_mul, entropy_mul64X64,
+                  entropy_estimate, block,
                   scratch_space, quantized));
             }
             continue;
@@ -975,7 +1114,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             if ((cy | cx) % 4 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   4, enable_32x32, bx, by, cx, cy, config, cmap_factors,
-                  ac_strategy, mt.entropy_mul, entropy_mul32X32,
+                  av1_variance, ac_strategy, mt.entropy_mul, entropy_mul32X32,
                   entropy_estimate, block, scratch_space, quantized));
             }
             continue;
@@ -997,9 +1136,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 2 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-                  mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
-                  scratch_space, quantized));
+                  2, true, bx, by, cx, cy, config, cmap_factors, av1_variance,
+                  ac_strategy, mt.entropy_mul, entropy_mul16X16, entropy_estimate,
+                  block, scratch_space, quantized));
             }
             continue;
           } else if (mt.type == AcStrategyType::DCT16X8) {
@@ -1022,7 +1161,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         // normal integral transform merging process.
         JXL_RETURN_IF_ERROR(
             TryMergeAcs(mt.type, bx, by, cx, cy, config, cmap_factors,
-                        ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
+                        av1_variance, ac_strategy, mt.entropy_mul, mt.priority,
+                        &priority[0],
                         entropy_estimate, block, scratch_space, quantized));
       }
     }
@@ -1036,9 +1176,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     for (size_t cx = 0; cx + 1 < rect.xsize(); ++cx) {
       if ((cy | cx) % 2 != 0) {
         JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-            2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-            entropy_mul16X8, entropy_mul16X16, entropy_estimate, block,
-            scratch_space, quantized));
+            2, true, bx, by, cx, cy, config, cmap_factors, av1_variance,
+            ac_strategy, entropy_mul16X8, entropy_mul16X16, entropy_estimate,
+            block, scratch_space, quantized));
       }
     }
   }
@@ -1050,9 +1190,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         continue;  // Already tried with loop above (DCT16X32 case).
       }
       JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-          4, enable_32x32, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-          entropy_mul16X32, entropy_mul32X32, entropy_estimate, block,
-          scratch_space, quantized));
+          4, enable_32x32, bx, by, cx, cy, config, cmap_factors, av1_variance,
+          ac_strategy, entropy_mul16X32, entropy_mul32X32, entropy_estimate,
+          block, scratch_space, quantized));
     }
   }
   return true;

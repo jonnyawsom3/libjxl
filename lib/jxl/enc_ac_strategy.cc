@@ -433,7 +433,6 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, float cost1,
   static constexpr float kCost2 = 4.4628149885273363f;
   static constexpr float kEntropyChannelMul[3] = {0.95f, 1.0f, 1.0f};
   const auto q = Set(df, quant_norm8);
-  const auto cost1_v = Set(df, cost1);
   const auto cost2_v = Set(df, kCost2);
   const auto cost_delta_v = Set(df, config.cost_delta);
 

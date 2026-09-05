@@ -574,8 +574,17 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
           0.81779489591359944,
       },
   };
-  double best = 1e30;
+  double best = std::numeric_limits<double>::max();
   best_tx = kTransforms8x8[0].type;
+
+  // Low-quality still-image behavior: keep DCT8 as the stable baseline,
+  // require small/alternative transforms to demonstrate a stronger RD win,
+  // and increasingly discourage their extra coefficient structure as the
+  // target distance rises. This is analogous to Tune-4's more conservative
+  // transform search, adapted to JXL's entropy model.
+  const float lowq =
+      std::min(1.0f, std::max(0.0f, (butteraugli_target - 3.0f) / 7.0f));
+
   for (auto tx : kTransforms8x8) {
     if (tx.encoding_speed_tier_max_limit < encoding_speed_tier) {
       continue;
@@ -589,6 +598,24 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       float weight = pow((5.0f - butteraugli_target) / 5.0f, 2.0f);
       entropy_mul -= kFavor2X2AtHighQuality * weight;
     }
+
+    // At aggressive compression, isolated small transforms tend to spend
+    // bits on detail that is no longer stable after quantization. Keep them
+    // available for real edges, but raise their RD bar gradually.
+    if (tx.type == AcStrategyType::DCT2X2 ||
+        tx.type == AcStrategyType::IDENTITY) {
+      entropy_mul += 0.12f * lowq;
+    } else if (tx.type == AcStrategyType::DCT4X4 ||
+               tx.type == AcStrategyType::DCT4X8 ||
+               tx.type == AcStrategyType::DCT8X4) {
+      entropy_mul += 0.035f * lowq;
+    } else if (tx.type == AcStrategyType::AFV0 ||
+               tx.type == AcStrategyType::AFV1 ||
+               tx.type == AcStrategyType::AFV2 ||
+               tx.type == AcStrategyType::AFV3) {
+      entropy_mul += 0.025f * lowq;
+    }
+
     if ((tx.type != AcStrategyType::DCT && tx.type != AcStrategyType::DCT2X2 &&
          tx.type != AcStrategyType::IDENTITY) &&
         butteraugli_target > 4.0) {

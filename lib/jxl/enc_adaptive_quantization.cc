@@ -312,21 +312,94 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
   return Add(Set(d, scalar_sum_y), out_val);
 }
 
+template <class D, class V>
+V PsyVarianceBoostModulation(const D d, const size_t x, const size_t y,
+                             const ImageF& xyb_y, const Rect& rect,
+                             const float butteraugli_target,
+                             const V out_val) {
+  // SVT-AV1-PSY-inspired low-contrast protection. JXL's quantizer is
+  // exponent-based, so a negative modulation allocates more precision.
+  if (butteraugli_target <= 2.0f || xyb_y.xsize() < 8 || xyb_y.ysize() < 8) {
+    return out_val;
+  }
+
+  const float lowq =
+      std::min(1.0f, std::max(0.0f, (butteraugli_target - 2.0f) / 8.0f));
+  const size_t max_x = xyb_y.xsize() - 8;
+  const size_t max_y = xyb_y.ysize() - 8;
+
+  auto variance8x8 = [&](const size_t bx, const size_t by) {
+    const size_t cx = std::min(bx, max_x);
+    const size_t cy = std::min(by, max_y);
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    for (size_t dy = 0; dy < 8; ++dy) {
+      const float* row = rect.ConstRow(xyb_y, cy + dy) + cx;
+      for (size_t dx = 0; dx < 8; ++dx) {
+        const double v = row[dx];
+        sum += v;
+        sum_sq += v * v;
+      }
+    }
+    const double mean = sum * (1.0 / 64.0);
+    double variance = sum_sq * (1.0 / 64.0) - mean * mean;
+    if (variance < 0.0) variance = 0.0;
+    return static_cast<float>(variance);
+  };
+
+  const int64_t ix = static_cast<int64_t>(x);
+  const int64_t iy = static_cast<int64_t>(y);
+  const int64_t max_x_i = static_cast<int64_t>(max_x);
+  const int64_t max_y_i = static_cast<int64_t>(max_y);
+  const float center_var = variance8x8(x, y);
+  float neighborhood = 0.0f;
+  for (int oy = -1; oy <= 1; ++oy) {
+    for (int ox = -1; ox <= 1; ++ox) {
+      const int64_t bx = std::max<int64_t>(
+          0, std::min<int64_t>(max_x_i, ix + ox * 8));
+      const int64_t by = std::max<int64_t>(
+          0, std::min<int64_t>(max_y_i, iy + oy * 8));
+      neighborhood += variance8x8(static_cast<size_t>(bx),
+                                   static_cast<size_t>(by));
+    }
+  }
+  neighborhood *= 1.0f / 9.0f;
+
+  constexpr float kEpsilon = 1e-7f;
+  if (neighborhood <= kEpsilon) return out_val;
+
+  const float low_contrast = std::min(
+      1.0f, std::max(0.0f,
+                     (neighborhood - center_var) / (neighborhood + kEpsilon)));
+  const float texture =
+      center_var / (center_var + 32.0f * kEpsilon);
+
+  // Roughly corresponds to a gentle/medium variance boost, but in JXL
+  // exponent space. Keep this deliberately below the level that would turn
+  // smooth skies into bitrate sinks.
+  constexpr float kMaxBoost = 0.10f;
+  const float boost = kMaxBoost * lowq * low_contrast * texture;
+  return Sub(out_val, Set(d, boost));
+}
+
 void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                          const ImageF& xyb_y, const ImageF& xyb_b,
                          const Rect& rect_in, const float scale,
                          const Rect& rect_out, ImageF* out) {
-  float base_level = 0.48f * scale;
-  float kDampenRampStart = 2.0f;
-  float kDampenRampEnd = 14.0f;
+  const float base_level = 0.48f * scale;
+  constexpr float kDampenRampStart = 2.0f;
+  constexpr float kDampenRampEnd = 14.0f;
+  constexpr float kMinDampen = 0.30f;
+
   float dampen = 1.0f;
   if (butteraugli_target >= kDampenRampStart) {
-    dampen = 1.0f - ((butteraugli_target - kDampenRampStart) /
-                     (kDampenRampEnd - kDampenRampStart));
-    if (dampen < 0) {
-      dampen = 0;
-    }
+    const float t =
+        (butteraugli_target - kDampenRampStart) /
+        (kDampenRampEnd - kDampenRampStart);
+    dampen = 1.0f - 0.70f * std::min(1.0f, std::max(0.0f, t));
+    dampen = std::max(kMinDampen, dampen);
   }
+
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
   for (size_t iy = rect_out.y0(); iy < rect_out.y1(); iy++) {
@@ -334,15 +407,16 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
     float* const JXL_RESTRICT row_out = out->Row(iy);
     const HWY_CAPPED(float, kBlockDim) df;
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
-      size_t x = ix * 8;
+      const size_t x = ix * 8;
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
       mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
       auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
       out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
                                             rect_in, mask_val));
-      // We want multiplicative quantization field, so everything
-      // until this point has been modulating the exponent.
-      row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
+      out_val = PsyVarianceBoostModulation(
+          df, x, y, xyb_y, rect_in, butteraugli_target, out_val);
+      row_out[ix] =
+          FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
     }
   }
 }
@@ -968,8 +1042,12 @@ Status FindBestQuantization(const FrameHeader& frame_header,
   float initial_qf_min;
   float initial_qf_max;
   ImageMinMax(initial_quant_field, &initial_qf_min, &initial_qf_max);
-  float initial_qf_ratio = initial_qf_max / initial_qf_min;
-  float qf_max_deviation_low = std::sqrt(250 / initial_qf_ratio);
+  constexpr float kMinQuantField = 1e-6f;
+  initial_qf_min = std::max(initial_qf_min, kMinQuantField);
+  initial_qf_max = std::max(initial_qf_max, initial_qf_min);
+  const float initial_qf_ratio =
+      std::max(1.0f, initial_qf_max / initial_qf_min);
+  float qf_max_deviation_low = std::sqrt(250.0f / initial_qf_ratio);
   float asymmetry = 2;
   if (qf_max_deviation_low < asymmetry) asymmetry = qf_max_deviation_low;
   float qf_lower = initial_qf_min / (asymmetry * qf_max_deviation_low);
@@ -1176,9 +1254,11 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
         // compensate. If the error is below the target, decrease the qf.
         // However, to avoid an excessive increase of the qf, only do so if the
         // error is less than half the maximum allowed error.
-        const float qf_mul = (max_error < 0.5f)   ? max_error * 2.0f
-                             : (max_error > 1.0f) ? max_error
-                                                  : 1.0f;
+        constexpr float kMinQfMul = 0.125f;
+    const float qf_mul =
+        (max_error < 0.5f)   ? std::max(kMinQfMul, max_error * 2.0f)
+        : (max_error > 1.0f) ? std::max(kMinQfMul, max_error)
+                             : 1.0f;
         for (size_t qy = by; qy < by + acs.covered_blocks_y(); qy++) {
           float* JXL_RESTRICT quant_field_row = quant_field.Row(qy);
           for (size_t qx = bx; qx < bx + acs.covered_blocks_x(); qx++) {

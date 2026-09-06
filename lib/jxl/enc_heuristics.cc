@@ -826,7 +826,13 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
 
   std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
   std::vector<size_t> totals(9, 1);
-  static const float kFavorNoSmoothing = 0.99f;
+  const float lowq = std::min(
+      1.0f, std::max(0.0f, (cparams.butteraugli_distance - 2.5f) / 4.5f));
+  // At aggressive compression, EPF can erase the very texture that the
+  // perceptual AQ deliberately preserved. Give the unfiltered candidate a
+  // stronger RD preference while still allowing smoothing where measured
+  // error warrants it.
+  const float kFavorNoSmoothing = 0.985f - 0.035f * lowq;
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
@@ -987,7 +993,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     const float distance = cparams.butteraugli_distance;
     const float t = std::min(1.0f,
                              std::max(0.0f, (distance - 2.0f) / 10.0f));
-    const float gab_weight = 1.0f - 0.06f * t;
+    const float gab_weight = 1.0f - 0.10f * t;
     float weight[3] = {gab_weight, gab_weight, gab_weight};
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }

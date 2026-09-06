@@ -312,109 +312,177 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
   return Add(Set(d, scalar_sum_y), out_val);
 }
 
-template <class D, class V>
-V PsyVarianceBoostModulation(const D d, const size_t x, const size_t y,
-                             const ImageF& xyb_y, const Rect& rect,
-                             const float butteraugli_target,
-                             const V out_val) {
-  // SVT-AV1-PSY-inspired low-contrast protection. JXL's quantizer is
-  // exponent-based, so a negative modulation allocates more precision.
-  if (butteraugli_target <= 2.0f || xyb_y.xsize() < 8 || xyb_y.ysize() < 8) {
-    return out_val;
+Status ComputePsyVarianceBoostMap(const ImageF& xyb_y,
+                                  const Rect& rect_in,
+                                  const Rect& rect_out,
+                                  float butteraugli_target,
+                                  std::vector<float>* boost_map) {
+  const size_t blocks_x = rect_out.xsize();
+  const size_t blocks_y = rect_out.ysize();
+  boost_map->assign(blocks_x * blocks_y, 0.0f);
+
+  // Keep this feature out of high-fidelity encodes. The useful operating
+  // range is the aggressive still-image regime.
+  if (butteraugli_target <= 2.5f || xyb_y.xsize() < 8 ||
+      xyb_y.ysize() < 8) {
+    return true;
   }
 
-  const float lowq =
-      std::min(1.0f, std::max(0.0f, (butteraugli_target - 2.0f) / 8.0f));
-  const size_t max_x = xyb_y.xsize() - 8;
-  const size_t max_y = xyb_y.ysize() - 8;
+  const float lowq = std::min(
+      1.0f, std::max(0.0f, (butteraugli_target - 2.5f) / 4.5f));
 
-  auto variance8x8 = [&](const size_t bx, const size_t by) {
-    const size_t cx = std::min(bx, max_x);
-    const size_t cy = std::min(by, max_y);
+  const size_t image_x_blocks = xyb_y.xsize() / kBlockDim;
+  const size_t image_y_blocks = xyb_y.ysize() / kBlockDim;
+  if (image_x_blocks == 0 || image_y_blocks == 0) return true;
+
+  auto variance8 = [&](size_t bx, size_t by) {
+    bx = std::min(bx, image_x_blocks - 1);
+    by = std::min(by, image_y_blocks - 1);
+
+    const size_t x = bx * kBlockDim;
+    const size_t y = by * kBlockDim;
+
     double sum = 0.0;
     double sum_sq = 0.0;
-    for (size_t dy = 0; dy < 8; ++dy) {
-      const float* row = rect.ConstRow(xyb_y, cy + dy) + cx;
-      for (size_t dx = 0; dx < 8; ++dx) {
+    for (size_t dy = 0; dy < kBlockDim; ++dy) {
+      const float* row = rect_in.ConstRow(xyb_y, y + dy) + x;
+      for (size_t dx = 0; dx < kBlockDim; ++dx) {
         const double v = row[dx];
         sum += v;
         sum_sq += v * v;
       }
     }
-    const double mean = sum * (1.0 / 64.0);
-    double variance = sum_sq * (1.0 / 64.0) - mean * mean;
-    if (variance < 0.0) variance = 0.0;
-    return static_cast<float>(variance);
+    const double mean = sum / 64.0;
+    double var = sum_sq / 64.0 - mean * mean;
+    if (var < 0.0) var = 0.0;
+    return static_cast<float>(var);
   };
 
-  const int64_t ix = static_cast<int64_t>(x);
-  const int64_t iy = static_cast<int64_t>(y);
-  const int64_t max_x_i = static_cast<int64_t>(max_x);
-  const int64_t max_y_i = static_cast<int64_t>(max_y);
-  const float center_var = variance8x8(x, y);
-  float neighborhood = 0.0f;
-  for (int oy = -1; oy <= 1; ++oy) {
-    for (int ox = -1; ox <= 1; ++ox) {
-      const int64_t bx = std::max<int64_t>(
-          0, std::min<int64_t>(max_x_i, ix + ox * 8));
-      const int64_t by = std::max<int64_t>(
-          0, std::min<int64_t>(max_y_i, iy + oy * 8));
-      neighborhood += variance8x8(static_cast<size_t>(bx),
-                                   static_cast<size_t>(by));
+  const size_t sbx0 = rect_out.x0() / 8;
+  const size_t sby0 = rect_out.y0() / 8;
+  const size_t sbx1 = DivCeil(rect_out.x1(), static_cast<size_t>(8));
+  const size_t sby1 = DivCeil(rect_out.y1(), static_cast<size_t>(8));
+
+  for (size_t sby = sby0; sby < sby1; ++sby) {
+    for (size_t sbx = sbx0; sbx < sbx1; ++sbx) {
+      std::array<float, 64> vars;
+      for (size_t iy = 0; iy < 8; ++iy) {
+        for (size_t ix = 0; ix < 8; ++ix) {
+          vars[iy * 8 + ix] = variance8(sbx * 8 + ix, sby * 8 + iy);
+        }
+      }
+
+      std::array<float, 64> sorted = vars;
+      std::sort(sorted.begin(), sorted.end());
+
+      // Weighted center statistic, modeled on the octile idea used by
+      // SVT-AV1-PSY. It is more stable for still images than a single
+      // percentile.
+      const float pivot =
+          0.25f * sorted[24] + 0.50f * sorted[32] + 0.25f * sorted[40];
+
+      constexpr float kVarianceEpsilon = 1e-8f;
+
+      for (size_t iy = 0; iy < 8; ++iy) {
+        for (size_t ix = 0; ix < 8; ++ix) {
+          const size_t gx = sbx * 8 + ix;
+          const size_t gy = sby * 8 + iy;
+
+          if (gx < rect_out.x0() || gx >= rect_out.x1() ||
+              gy < rect_out.y0() || gy >= rect_out.y1()) {
+            continue;
+          }
+
+          const float var = vars[iy * 8 + ix];
+
+          float relative_low =
+              (pivot - var) / (pivot + kVarianceEpsilon);
+          relative_low = std::min(1.0f, std::max(0.0f, relative_low));
+
+          // Avoid turning featureless skies/walls into a bitrate sink.
+          const float activity =
+              std::sqrt(var) / (std::sqrt(var) + 0.0045f);
+
+          // Materially stronger than the first pass. At maximum strength this
+          // can lower Q by roughly 18% in selected blocks.
+          constexpr float kMaxBoost = 0.28f;
+          const float strength =
+              lowq * (0.35f + 0.65f * lowq);
+          float boost =
+              kMaxBoost * strength *
+              std::sqrt(relative_low) * activity;
+
+          // Smooth transition at the selection boundary.
+          boost *= boost / (boost + 0.08f);
+
+          const size_t ox = gx - rect_out.x0();
+          const size_t oy = gy - rect_out.y0();
+          (*boost_map)[oy * blocks_x + ox] = boost;
+        }
+      }
     }
   }
-  neighborhood *= 1.0f / 9.0f;
-
-  constexpr float kEpsilon = 1e-7f;
-  if (neighborhood <= kEpsilon) return out_val;
-
-  const float low_contrast = std::min(
-      1.0f, std::max(0.0f,
-                     (neighborhood - center_var) / (neighborhood + kEpsilon)));
-  const float texture =
-      center_var / (center_var + 32.0f * kEpsilon);
-
-  // Roughly corresponds to a gentle/medium variance boost, but in JXL
-  // exponent space. Keep this deliberately below the level that would turn
-  // smooth skies into bitrate sinks.
-  constexpr float kMaxBoost = 0.10f;
-  const float boost = kMaxBoost * lowq * low_contrast * texture;
-  return Sub(out_val, Set(d, boost));
+  return true;
 }
 
-void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
-                         const ImageF& xyb_y, const ImageF& xyb_b,
-                         const Rect& rect_in, const float scale,
-                         const Rect& rect_out, ImageF* out) {
+void PerBlockModulations(const float butteraugli_target,
+                         const ImageF& xyb_x, const ImageF& xyb_y,
+                         const ImageF& xyb_b, const Rect& rect_in,
+                         const float scale, const Rect& rect_out,
+                         ImageF* out) {
   const float base_level = 0.48f * scale;
+
+  // Leave some adaptive masking in the low-quality regime, but give explicit
+  // texture allocation enough leverage to materially affect filesize.
   constexpr float kDampenRampStart = 2.0f;
-  constexpr float kDampenRampEnd = 14.0f;
-  constexpr float kMinDampen = 0.30f;
+  constexpr float kDampenRampEnd = 11.0f;
+  constexpr float kMinDampen = 0.18f;
 
   float dampen = 1.0f;
   if (butteraugli_target >= kDampenRampStart) {
     const float t =
         (butteraugli_target - kDampenRampStart) /
         (kDampenRampEnd - kDampenRampStart);
-    dampen = 1.0f - 0.70f * std::min(1.0f, std::max(0.0f, t));
+    dampen =
+        1.0f - 0.82f * std::min(1.0f, std::max(0.0f, t));
     dampen = std::max(kMinDampen, dampen);
   }
 
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
+
+  std::vector<float> variance_boost;
+  JXL_RETURN_IF_ERROR(ComputePsyVarianceBoostMap(
+      xyb_y, rect_in, rect_out, butteraugli_target, &variance_boost));
+
   for (size_t iy = rect_out.y0(); iy < rect_out.y1(); iy++) {
     const size_t y = iy * 8;
     float* const JXL_RESTRICT row_out = out->Row(iy);
     const HWY_CAPPED(float, kBlockDim) df;
+
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
       const size_t x = ix * 8;
+
       auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
-      mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
-      auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
-      out_val = PsyVarianceBoostModulation(
-          df, x, y, xyb_y, rect_in, butteraugli_target, out_val);
+      mask_val =
+          GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
+
+      auto out_val =
+          HfModulation(df, x, y, xyb_y, rect_in, mask_val);
+
+      out_val =
+          Min(out_val,
+              BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
+                             rect_in, mask_val));
+
+      const size_t ox = ix - rect_out.x0();
+      const size_t oy = iy - rect_out.y0();
+      const float boost =
+          variance_boost[oy * rect_out.xsize() + ox];
+
+      // Negative exponent delta => smaller quantizer => more precision.
+      out_val = Sub(out_val, Set(df, boost));
+
       row_out[ix] =
           FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
     }
@@ -1019,6 +1087,8 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
   const float butteraugli_target = cparams.butteraugli_distance;
   const float original_butteraugli = cparams.original_butteraugli_distance;
+  const float lowq = std::min(
+      1.0f, std::max(0.0f, (original_butteraugli - 2.5f) / 4.5f));
   ButteraugliParams params;
   const auto& tf = frame_header.nonserialized_metadata->m.color_encoding.Tf();
   params.intensity_target =
@@ -1108,8 +1178,13 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
     if (i == iters) break;
 
+    // Stronger redistribution at low quality: bring under-budget regions
+    // back toward the target more aggressively, while still using the hard
+    // branch for over-budget regions.
+    const double kPow0 = 0.28 + 0.15 * lowq;
+    const double kPow1 = 0.18 + 0.10 * lowq;
     double kPow[8] = {
-        0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        kPow0, kPow1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     };
     double kPowMod[8] = {
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -1118,7 +1193,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       // Don't allow optimization to make the quant field a lot worse than
       // what the initial guess was. This allows the AC field to have enough
       // precision to reduce the oscillations due to the dc reconstruction.
-      double kInitMul = 0.6;
+      const double kInitMul = 0.60 - 0.25 * lowq;
       const double kOneMinusInitMul = 1.0 - kInitMul;
       for (size_t y = 0; y < quant_field.ysize(); ++y) {
         float* const JXL_RESTRICT row_q = quant_field.Row(y);

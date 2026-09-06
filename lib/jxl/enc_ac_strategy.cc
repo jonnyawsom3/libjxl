@@ -583,8 +583,12 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   // target distance rises. This is analogous to Tune-4's more conservative
   // transform search, adapted to JXL's entropy model.
   const float lowq =
-      std::min(1.0f, std::max(0.0f, (butteraugli_target - 3.0f) / 7.0f));
+      std::min(1.0f, std::max(0.0f, (butteraugli_target - 3.0f) / 5.0f));
 
+  // Still-picture encoders generally get better perceptual results by
+  // limiting very large transforms once quantization is aggressive. Large
+  // transforms can spread quantization error across visually unrelated
+  // edges and make ringing harder for the post-filters to hide.
   for (auto tx : kTransforms8x8) {
     if (tx.encoding_speed_tier_max_limit < encoding_speed_tier) {
       continue;
@@ -604,16 +608,16 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
     // available for real edges, but raise their RD bar gradually.
     if (tx.type == AcStrategyType::DCT2X2 ||
         tx.type == AcStrategyType::IDENTITY) {
-      entropy_mul += 0.12f * lowq;
+      entropy_mul += 0.30f * lowq;
     } else if (tx.type == AcStrategyType::DCT4X4 ||
                tx.type == AcStrategyType::DCT4X8 ||
                tx.type == AcStrategyType::DCT8X4) {
-      entropy_mul += 0.035f * lowq;
+      entropy_mul += 0.075f * lowq;
     } else if (tx.type == AcStrategyType::AFV0 ||
                tx.type == AcStrategyType::AFV1 ||
                tx.type == AcStrategyType::AFV2 ||
                tx.type == AcStrategyType::AFV3) {
-      entropy_mul += 0.025f * lowq;
+      entropy_mul += 0.050f * lowq;
     }
 
     if ((tx.type != AcStrategyType::DCT && tx.type != AcStrategyType::DCT2X2 &&
@@ -867,6 +871,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // integral transforms cross these boundaries leads to
   // additional complications.
   const float butteraugli_target = cparams.butteraugli_distance;
+  const float lowq = std::min(
+      1.0f, std::max(0.0f, (butteraugli_target - 3.0f) / 5.0f));
   float* JXL_RESTRICT scratch_space = block + 3 * AcStrategy::kMaxCoeffArea;
   size_t bx = rect.x0();
   size_t by = rect.y0();
@@ -916,10 +922,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // ringing next to sky etc. Optimization will find smaller numbers
   // and produce more ringing than is ideal. Larger numbers will
   // help stop ringing.
-  const float entropy_mul16X8 = 1.21;
-  const float entropy_mul16X16 = 1.34;
-  const float entropy_mul16X32 = 1.49;
-  const float entropy_mul32X32 = 1.48;
+  const float entropy_mul16X8 = 1.20f;
+  const float entropy_mul16X16 = 1.30f;
+  const float entropy_mul16X32 = 1.56f;
+  const float entropy_mul32X32 = 1.56f;
   const float entropy_mul64X32 = 2.25;
   const float entropy_mul64X64 = 2.25;
   // TODO(jyrki): Consider this feedback in further changes:
@@ -965,8 +971,26 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     if (mt.decoding_speed_tier_max_limit < cparams.decoding_speed_tier) {
       continue;
     }
+
+    // SVT-AV1-PSY Tune 4 limits the maximum transform size for still
+    // pictures. Apply the same principle here once the target is clearly
+    // in the aggressive-compression regime.
+    if (butteraugli_target >= 4.5f &&
+        (mt.type == AcStrategyType::DCT64X32 ||
+         mt.type == AcStrategyType::DCT32X64)) {
+      continue;
+    }
+
     AcStrategy acs = AcStrategy::FromRawStrategy(mt.type);
 
+    // Make 32x32 a less eager choice as quality drops; 16x16 and rectangular
+    // transforms remain available for local correlation.
+    float merge_entropy_mul = mt.entropy_mul;
+    if (butteraugli_target >= 4.5f &&
+        (mt.type == AcStrategyType::DCT16X32 ||
+         mt.type == AcStrategyType::DCT32X16)) {
+      merge_entropy_mul *= 1.0f + 0.18f * lowq;
+    }
     for (size_t cy = 0; cy + acs.covered_blocks_y() - 1 < rect.ysize();
          cy += acs.covered_blocks_y()) {
       for (size_t cx = 0; cx + acs.covered_blocks_x() - 1 < rect.xsize();
@@ -978,7 +1002,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             if ((cy | cx) % 8 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   8, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-                  mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
+                  merge_entropy_mul, entropy_mul64X64, entropy_estimate, block,
                   scratch_space, quantized));
             }
             continue;
@@ -1002,7 +1026,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             if ((cy | cx) % 4 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   4, enable_32x32, bx, by, cx, cy, config, cmap_factors,
-                  ac_strategy, mt.entropy_mul, entropy_mul32X32,
+                  ac_strategy, merge_entropy_mul, entropy_mul32X32,
                   entropy_estimate, block, scratch_space, quantized));
             }
             continue;
@@ -1025,7 +1049,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             if ((cy | cx) % 2 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
                   2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
-                  mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
+                  merge_entropy_mul, entropy_mul16X16, entropy_estimate, block,
                   scratch_space, quantized));
             }
             continue;
@@ -1049,7 +1073,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         // normal integral transform merging process.
         JXL_RETURN_IF_ERROR(
             TryMergeAcs(mt.type, bx, by, cx, cy, config, cmap_factors,
-                        ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
+                        ac_strategy, merge_entropy_mul, mt.priority, &priority[0],
                         entropy_estimate, block, scratch_space, quantized));
       }
     }

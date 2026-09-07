@@ -1587,23 +1587,10 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
 
   size_t stream_id = ModularStreamId::VarDCTDC(group_index).ID(frame_dim_);
   stream_options_[stream_id].max_chan_size = 0xFFFFFF;
-  stream_options_[stream_id].predictor = Predictor::Weighted;
-  stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kWPOnly;
-  if (cparams_.speed_tier >= SpeedTier::kSquirrel) {
-    stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kGradientFixedDC;
-  }
-  if (cparams_.speed_tier < SpeedTier::kSquirrel && !nl_dc) {
-    stream_options_[stream_id].predictor =
-        (cparams_.speed_tier < SpeedTier::kKitten ? Predictor::Variable
-                                                  : Predictor::Best);
+  stream_options_[stream_id].predictor = Predictor::Zero;
     stream_options_[stream_id].wp_tree_mode =
         ModularOptions::TreeMode::kDefault;
     stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kLearn;
-  }
-  if (cparams_.decoding_speed_tier >= 1) {
-    stream_options_[stream_id].tree_kind =
-        ModularOptions::TreeKind::kGradientFixedDC;
-  }
   stream_options_[stream_id].histogram_params =
       stream_options_[0].histogram_params;
 

@@ -885,88 +885,345 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
   };
 
   bool DCzero = (frame_header.color_transform == ColorTransform::kYCbCr);
-  // Compute chroma-from-luma for AC (doesn't seem to be useful for DC)
+    // Compute chroma-from-luma for AC (doesn't seem to be useful for DC).
+  //
+  // JPEG reconstruction uses the exact fixed-point sequence below:
+  //
+  //   scale       = RatioJPEG(factor)
+  //   coeff_scale = round(scale * qratio / 2^P)
+  //   cfl_factor  = round(Y * coeff_scale / 2^P)
+  //   residual    = C - cfl_factor
+  //
+  // The old estimator chose the factor almost exclusively by counting how
+  // many AC coefficients fell into a "zero" interval. That can select a
+  // factor with many zeros but unnecessarily large nonzero coefficients.
+  //
+  // We instead:
+  //
+  //   1. Estimate the continuous least-squares optimum.
+  //   2. Estimate the zero-rich optimum using the existing zero threshold.
+  //   3. Evaluate a small set of candidates using the exact integer predictor
+  //      used by the transcoder.
+  //   4. Minimize an inexpensive coefficient-rate proxy, with residual
+  //      magnitude and zero count used as deterministic tie breakers.
+  //
+  // The map is int8_t, so the representable factor range used here is
+  // [-127, 127]. In particular, do not generate +128: storing +128 in int8_t
+  // would wrap to -128 and change the predictor.
+
   if (frame_header.chroma_subsampling.Is444() &&
       enc_state->cparams.force_cfl_jpeg_recompression &&
       jpeg_data.components.size() == 3) {
+    constexpr int kScale = kDefaultColorFactor;
+    constexpr int kOffset = 127;
+    constexpr int kMinFactor = -127;
+    constexpr int kMaxFactor = 127;
+    constexpr int kNumCandidates = 11;
+
+    const int kRound = 1 << (kCFLFixedPointPrecision - 1);
+    const double kInvFixed =
+        1.0 / static_cast<double>(int64_t{1} << kCFLFixedPointPrecision);
+
     for (size_t c : {0, 2}) {
-      ImageSB* map = (c == 0 ? &shared.cmap.ytox_map : &shared.cmap.ytob_map);
-      const float kScale = kDefaultColorFactor;
-      const int kOffset = 127;
-      const float kBase = c == 0 ? shared.cmap.base().YtoXRatio(0)
-                                 : shared.cmap.base().YtoBRatio(0);
+      ImageSB* map =
+          (c == 0 ? &shared.cmap.ytox_map : &shared.cmap.ytob_map);
+
+      const float kBase =
+          c == 0 ? shared.cmap.base().YtoXRatio(0)
+                 : shared.cmap.base().YtoBRatio(0);
+
       const float kZeroThresh =
           kScale * kZeroBiasDefault[c] *
           0.9999f;  // just epsilon less for better rounding
 
       auto process_row = [&](const uint32_t task,
-                             const size_t thread) -> Status {
-        size_t ty = task;
+                             const size_t /*thread*/) -> Status {
+        const size_t ty = task;
         int8_t* JXL_RESTRICT row_out = map->Row(ty);
+
         for (size_t tx = 0; tx < map->xsize(); ++tx) {
           const size_t y0 = ty * kColorTileDimInBlocks;
           const size_t x0 = tx * kColorTileDimInBlocks;
-          const size_t y1 = std::min(frame_dim.ysize_blocks,
-                                     (ty + 1) * kColorTileDimInBlocks);
-          const size_t x1 = std::min(frame_dim.xsize_blocks,
-                                     (tx + 1) * kColorTileDimInBlocks);
-          int32_t d_num_zeros[257] = {0};
-          // TODO(veluca): this needs SIMD + fixed point adaptation, and/or
-          // conversion to the new CfL algorithm.
+          const size_t y1 = std::min(
+              frame_dim.ysize_blocks,
+              (ty + 1) * kColorTileDimInBlocks);
+          const size_t x1 = std::min(
+              frame_dim.xsize_blocks,
+              (tx + 1) * kColorTileDimInBlocks);
+
+          // ------------------------------------------------------------------
+          // First pass: find two good estimates of the factor.
+          // ------------------------------------------------------------------
+
+          // Difference array for the old "how many coefficients become zero"
+          // criterion. There are 256 possible quantized indices [0, 255],
+          // corresponding to signed factors [-127, 128]. We later clamp the
+          // actual factor to the int8_t-compatible range [-127, 127].
+          int32_t d_num_zeros[257] = {};
+
+          // Continuous least-squares fit:
+          //
+          // residual ~= 84*C - 84*base*Yscaled - factor*Yscaled
+          //
+          // where Yscaled = Y * qratio / 2^P.
+          double regression_num = 0.0;
+          double regression_den = 0.0;
+
           for (size_t y = y0; y < y1; ++y) {
-            const int16_t* JXL_RESTRICT row_m = jpeg_row(1, y);
-            const int16_t* JXL_RESTRICT row_s = jpeg_row(c, y);
+            const int16_t* JXL_RESTRICT row_y = jpeg_row(1, y);
+            const int16_t* JXL_RESTRICT row_c = jpeg_row(c, y);
+
             for (size_t x = x0; x < x1; ++x) {
-              for (size_t coeffpos = 1; coeffpos < kDCTBlockSize; coeffpos++) {
-                const float scaled_m = row_m[x * kDCTBlockSize + coeffpos] *
-                                       (1.0f / (1 << kCFLFixedPointPrecision)) *
-                                       scaled_qtable[64 * c + coeffpos];
-                const float scaled_s =
-                    kScale * row_s[x * kDCTBlockSize + coeffpos] +
-                    (kOffset - kBase * kScale) * scaled_m;
-                if (std::abs(scaled_m) > 1e-8f) {
-                  float from;
-                  float to;
-                  if (scaled_m > 0) {
+              const size_t base = x * kDCTBlockSize;
+
+              for (size_t coeffpos = 1;
+                   coeffpos < kDCTBlockSize; ++coeffpos) {
+                const int32_t y_coeff = row_y[base + coeffpos];
+                const int32_t c_coeff = row_c[base + coeffpos];
+                const int32_t qratio =
+                    scaled_qtable[kDCTBlockSize * c + coeffpos];
+
+                if (y_coeff == 0) continue;
+
+                const double scaled_m =
+                    static_cast<double>(y_coeff) *
+                    static_cast<double>(qratio) * kInvFixed;
+
+                // Exact continuous target corresponding to:
+                //
+                //   84*C + (127 - 84*base)*scaled_m
+                //     - (factor + 127)*scaled_m
+                //
+                // = 84*C - 84*base*scaled_m - factor*scaled_m.
+                const double target =
+                    static_cast<double>(kScale) *
+                        static_cast<double>(c_coeff) -
+                    static_cast<double>(kScale) *
+                        static_cast<double>(kBase) * scaled_m;
+
+                regression_num += scaled_m * target;
+                regression_den += scaled_m * scaled_m;
+
+                // Zero interval in the same index space used by the original
+                // estimator. This is only used to seed candidate factors; the
+                // final decision below uses the exact fixed-point predictor.
+                const double scaled_s =
+                    static_cast<double>(kScale) *
+                        static_cast<double>(c_coeff) +
+                    (static_cast<double>(kOffset) -
+                     static_cast<double>(kBase) *
+                         static_cast<double>(kScale)) *
+                        scaled_m;
+
+                if (std::abs(scaled_m) > 1e-12) {
+                  double from;
+                  double to;
+
+                  if (scaled_m > 0.0) {
                     from = (scaled_s - kZeroThresh) / scaled_m;
                     to = (scaled_s + kZeroThresh) / scaled_m;
                   } else {
                     from = (scaled_s + kZeroThresh) / scaled_m;
                     to = (scaled_s - kZeroThresh) / scaled_m;
                   }
-                  if (from < 0.0f) {
-                    from = 0.0f;
-                  }
-                  if (to > 255.0f) {
-                    to = 255.0f;
-                  }
-                  // Instead of clamping the both values
-                  // we just check that range is sane.
+
+                  from = std::max(from, 0.0);
+                  to = std::min(to, 255.0);
+
                   if (from <= to) {
-                    d_num_zeros[static_cast<int>(std::ceil(from))]++;
-                    d_num_zeros[static_cast<int>(std::floor(to + 1))]--;
+                    const int first = std::max(
+                        0, static_cast<int>(std::ceil(from)));
+                    const int last = std::min(
+                        255, static_cast<int>(std::floor(to)));
+
+                    if (first <= last) {
+                      ++d_num_zeros[first];
+                      --d_num_zeros[last + 1];
+                    }
                   }
                 }
               }
             }
           }
-          int best = 0;
-          int32_t best_sum = 0;
-          FindAvgIndexOfSumMaximum<256>(d_num_zeros, &best, &best_sum);
-          int32_t offset_sum = 0;
-          for (int i = 0; i <= kOffset; ++i) {
-            offset_sum += d_num_zeros[i];
+
+          int zero_best_index = 0;
+          int32_t zero_best_sum = 0;
+          FindAvgIndexOfSumMaximum<256>(
+              d_num_zeros, &zero_best_index, &zero_best_sum);
+
+          int zero_best_factor =
+              zero_best_index - kOffset;
+          zero_best_factor =
+              jxl::Clamp1(zero_best_factor, kMinFactor, kMaxFactor);
+
+          int regression_factor = 0;
+          if (regression_den > 0.0) {
+            const double estimate =
+                regression_num / regression_den;
+
+            if (estimate <= static_cast<double>(kMinFactor)) {
+              regression_factor = kMinFactor;
+            } else if (estimate >= static_cast<double>(kMaxFactor)) {
+              regression_factor = kMaxFactor;
+            } else {
+              regression_factor =
+                  static_cast<int>(std::llround(estimate));
+            }
           }
-          row_out[tx] = 0;
-          if (best_sum > offset_sum + 1) {
-            row_out[tx] = best - kOffset;
+
+          // ------------------------------------------------------------------
+          // Build a small candidate set around both estimates.
+          // ------------------------------------------------------------------
+
+          std::array<int, kNumCandidates> candidates = {};
+          size_t num_candidates = 0;
+
+          const auto add_candidate = [&](int factor) {
+            factor = jxl::Clamp1(
+                factor, kMinFactor, kMaxFactor);
+
+            for (size_t i = 0; i < num_candidates; ++i) {
+              if (candidates[i] == factor) return;
+            }
+
+            if (num_candidates < candidates.size()) {
+              candidates[num_candidates++] = factor;
+            }
+          };
+
+          // The least-squares estimate is normally the most important one.
+          add_candidate(regression_factor - 2);
+          add_candidate(regression_factor - 1);
+          add_candidate(regression_factor);
+          add_candidate(regression_factor + 1);
+          add_candidate(regression_factor + 2);
+
+          // The zero-producing estimate is useful when the residual
+          // distribution is strongly quantized / heavy-tailed.
+          add_candidate(zero_best_factor - 1);
+          add_candidate(zero_best_factor);
+          add_candidate(zero_best_factor + 1);
+
+          // Keep the no-CfL case in contention.
+          add_candidate(0);
+
+          // ------------------------------------------------------------------
+          // Second pass: score candidates using the EXACT predictor used by
+          // the JPEG transcoder.
+          //
+          // We score every AC coefficient in the tile. There are only a few
+          // candidates, so this is substantially more accurate than the old
+          // zero-only criterion while remaining bounded.
+          // ------------------------------------------------------------------
+
+          std::array<int64_t, kNumCandidates> rate_cost = {};
+          std::array<int64_t, kNumCandidates> abs_sum = {};
+          std::array<uint32_t, kNumCandidates> num_zero = {};
+
+          std::array<int32_t, kNumCandidates> jpeg_scale = {};
+
+          for (size_t i = 0; i < num_candidates; ++i) {
+            jpeg_scale[i] =
+                ColorCorrelation::RatioJPEG(candidates[i]);
           }
+
+          for (size_t y = y0; y < y1; ++y) {
+            const int16_t* JXL_RESTRICT row_y = jpeg_row(1, y);
+            const int16_t* JXL_RESTRICT row_c = jpeg_row(c, y);
+
+            for (size_t x = x0; x < x1; ++x) {
+              const size_t base = x * kDCTBlockSize;
+
+              for (size_t coeffpos = 1;
+                   coeffpos < kDCTBlockSize; ++coeffpos) {
+                const int32_t Y =
+                    row_y[base + coeffpos];
+                const int32_t QChroma =
+                    row_c[base + coeffpos];
+                const int32_t qratio =
+                    scaled_qtable[kDCTBlockSize * c + coeffpos];
+
+                for (size_t i = 0; i < num_candidates; ++i) {
+                  // This is intentionally the same arithmetic as the
+                  // reconstruction code below in ComputeJPEGTranscodingData.
+                  const int32_t coeff_scale =
+                      (jpeg_scale[i] * qratio + kRound) >>
+                      kCFLFixedPointPrecision;
+
+                  const int32_t cfl_factor =
+                      (Y * coeff_scale + kRound) >>
+                      kCFLFixedPointPrecision;
+
+                  const int32_t residual =
+                      QChroma - cfl_factor;
+
+                  const uint32_t magnitude =
+                      static_cast<uint32_t>(
+                          residual < 0 ? -int64_t{residual}
+                                       : int64_t{residual});
+
+                  if (magnitude == 0) {
+                    ++num_zero[i];
+                    continue;
+                  }
+
+                  abs_sum[i] += magnitude;
+
+                  // Approximate coefficient coding cost by the number of
+                  // magnitude bits plus sign/presence overhead.
+                  //
+                  // This is deliberately simple: we want the factor ranking
+                  // to favor genuinely smaller residual magnitudes without
+                  // pretending this is an exact rANS bit count.
+                  int magnitude_bits = 0;
+                  uint32_t v = magnitude;
+                  while (v != 0) {
+                    ++magnitude_bits;
+                    v >>= 1;
+                  }
+                  rate_cost[i] +=
+                      static_cast<int64_t>(magnitude_bits + 1);
+                }
+              }
+            }
+          }
+
+          // Select the minimum estimated rate. Ties are resolved in favor of
+          // smaller total residual magnitude, then more zeros, then the factor
+          // closest to zero. This makes the result stable around flat minima.
+          size_t best_candidate = 0;
+
+          for (size_t i = 1; i < num_candidates; ++i) {
+            if (rate_cost[i] < rate_cost[best_candidate] ||
+                (rate_cost[i] == rate_cost[best_candidate] &&
+                 abs_sum[i] < abs_sum[best_candidate]) ||
+                (rate_cost[i] == rate_cost[best_candidate] &&
+                 abs_sum[i] == abs_sum[best_candidate] &&
+                 num_zero[i] > num_zero[best_candidate]) ||
+                (rate_cost[i] == rate_cost[best_candidate] &&
+                 abs_sum[i] == abs_sum[best_candidate] &&
+                 num_zero[i] == num_zero[best_candidate] &&
+                 std::abs(candidates[i]) <
+                     std::abs(candidates[best_candidate]))) {
+              best_candidate = i;
+            }
+          }
+
+          int best_factor = candidates[best_candidate];
+          best_factor =
+              jxl::Clamp1(best_factor, kMinFactor, kMaxFactor);
+
+          row_out[tx] =
+              static_cast<int8_t>(best_factor);
         }
+
         return true;
       };
 
-      JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, map->ysize(), ThreadPool::NoInit,
-                                    process_row, "FindCorrelation"));
+      JXL_RETURN_IF_ERROR(
+          RunOnPool(pool, 0, map->ysize(),
+                    ThreadPool::NoInit, process_row,
+                    "FindCorrelation"));
     }
   }
 

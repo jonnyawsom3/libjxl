@@ -2640,6 +2640,42 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     } else {
       cparams = all_params_test[best_idx_test];
     }
+  } else if (cparams.speed_tier <= SpeedTier::kSquirrel &&
+    cparams.ModularPartIsLossless()) {
+    std::vector<CompressParams> PaletteTrial;
+    CompressParams cparams_attempt = cparams;
+    PaletteTrial.push_back(cparams);
+    
+    cparams_attempt.modular_group_size_shift = 2;
+    cparams_attempt.options.predictor = Predictor::Zero;
+    cparams_attempt.options.nb_repeats = 0.01f;
+    cparams_attempt.palette_colors = 70000;
+    cparams_attempt.patches = Override::kOff;
+    cparams_attempt.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+    PaletteTrial.push_back(cparams_attempt);
+
+    std::vector<size_t> size;
+    size.resize(PaletteTrial.size());
+
+    const auto process_variant = [&](size_t task, size_t) -> Status {
+      JxlEncoderOutputProcessorWrapper local_output(memory_manager);
+      JXL_RETURN_IF_ERROR(EncodeFrame(
+          memory_manager, PaletteTrial[task], frame_info, metadata, frame_data,
+          cms, nullptr, &local_output, aux_out, nullptr));
+      size[task] = local_output.CurrentPosition();
+      return true;
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, PaletteTrial.size(),
+                                  ThreadPool::NoInit, process_variant,
+                                  "Compress PaletteTrial"));
+    
+    size_t best_idx = 0;
+    for (size_t i = 1; i < PaletteTrial.size(); i++) {
+      if (size[best_idx] > size[i]) {
+        best_idx = i;
+      }
+    }
+    cparams = PaletteTrial[best_idx];
   }
 
   JXL_RETURN_IF_ERROR(ParamsPostInit(&cparams));

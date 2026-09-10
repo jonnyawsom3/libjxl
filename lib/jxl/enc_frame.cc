@@ -2641,23 +2641,24 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
       cparams = all_params_test[best_idx_test];
     }
 
-    // Print the winner at the end of effort 11 before the final encode.
+    // Print the winner of effort 11 trials before the final encode.
     CompressParams print_params = cparams;
     JXL_RETURN_IF_ERROR(ParamsPostInit(&print_params));
 
-    fprintf(stderr, "-d %.2f -e 10 -g %d -I %.2f -P %d -E %d "
-                    "--modular_palette_colors=%d -X %.2f -Y %.2f",
-            print_params.butteraugli_distance,
-            print_params.modular_group_size_shift,
-            print_params.options.nb_repeats,
-            static_cast<int>(print_params.options.predictor),
-            print_params.options.max_properties, print_params.palette_colors,
-            print_params.channel_colors_pre_transform_percent,
-            print_params.channel_colors_percent);
+    fprintf(stderr, "Winning Effort 11 Command\n");
+    fprintf(stderr, "cjxl -d 0 -e 10 -g %d -E %d -I %d -P %d "
+                    "--modular_palette_colors %d -X %d -Y %d",
+      print_params.modular_group_size_shift,
+      print_params.options.max_properties,
+      static_cast<int>(print_params.options.nb_repeats),
+      static_cast<int>(print_params.options.predictor),
+      print_params.palette_colors,
+      static_cast<int>(print_params.channel_colors_pre_transform_percent),
+      static_cast<int>(print_params.channel_colors_percent));
     if (print_params.patches == Override::kOn ||
-        print_params.patches == Override::kOff) {
-      fprintf(stderr, " --patches=%d",
-              print_params.patches == Override::kOn ? 1 : 0);
+      print_params.patches == Override::kOff) {
+      fprintf(stderr, " --patches %d",
+        print_params.patches == Override::kOn ? 1 : 0);
     }
     fprintf(stderr, "\n");
   }

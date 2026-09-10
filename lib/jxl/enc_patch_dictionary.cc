@@ -856,7 +856,8 @@ Status RoundtripPatchFrame(Image3F* reference_frame,
   AuxOut patch_aux_out;
   JXL_RETURN_IF_ERROR(EncodeFrame(
       memory_manager, cparams, patch_frame_info, state->shared.metadata, ib,
-      cms, pool, special_frame.get(), aux_out ? &patch_aux_out : nullptr));
+      cms, pool, special_frame.get(), aux_out ? &patch_aux_out : nullptr,
+      true));
   if (aux_out) {
     for (const auto& l : patch_aux_out.layers) {
       aux_out->layer(LayerType::Dictionary).Assimilate(l);

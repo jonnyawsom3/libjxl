@@ -830,7 +830,7 @@ Status EncodePreview(const CompressParams& cparams, ImageBundle& ib,
     frame_info.is_preview = true;
     JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams, frame_info,
                                     metadata, ib, cms, pool, &preview_writer,
-                                    &aux_out));
+                                    &aux_out, false));
     preview_writer.ZeroPadToByte();
   }
 
@@ -893,7 +893,7 @@ Status EncodeFile(const CompressParams& params, CodecInOut* io,
     JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams, info,
                                     metadata.get(), io->frames[i], cms, pool,
                                     &writer,
-                                    /* aux_out */ nullptr));
+                                    /* aux_out */ nullptr, false));
   }
 
   PaddedBytes output = std::move(writer).TakeBytes();

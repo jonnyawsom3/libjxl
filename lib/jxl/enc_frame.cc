@@ -2562,7 +2562,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
                    JxlEncoderChunkedFrameAdapter& frame_data,
                    const JxlCmsInterface& cms, ThreadPool* pool,
                    JxlEncoderOutputProcessorWrapper* output_processor,
-                   AuxOut* aux_out, uint32_t* jxlp_counter) {
+                   AuxOut* aux_out, uint32_t* jxlp_counter,
+                   bool do_trials) {
   CompressParams cparams = cparams_orig;
   if (cparams.speed_tier == SpeedTier::kTectonicPlate &&
       !cparams.IsLossless()) {
@@ -2603,7 +2604,7 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
       JxlEncoderOutputProcessorWrapper local_output(memory_manager);
       JXL_RETURN_IF_ERROR(EncodeFrame(
           memory_manager, all_params[task], frame_info, metadata, frame_data,
-          cms, nullptr, &local_output, aux_out, nullptr));
+          cms, nullptr, &local_output, aux_out, nullptr, false));
       size[task] = local_output.CurrentPosition();
       return true;
     };
@@ -2640,7 +2641,10 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     } else {
       cparams = all_params_test[best_idx_test];
     }
-  } else if (cparams.speed_tier <= SpeedTier::kSquirrel &&
+  }
+  
+  if (do_trials &&
+    cparams.speed_tier <= SpeedTier::kSquirrel &&
     cparams.ModularPartIsLossless()) {
     std::vector<CompressParams> PaletteTrial;
     CompressParams cparams_attempt = cparams;
@@ -2651,7 +2655,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     cparams_attempt.options.nb_repeats = 0.01f;
     cparams_attempt.palette_colors = 70000;
     cparams_attempt.patches = Override::kOff;
-    cparams_attempt.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+    cparams_attempt.options.tree_kind =
+    ModularOptions::TreeKind::kTrivialTreeNoPredictor;
     PaletteTrial.push_back(cparams_attempt);
 
     std::vector<size_t> size;
@@ -2661,7 +2666,7 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
       JxlEncoderOutputProcessorWrapper local_output(memory_manager);
       JXL_RETURN_IF_ERROR(EncodeFrame(
           memory_manager, PaletteTrial[task], frame_info, metadata, frame_data,
-          cms, nullptr, &local_output, aux_out, nullptr));
+          cms, nullptr, &local_output, aux_out, nullptr, false));
       size[task] = local_output.CurrentPosition();
       return true;
     };
@@ -2790,7 +2795,7 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
   JxlEncoderOutputProcessorWrapper output_processor(memory_manager);
   JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams_orig, fi, metadata,
                                   frame_data, cms, pool, &output_processor,
-                                  aux_out, nullptr));
+                                  aux_out, nullptr, true));
   JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
   std::vector<uint8_t> output;
   JXL_RETURN_IF_ERROR(output_processor.CopyOutput(output));

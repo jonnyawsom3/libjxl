@@ -2652,11 +2652,18 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     
     cparams_attempt.modular_group_size_shift = 2;
     cparams_attempt.options.predictor = Predictor::Zero;
-    cparams_attempt.options.nb_repeats = 0.01f;
     cparams_attempt.palette_colors = 70000;
     cparams_attempt.patches = Override::kOff;
-    cparams_attempt.options.tree_kind =
-    ModularOptions::TreeKind::kTrivialTreeNoPredictor;
+    // At effort 9+ use a small noWP tree, otherwise no tree for speed.
+    if (cparams.speed_tier <= SpeedTier::kTortoise) {
+      cparams_attempt.options.nb_repeats = 0.01f;
+      cparams_attempt.options.wp_tree_mode =
+        ModularOptions::TreeMode::kNoWP;
+    } else {
+      cparams_attempt.options.nb_repeats = 0;
+      cparams_attempt.options.tree_kind =
+        ModularOptions::TreeKind::kTrivialTreeNoPredictor;
+    }
     PaletteTrial.push_back(cparams_attempt);
 
     std::vector<size_t> size;

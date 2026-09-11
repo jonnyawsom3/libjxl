@@ -183,7 +183,7 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
     AuxOut dc_aux_out;
     JXL_RETURN_IF_ERROR(EncodeFrame(
         memory_manager, cparams, dc_frame_info, shared.metadata, *ib, cms, pool,
-        special_frame.get(), aux_out ? &dc_aux_out : nullptr, false));
+        special_frame.get(), aux_out ? &dc_aux_out : nullptr));
     if (aux_out) {
       for (const auto& l : dc_aux_out.layers) {
         aux_out->layer(LayerType::Dc).Assimilate(l);

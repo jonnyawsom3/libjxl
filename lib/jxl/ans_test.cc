@@ -223,7 +223,7 @@ void TestCheckpointing(bool ans, bool lz77) {
 
   EntropyEncodingData codes;
   HistogramParams params;
-  params.lz77_method = lz77 ? HistogramParams::LZ77Method::kLZ77b3w3f
+  params.lz77_method = lz77 ? HistogramParams::LZ77Method::kLZ77b31w3f
                             : HistogramParams::LZ77Method::kNone;
   params.force_huffman = !ans;
 

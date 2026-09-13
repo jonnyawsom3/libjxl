@@ -447,6 +447,49 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
     // when not estimating, assume some arbitrary bpp
     if (cparams_.speed_tier <= SpeedTier::kSquirrel) {
       JXL_ASSIGN_OR_RETURN(cost_before, EstimateCost(gi));
+      if (nb_chans == 3 && gi.nb_meta_channels == 0 &&
+          cparams_.color_transform == ColorTransform::kNone &&
+          cparams_.colorspace < 0) {
+        int nb_rcts_to_try = 0;
+        switch (cparams_.speed_tier) {
+          case SpeedTier::kSquirrel:
+            nb_rcts_to_try = 7;
+            break;
+          case SpeedTier::kKitten:
+            nb_rcts_to_try = 9;
+            break;
+          default:
+            nb_rcts_to_try = 19;
+            break;
+        }
+        std::vector<Channel> orig;
+        orig.reserve(3);
+        for (size_t c = 0; c < 3; ++c) {
+          Channel& genuine = gi.channel[c];
+          JXL_ASSIGN_OR_RETURN(
+              Channel ch, Channel::Create(genuine.memory_manager(), genuine.w,
+                                          genuine.h, genuine.hshift,
+                                          genuine.vshift));
+          JXL_RETURN_IF_ERROR(CopyImageTo(genuine.plane, &ch.plane));
+          orig.emplace_back(std::move(ch));
+        }
+        std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
+        std::array<Channel*, 3> out = {&gi.channel[0], &gi.channel[1],
+                                       &gi.channel[2]};
+        for (int rct_type : {0 * 7 + 6, 0 * 7 + 5, 1 * 7 + 3, 3 * 7 + 5,
+                             5 * 7 + 5, 1 * 7 + 5, 2 * 7 + 5, 1 * 7 + 1,
+                             0 * 7 + 4, 1 * 7 + 2, 2 * 7 + 1, 2 * 7 + 2,
+                             2 * 7 + 3, 4 * 7 + 4, 4 * 7 + 5, 0 * 7 + 2,
+                             0 * 7 + 1, 0 * 7 + 3}) {
+          if (--nb_rcts_to_try <= 0) break;
+          JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, pool));
+          JXL_ASSIGN_OR_RETURN(float cost_rct, EstimateCost(gi));
+          cost_before = std::min(cost_before, cost_rct);
+        }
+        for (size_t c = 0; c < 3; ++c) {
+          gi.channel[c].plane.Swap(orig[c].plane);
+        }
+      }
     } else {
       cost_before = nb_pixels * arbitrary_bpp_estimate;
     }

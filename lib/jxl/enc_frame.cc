@@ -2673,7 +2673,7 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
       JxlEncoderOutputProcessorWrapper local_output(memory_manager);
       JXL_RETURN_IF_ERROR(EncodeFrame(
           memory_manager, PaletteTrial[task], frame_info, metadata, frame_data,
-          cms, nullptr, &local_output, aux_out, nullptr, false));
+          cms, nullptr, &local_output, nullptr, nullptr, false));
       size[task] = local_output.CurrentPosition();
       return true;
     };

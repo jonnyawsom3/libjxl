@@ -119,6 +119,7 @@ struct CompressParams {
   // Use Local channel palette if #colors < this percentage of range
   float channel_colors_percent = 80.f;
   int palette_colors = 1 << 10;  // up to 10-bit palette is probably worthwhile
+  int palette_ordering = -1;     // -1 = auto (effort-based), or PaletteOrdering value
   bool lossy_palette = false;
 
   // Returns whether these params are lossless as defined by SetLossless();
@@ -169,8 +170,6 @@ struct CompressParams {
 
   // See JXL_ENC_FRAME_SETTING_BUFFERING option value.
   int buffering = -1;
-  // Output streaming mode: 0=buffered, 1=seek-based streaming, 2=OOO jxlp.
-  int output_mode = 0;
   // See JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS option value.
   bool use_full_image_heuristics = true;
 
@@ -182,7 +181,7 @@ struct CompressParams {
   Tree custom_fixed_tree;
   // If not empty, these custom splines will be used instead of the computed
   // ones. Used in jxl_from_tee tool.
-  SplineDataView custom_splines{};
+  Splines custom_splines;
   // If not null, overrides progressive mode settings. Used in decode_test.
   const ProgressiveMode* custom_progressive_mode = nullptr;
 

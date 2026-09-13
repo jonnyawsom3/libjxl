@@ -52,6 +52,7 @@
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/image_ops.h"
+#include "lib/jxl/memory_manager_internal.h"
 #include "lib/jxl/modular/encoding/context_predict.h"
 #include "lib/jxl/modular/encoding/dec_ma.h"
 #include "lib/jxl/modular/encoding/enc_encoding.h"
@@ -250,7 +251,6 @@ float EstimateWPCost(const Image& img, size_t i) {
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     weighted::State wp_state(wp_header, ch.w, ch.h);
     Properties properties(1);
-    bool unhealthy = false;
     for (size_t y = 0; y < ch.h; y++) {
       const pixel_type* JXL_RESTRICT r = ch.Row(y);
       for (size_t x = 0; x < ch.w; x++) {
@@ -268,8 +268,7 @@ float EstimateWPCost(const Image& img, size_t i) {
         for (int c : cutoffs) {
           ctx += (c >= properties[0]) ? 1 : 0;
         }
-        pixel_type res;
-        unhealthy |= SubOverflow(r[x], guess, res);
+        pixel_type res = r[x] - guess;
         uint32_t token;
         uint32_t nbits;
         uint32_t bits;
@@ -278,10 +277,6 @@ float EstimateWPCost(const Image& img, size_t i) {
         extra_bits += nbits;
         wp_state.UpdateErrors(r[x], x, y, ch.w);
       }
-    }
-    if (unhealthy) {
-      // Force this predictor option to be rejected by the cost selector.
-      return std::numeric_limits<float>::max();
     }
     for (auto& h : histo) {
       histo_cost += h.ShannonEntropy();
@@ -330,6 +325,113 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
   return did_it;
 }
 
+StatusOr<bool> try_palette_transform(
+    Image& gi, Transform& maybe_palette, const CompressParams& cparams,
+    const weighted::Header& wp_header, float cost_before, ThreadPool* pool) {
+  std::vector<PaletteOrdering> candidates;
+  const char* env = getenv("JXL_PALETTE_ORDERING");
+  if (env != nullptr) {
+    std::string s(env);
+    size_t start = 0;
+    while (start < s.size()) {
+      size_t end = s.find(',', start);
+      if (end == std::string::npos) end = s.size();
+      std::string item = s.substr(start, end - start);
+      if (item == "none" || item == "0") {
+        candidates.push_back(PaletteOrdering::kNone);
+      } else if (item == "luma" || item == "1") {
+        candidates.push_back(PaletteOrdering::kLuma);
+      } else if (item == "tsp_greedy" || item == "greedy" || item == "2") {
+        candidates.push_back(PaletteOrdering::kTSPGreedy);
+      } else if (item == "minla" || item == "3") {
+        candidates.push_back(PaletteOrdering::kMinLA);
+      } else if (item == "minla_gradient" || item == "gradient" ||
+                 item == "4") {
+        candidates.push_back(PaletteOrdering::kMinLAGradient);
+      }
+      start = end + 1;
+    }
+  }
+
+  if (candidates.empty()) {
+    if (cparams.palette_ordering >= 0) {
+      candidates = {static_cast<PaletteOrdering>(cparams.palette_ordering)};
+    } else if (cparams.palette_colors < 0) {
+      candidates = {PaletteOrdering::kNone};
+    } else if (maybe_palette.lossy_palette ||
+               cparams.speed_tier >= SpeedTier::kFalcon) {
+      candidates = {PaletteOrdering::kLuma};
+    } else if (cparams.speed_tier == SpeedTier::kCheetah ||
+               cparams.speed_tier == SpeedTier::kHare) {
+      candidates = {PaletteOrdering::kMinLA};
+    } else if (cparams.speed_tier == SpeedTier::kWombat ||
+               cparams.speed_tier == SpeedTier::kSquirrel) {
+      candidates = {PaletteOrdering::kLuma, PaletteOrdering::kMinLA};
+    } else if (cparams.speed_tier == SpeedTier::kKitten) {
+      candidates = {PaletteOrdering::kLuma, PaletteOrdering::kMinLA,
+                    PaletteOrdering::kTSPGreedy};
+    } else if (cparams.speed_tier == SpeedTier::kTortoise) {
+      candidates = {PaletteOrdering::kLuma, PaletteOrdering::kMinLA,
+                    PaletteOrdering::kMinLAGradient};
+    } else {
+      candidates = {PaletteOrdering::kLuma, PaletteOrdering::kMinLA,
+                    PaletteOrdering::kTSPGreedy,
+                    PaletteOrdering::kMinLAGradient};
+    }
+  }
+
+  if (candidates.size() == 1) {
+    maybe_palette.palette_ordering = candidates[0];
+    return maybe_do_transform(gi, maybe_palette, cparams, wp_header,
+                              cost_before, pool, cparams.options.zero_tokens);
+  }
+
+  float best_cost = cost_before;
+  PaletteOrdering best_ordering = candidates[0];
+  bool has_transform = false;
+
+  for (PaletteOrdering ordering : candidates) {
+    if (has_transform) {
+      Transform t = gi.transform.back();
+      if (!t.Inverse(gi, wp_header, pool)) return false;
+      gi.transform.pop_back();
+      has_transform = false;
+    }
+    maybe_palette.palette_ordering = ordering;
+    bool did_it = do_transform(gi, maybe_palette, wp_header, pool);
+    if (!did_it) {
+      break;
+    }
+    has_transform = true;
+    JXL_ASSIGN_OR_RETURN(float cost_after, EstimateCost(gi));
+    JXL_DEBUG_V(7, "Palette ordering %d: cost %f (best: %f, before: %f)",
+                static_cast<int>(ordering), cost_after, best_cost, cost_before);
+    if (cost_after < best_cost) {
+      best_cost = cost_after;
+      best_ordering = ordering;
+    }
+  }
+
+  if (has_transform) {
+    if (best_cost < cost_before &&
+        maybe_palette.palette_ordering == best_ordering) {
+      return true;
+    }
+    Transform t = gi.transform.back();
+    if (!t.Inverse(gi, wp_header, pool)) return false;
+    gi.transform.pop_back();
+    has_transform = false;
+  }
+
+  if (best_cost < cost_before) {
+    maybe_palette.palette_ordering = best_ordering;
+    bool ok = do_transform(gi, maybe_palette, wp_header, pool);
+    JXL_ENSURE(ok);
+    return true;
+  }
+  return false;
+}
+
 Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
                     const CompressParams& cparams_,
                     float channel_colors_percent,
@@ -373,8 +475,8 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // predictor.
       JXL_ASSIGN_OR_RETURN(
           did_palette,
-          maybe_do_transform(gi, maybe_palette, cparams_, weighted::Header(),
-                             cost_before, pool, cparams_.options.zero_tokens));
+          try_palette_transform(gi, maybe_palette, cparams_, weighted::Header(),
+                                cost_before, pool));
     }
     // all-minus-one-channel palette (RGB with separate alpha, or CMY with
     // separate K)
@@ -392,8 +494,8 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       }
       JXL_ASSIGN_OR_RETURN(
           did_palette,
-          maybe_do_transform(gi, maybe_palette_3, cparams_, weighted::Header(),
-                             cost_before, pool, cparams_.options.zero_tokens));
+          try_palette_transform(gi, maybe_palette_3, cparams_,
+                                weighted::Header(), cost_before, pool));
     }
   }
 
@@ -557,7 +659,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
         cparams_.options.max_properties,
         static_cast<int>(
             frame_header.nonserialized_metadata->m.num_extra_channels) +
-            (frame_header.nonserialized_metadata->m.color_encoding.IsGray() ? 0 : 2));
+            (frame_header.encoding == FrameEncoding::kModular ? 2 : -1));
     switch (cparams_.speed_tier) {
       case SpeedTier::kHare:
         cparams_.options.splitting_heuristics_properties.assign(
@@ -720,7 +822,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
   if (cparams_.custom_splines.HasAny()) {
     PassesSharedState& shared = enc_state->shared;
     ImageFeatures& image_features = shared.image_features;
-    image_features.splines.SetData(cparams_.custom_splines);
+    image_features.splines = cparams_.custom_splines;
   }
 
   // Convert ImageBundle to modular Image object
@@ -893,10 +995,8 @@ Status ModularFrameEncoder::ComputeEncodingData(
        (do_color && metadata.bit_depth.bits_per_sample > 8))) {
     channel_colors_percent = cparams_.channel_colors_pre_transform_percent;
   }
-    // Global palette causes bad progressive loading due to interpolation
-    // but lossy palette is still required for JXL art.
-  if (!groupwise && (cparams_.lossy_palette ||
-      !(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
+  if (!groupwise &&
+     (!(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
     JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams_,
                                      channel_colors_percent, pool));
   }

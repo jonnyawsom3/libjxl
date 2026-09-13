@@ -31,9 +31,10 @@ jobs:
         egress-policy: audit
 
     - name: Checkout source
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         fetch-depth: 0  # Disable shallow clone
+        persist-credentials: false
 
     - name: Set up SSH
       run: |
@@ -48,4 +49,4 @@ jobs:
         GIT_SSH_COMMAND: ssh -v -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
       run: |
         git remote add gitlab git@gitlab.com:wg1/jpeg-xl.git
-        git push gitlab $BRANCH_NAME:$BRANCH_NAME
+        git push gitlab "$BRANCH_NAME:$BRANCH_NAME"

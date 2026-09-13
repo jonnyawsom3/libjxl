@@ -19,9 +19,9 @@ permissions:
   contents: read
 
 env:
-  CONFORMANCE_REPO_HASH: a3ee00672dd1b58c2b5a7d5e8b9e4a7b9e53ec1e
-  LIBJXL_VERSION: "0.12.0"
-  LIBJXL_ABI_VERSION: "0.12"
+  CONFORMANCE_REPO_HASH: 4bf053529c7cefd2951be453475bb3dccc7e7be8
+  LIBJXL_VERSION: "0.13.0"
+  LIBJXL_ABI_VERSION: "0.13"
   SDE_ID: "813591"
   SDE_VERSION: "9.33.0-2024-01-07"
 
@@ -41,13 +41,15 @@ jobs:
         egress-policy: audit
 
     - name: Checkout the conformance source
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         repository: libjxl/conformance
         ref: ${{ env.CONFORMANCE_REPO_HASH }}
         path: conformance
+        persist-credentials: false
+
     - name: Cache
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/conformance/.objects
         key: conformance-refs
@@ -82,18 +84,18 @@ jobs:
           - name: SVE2_128
             os: ubuntu-24.04-arm
             cflags: -DHWY_DISABLED_TARGETS=HWY_SVE2_128-1
-            cc: gcc
-            cxx: g++
+            cc: gcc-latest
+            cxx: g++-latest
           - name: SVE2
             os: ubuntu-24.04-arm
             cflags: -DHWY_DISABLED_TARGETS=HWY_SVE2-1
-            cc: gcc
-            cxx: g++
+            cc: gcc-latest
+            cxx: g++-latest
           - name: SVE
             os: ubuntu-24.04-arm
             cflags: -DHWY_DISABLED_TARGETS=HWY_SVE-1
-            cc: gcc
-            cxx: g++
+            cc: gcc-latest
+            cxx: g++-latest
           - name: NEON_WITHOUT_AES
             os: ubuntu-24.04-arm
             cflags: -DHWY_DISABLED_TARGETS=HWY_NEON_WITHOUT_AES-1
@@ -106,14 +108,29 @@ jobs:
         egress-policy: audit
 
     - name: Checkout the jxl source
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         submodules: true
         fetch-depth: 2
+        persist-credentials: false
 
     - name: Install build deps
       run: |
         sudo ./tools/scripts/install_deps.sh build
+
+    - name: Select latest installed GCC
+      if: matrix.cc == 'gcc-latest'
+      run: |
+        LATEST_GCC_VER=$(compgen -c gcc- | grep -E '^gcc-[0-9]+$' | sort -V | tail -n 1 | cut -d- -f2)
+        echo "CC=gcc-${LATEST_GCC_VER}" >> $GITHUB_ENV
+        echo "CXX=g++-${LATEST_GCC_VER}" >> $GITHUB_ENV
+        echo "Selected GCC version: ${LATEST_GCC_VER}"
+
+    - name: Set CC/CXX
+      if: matrix.cc != 'gcc-latest'
+      run: |
+        echo "CC=${{ matrix.cc || 'clang' }}" >> $GITHUB_ENV
+        echo "CXX=${{ matrix.cxx || 'clang++' }}" >> $GITHUB_ENV
 
     - name: Git environment
       id: git-env
@@ -121,7 +138,7 @@ jobs:
         echo "parent=$(git rev-parse ${{ github.sha }}^)" >> $GITHUB_OUTPUT
       shell: bash
     - name: ccache
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ env.CCACHE_DIR }}
         # When the cache hits the key it is not updated, so if this is a rebuild
@@ -135,7 +152,6 @@ jobs:
       run: |
         mkdir -p ${CCACHE_DIR}
         echo "max_size = 200M" > ${CCACHE_DIR}/ccache.conf
-        CC=${{ matrix.cc || 'clang' }} CXX=${{ matrix.cxx || 'clang++' }} \
         CMAKE_FLAGS="${{ matrix.cflags }} -DHWY_BROKEN_TARGETS=0" \
         SKIP_TEST=1 TARGETS="hwy_list_targets tools/djxl" \
         ./ci.sh ${{ matrix.build_type || 'release' }} \
@@ -181,19 +197,20 @@ jobs:
         egress-policy: audit
 
     - name: Checkout install_deps.sh
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         sparse-checkout: tools/scripts/install_deps.sh
         sparse-checkout-cone-mode: false
         fetch-depth: 1
-  
+        persist-credentials: false
+
     - name: Install deps
       run: |
         sudo ./tools/scripts/install_deps.sh conformance
 
     - name: Cache SDE
       if: ${{ matrix.target == 'AVX3' }}
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/sde
         key: sde-${{ env.SDE_ID }}
@@ -211,13 +228,15 @@ jobs:
         cd ..
 
     - name: Checkout the conformance source
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         repository: libjxl/conformance
         ref: ${{ env.CONFORMANCE_REPO_HASH }}
         path: conformance
+        persist-credentials: false
+
     - name: Cache
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ github.workspace }}/conformance/.objects
         key: conformance-refs

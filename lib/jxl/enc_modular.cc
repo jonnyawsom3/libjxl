@@ -52,7 +52,6 @@
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/image_ops.h"
-#include "lib/jxl/memory_manager_internal.h"
 #include "lib/jxl/modular/encoding/context_predict.h"
 #include "lib/jxl/modular/encoding/dec_ma.h"
 #include "lib/jxl/modular/encoding/enc_encoding.h"
@@ -721,7 +720,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
   if (cparams_.custom_splines.HasAny()) {
     PassesSharedState& shared = enc_state->shared;
     ImageFeatures& image_features = shared.image_features;
-    image_features.splines = cparams_.custom_splines;
+    image_features.splines.SetData(cparams_.custom_splines);
   }
 
   // Convert ImageBundle to modular Image object
@@ -894,8 +893,10 @@ Status ModularFrameEncoder::ComputeEncodingData(
        (do_color && metadata.bit_depth.bits_per_sample > 8))) {
     channel_colors_percent = cparams_.channel_colors_pre_transform_percent;
   }
-  if (!groupwise &&
-     (!(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
+    // Global palette causes bad progressive loading due to interpolation
+    // but lossy palette is still required for JXL art.
+  if (!groupwise && (cparams_.lossy_palette ||
+      !(cparams_.responsive && cparams_.ModularPartIsLossless()))) {
     JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams_,
                                      channel_colors_percent, pool));
   }

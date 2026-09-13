@@ -8,10 +8,13 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "lib/jxl/base/common.h"
+#include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/sanitizers.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/image_metadata.h"
@@ -233,13 +236,14 @@ class UpsamplingStage : public RenderPipelineStage {
     std::array<float*, 25> input;
     for (ptrdiff_t iy = -2; iy <= 2; ++iy) {
       for (ptrdiff_t ix = -2; ix <= 2; ++ix) {
-        input[5 * (iy + 2) + (ix + 2)] = GetInputRow(input_rows, c_, iy) + ix;
+        input[5 * (iy + 2) + (ix + 2)] =
+            GetInputRow(input_rows, c_, iy) + x0 + ix;
       }
     }
 
     for (size_t x = 0; x < len; x += Lanes(df)) {
       for (size_t oy = 0; oy < N; oy++) {
-        float* dst_row = GetOutputRow(output_rows, c_, oy);
+        float* dst_row = GetOutputRow(output_rows, c_, oy) + x0 * N;
         for (size_t ox = 0; ox < N; ox++) {
           size_t k = N * oy + ox;
           auto acc0 = Mul(LoadU(df, input[0]), Set(df, Kernel(k, 0)));

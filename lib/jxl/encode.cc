@@ -1062,7 +1062,8 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
       if (!jxl::EncodeFrame(&memory_manager, frame_cparams, frame_info,
                             &metadata, input_frame->frame_data, cms,
                             thread_pool.get(), &output_processor,
-                            input_frame->option_values.aux_out, &jxlp_ctr)) {
+                            input_frame->option_values.aux_out,
+                            &jxlp_ctr, true)) {
         return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
                              "Failed to encode frame");
       }

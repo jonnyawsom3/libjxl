@@ -48,7 +48,7 @@ class SymbolCostEstimator {
       max_alphabet_size_ =
           std::max(max_alphabet_size_, builder[i].counts.size());
     }
-    bits_.resize(num_contexts * max_alphabet_size_);
+    bits_.resize(num_contexts * max_alphabet_size_, ANS_LOG_TAB_SIZE);
     // TODO(veluca): SIMD?
     add_symbol_cost_.resize(num_contexts);
     for (size_t i = 0; i < num_contexts; i++) {

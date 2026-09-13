@@ -99,8 +99,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
                    JxlEncoderChunkedFrameAdapter& frame_data,
                    const JxlCmsInterface& cms, ThreadPool* pool,
                    JxlEncoderOutputProcessorWrapper* output_processor,
-                   AuxOut* aux_out, uint32_t* jxlp_counter),
-                   bool do_trials;
+                   AuxOut* aux_out, uint32_t* jxlp_counter,
+                   bool do_trials);
 
 Status EncodeFrame(JxlMemoryManager* memory_manager,
                    const CompressParams& cparams_orig,

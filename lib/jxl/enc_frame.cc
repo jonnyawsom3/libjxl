@@ -511,14 +511,13 @@ Status MakeFrameHeader(size_t xsize, size_t ysize,
   if (jpeg_data) {
     frame_header->UpdateFlag(false, FrameHeader::kUseDcFrame);
     // Skip smoothing if set to 0, default to 444 only and on when set to 1.
-    if (cparams.force_lfs_jpeg_recompression != 0) {
-      if ((cparams.force_lfs_jpeg_recompression == -1 &&
+    // Flag is whether to skip, so logic is inverted.
+      if (!((cparams.force_lfs_jpeg_recompression == -1 &&
         frame_header->chroma_subsampling.Is444()) ||
-        cparams.force_lfs_jpeg_recompression == 1) {
+        cparams.force_lfs_jpeg_recompression == 1)) {
         frame_header->UpdateFlag(true,
         FrameHeader::kSkipAdaptiveDCSmoothing);
       }
-    }
   }
 
   return true;

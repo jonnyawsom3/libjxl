@@ -365,6 +365,7 @@ StatusOr<bool> try_palette_transform(
     } else if (cparams.palette_colors < 0) {
       candidates = {PaletteOrdering::kNone};
     } else if (maybe_palette.lossy_palette ||
+               cparams.options.predictor == Predictor::Zero ||
                cparams.speed_tier >= SpeedTier::kFalcon) {
       candidates = {PaletteOrdering::kLuma};
     } else if (cparams.speed_tier == SpeedTier::kCheetah ||

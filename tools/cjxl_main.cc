@@ -359,7 +359,7 @@ struct CompressArgs {
         '\0', "jpeg_reconstruction_lfs", "-1|0|1",
         "Disable/enable LF Smoothing for lossless "
         "JPEG reconstruction.\n"
-        "-1 = default (let encoder decide), 0 = disable, 1 = enable.",
+        "    -1 = default (let encoder decide), 0 = disable, 1 = enable.",
         &jpeg_reconstruction_lfs, &ParseInt64, -1);
 
     cmdline->AddOptionValue('\0', "num_reps", "REPS",
@@ -377,9 +377,10 @@ struct CompressArgs {
 
     cmdline->AddOptionValue(
         '\0', "output_mode", "-1..2",
-        "Output mode: -1=default (let encoder decide), 0=buffer output "
-        "internally, 1=streaming with seeking, 2=OOO jxlp (ftyp v1, no "
-        "seeking required).",
+        "Output mode: -1 = default (let encoder decide),"
+        "0 = buffer output internally./n"
+        "    1 = streaming with seeking, 2 = OOO jxlp"
+        "(ftyp v1, no seeking required).",
         &output_mode, &ParseInt64, 3);
 
     cmdline->AddOptionFlag('\0', "disable_output",

@@ -1923,8 +1923,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       frame_settings->values.cparams.output_mode = value;
       break;
     case JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS:
-      frame_settings->values.cparams.force_lfs_jpeg_recompression =
-        static_cast<jxl::Override>(value);
+      frame_settings->values.cparams.force_lfs_jpeg_recompression = value;
       break;
 
     default:

@@ -417,6 +417,22 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_OUTPUT_MODE = 40,
 
+  /** Tree learning mode for modular encoding: 0=greedy, 1=1d DP, 2=2-prop DP, 3=joint nested DP, 4=grid 2d DP.
+   */
+  JXL_ENC_FRAME_SETTING_MODULAR_TREE_LEARNING_MODE = 41,
+
+  /** Modular WP tree mode (0=default, 1=wp only, 2=gradient only, 3=no wp).
+   */
+  JXL_ENC_FRAME_SETTING_MODULAR_WP_TREE_MODE = 42,
+
+  /** Modular tree node base cost.
+   */
+  JXL_ENC_FRAME_SETTING_MODULAR_NODE_BASE_COST = 43,
+
+  /** Modular tree node log cost.
+   */
+  JXL_ENC_FRAME_SETTING_MODULAR_NODE_LOG_COST = 44,
+
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.
    */

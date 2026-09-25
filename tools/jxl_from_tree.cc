@@ -329,6 +329,40 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
       fprintf(stderr, "Invalid Upsample_EC: %s\n", t.c_str());
       return false;
     }
+  } else if (t == "UpsampleWeights") {
+    const size_t count =
+      cparams.resampling == 2 ? 15 :
+      cparams.resampling == 4 ? 55 :
+      cparams.resampling == 8 ? 210 : 0;
+
+    if (count == 0) {
+      fprintf(stderr,
+              "UpsampleWeights requires Upsample 2, 4, or 8\n");
+      return false;
+    }
+
+    float* weights =
+        cparams.resampling == 2
+            ? io.metadata.transform_data.upsampling2_weights
+            : cparams.resampling == 4
+            ? io.metadata.transform_data.upsampling4_weights
+            : io.metadata.transform_data.upsampling8_weights;
+      
+      io.metadata.transform_data.custom_weights_mask |=
+      (cparams.resampling >> 1);
+
+    for (size_t i = 0; i < count; ++i) {
+      t = tok();
+      size_t num = 0;
+      const float v = std::stof(t, &num);
+
+      if (num != t.size()) {
+        fprintf(stderr, "Invalid upsampling weight: %s\n", t.c_str());
+        return false;
+      }
+
+      weights[i] = v;
+    }
   } else if (t == "Animation") {
     io.metadata.m.have_animation = true;
     io.metadata.m.animation.tps_numerator = 1000;

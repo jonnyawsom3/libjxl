@@ -330,38 +330,38 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
       return false;
     }
   } else if (t == "UpsampleWeights") {
-    const size_t count =
-      cparams.resampling == 2 ? 15 :
-      cparams.resampling == 4 ? 55 :
-      cparams.resampling == 8 ? 210 : 0;
+  t = tok();
 
-    if (count == 0) {
-      fprintf(stderr,
-              "UpsampleWeights requires Upsample 2, 4, or 8\n");
+  size_t num = 0;
+  const size_t factor = std::stoul(t, &num);
+  if (num != t.size() || (factor != 2 && factor != 4 && factor != 8)) {
+    fprintf(stderr, "Invalid UpsampleWeights factor: %s\n", t.c_str());
+    return false;
+  }
+
+  const size_t count =
+      factor == 2 ? 15 :
+      factor == 4 ? 55 :
+                    210;
+
+  float* weights =
+      factor == 2
+          ? io.metadata.transform_data.upsampling2_weights
+          : factor == 4
+              ? io.metadata.transform_data.upsampling4_weights
+              : io.metadata.transform_data.upsampling8_weights;
+
+  io.metadata.transform_data.custom_weights_mask |= (factor >> 1);
+
+  for (size_t i = 0; i < count; ++i) {
+    t = tok();
+
+    num = 0;
+    weights[i] = std::stof(t, &num);
+
+    if (num != t.size()) {
+      fprintf(stderr, "Invalid upsampling weight: %s\n", t.c_str());
       return false;
-    }
-
-    float* weights =
-        cparams.resampling == 2
-            ? io.metadata.transform_data.upsampling2_weights
-            : cparams.resampling == 4
-            ? io.metadata.transform_data.upsampling4_weights
-            : io.metadata.transform_data.upsampling8_weights;
-      
-      io.metadata.transform_data.custom_weights_mask |=
-      (cparams.resampling >> 1);
-
-    for (size_t i = 0; i < count; ++i) {
-      t = tok();
-      size_t num = 0;
-      const float v = std::stof(t, &num);
-
-      if (num != t.size()) {
-        fprintf(stderr, "Invalid upsampling weight: %s\n", t.c_str());
-        return false;
-      }
-
-      weights[i] = v;
     }
   } else if (t == "Animation") {
     io.metadata.m.have_animation = true;

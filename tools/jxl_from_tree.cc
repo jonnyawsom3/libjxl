@@ -330,40 +330,41 @@ bool ParseNode(F& tok, Tree& tree, SplineData& spline_data,
       return false;
     }
   } else if (t == "UpsampleWeights") {
-  t = tok();
-
-  size_t num = 0;
-  const size_t factor = std::stoul(t, &num);
-  if (num != t.size() || (factor != 2 && factor != 4 && factor != 8)) {
-    fprintf(stderr, "Invalid UpsampleWeights factor: %s\n", t.c_str());
-    return false;
-  }
-
-  const size_t count =
+      t = tok();
+      
+      size_t num = 0;
+      const size_t factor = std::stoul(t, &num);
+      if (num != t.size() || (factor != 2 && factor != 4 && factor != 8)) {
+        fprintf(stderr, "Invalid UpsampleWeights factor: %s\n", t.c_str());
+        return false;
+      }
+      
+      const size_t count =
       factor == 2 ? 15 :
       factor == 4 ? 55 :
                     210;
-
-  float* weights =
+      
+      float* weights =
       factor == 2
-          ? io.metadata.transform_data.upsampling2_weights
-          : factor == 4
-              ? io.metadata.transform_data.upsampling4_weights
-              : io.metadata.transform_data.upsampling8_weights;
-
-  io.metadata.transform_data.custom_weights_mask |= (factor >> 1);
-
-  for (size_t i = 0; i < count; ++i) {
-    t = tok();
-
-    num = 0;
-    weights[i] = std::stof(t, &num);
-
-    if (num != t.size()) {
-      fprintf(stderr, "Invalid upsampling weight: %s\n", t.c_str());
-      return false;
-    }
-  } else if (t == "Animation") {
+      ? io.metadata.transform_data.upsampling2_weights
+      : factor == 4
+      ? io.metadata.transform_data.upsampling4_weights
+      : io.metadata.transform_data.upsampling8_weights;
+      
+      io.metadata.transform_data.custom_weights_mask |= (factor >> 1);
+      
+      for (size_t i = 0; i < count; ++i) {
+        t = tok();
+        
+        num = 0;
+        weights[i] = std::stof(t, &num);
+        
+        if (num != t.size()) {
+          fprintf(stderr, "Invalid upsampling weight: %s\n", t.c_str());
+          return false;
+        }
+      }
+    } else if (t == "Animation") {
     io.metadata.m.have_animation = true;
     io.metadata.m.animation.tps_numerator = 1000;
     io.metadata.m.animation.tps_denominator = 1;

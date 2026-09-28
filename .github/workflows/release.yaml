@@ -39,6 +39,11 @@ jobs:
     name: linux x86_64 static
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'CI:none') }}
     runs-on: [ubuntu-latest]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
     steps:
     - name: Harden Runner
       uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -52,6 +57,7 @@ jobs:
         sudo apt install -y \
           asciidoc \
           clang \
+          ccache \
           cmake \
           doxygen \
           graphviz \
@@ -79,8 +85,17 @@ jobs:
         fetch-depth: 1
         persist-credentials: false
 
+    - name: Cache compiler output
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ runner.os }}-clang-ccache-v1-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-clang-ccache-v1-
+
     - name: Build
       run: |
+        ccache --zero-stats
         SKIP_TEST=1 \
         ./ci.sh release \
           -DJPEGXL_DEP_LICENSE_DIR=/usr/share/doc \
@@ -90,6 +105,12 @@ jobs:
           -DJPEGXL_ENABLE_PLUGINS=OFF \
           -DJPEGXL_ENABLE_OPENEXR=OFF \
           -DJPEGXL_ENABLE_DEVTOOLS=ON \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+
+    - name: Show compiler cache stats
+      if: always()
+      run: ccache --show-stats
 
     - name: Package release tarball
       run: |
@@ -126,6 +147,14 @@ jobs:
     container:
       image: ${{ matrix.os }}
 
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 2G
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
     steps:
     - name: Harden Runner
       uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -138,6 +167,7 @@ jobs:
         apt update
         DEBIAN_FRONTEND=noninteractive apt install -y \
           build-essential \
+          ccache \
           devscripts \
           python3 \
           sed \
@@ -161,6 +191,14 @@ jobs:
         submodules: true
         fetch-depth: 1
         persist-credentials: false
+
+    - name: Cache compiler output
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ${{ runner.os }}-${{ matrix.os }}-ccache-v1-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.os }}-ccache-v1-
 
     - name: Stamp non-release versions
       # Stamps the built package with the commit date as part of the version
@@ -202,8 +240,13 @@ jobs:
 
     - name: Build libjxl
       run: |
+        ccache --zero-stats
         apt build-dep -y .
         EXCLUDE_DEBIAN_PACKAGES="${{ matrix.exclude_debian_packages || '' }}" ./ci.sh debian_build jpeg-xl
+
+    - name: Show compiler cache stats
+      if: always()
+      run: ccache --show-stats
 
     - name: Stats
       run: |

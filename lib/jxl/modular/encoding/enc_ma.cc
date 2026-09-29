@@ -556,6 +556,35 @@ Status TreeSamples::SetPredictor(Predictor predictor,
     std::swap(predictors[1], predictors[static_cast<int>(Predictor::Gradient)]);
   } else if (predictor == Predictor::Best) {
     predictors = {Predictor::Weighted, Predictor::Gradient};
+  } else if (predictor == Predictor::Squeezed) {
+    const char* env_sq = getenv("JXL_SQ_SET");
+    if (env_sq && strcmp(env_sq, "0") == 0) {
+      predictors = {Predictor::Zero};
+    } else if (env_sq && strcmp(env_sq, "1") == 0) {
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Left};
+    } else if (env_sq && strcmp(env_sq, "2") == 0) {
+      predictors = {Predictor::Zero, Predictor::Top};
+    } else if (env_sq && strcmp(env_sq, "3") == 0) {
+      predictors = {Predictor::Zero, Predictor::Left};
+    } else if (env_sq && strcmp(env_sq, "4") == 0) {
+      predictors = {Predictor::Zero, Predictor::Gradient};
+    } else if (env_sq && strcmp(env_sq, "5") == 0) {
+      predictors = {Predictor::Zero, Predictor::Select};
+    } else if (env_sq && strcmp(env_sq, "6") == 0) {
+      predictors = {Predictor::Zero, Predictor::Average0};
+    } else if (env_sq && strcmp(env_sq, "8") == 0) {
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Gradient};
+    } else if (env_sq && strcmp(env_sq, "9") == 0) {
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Select};
+    } else if (env_sq && strcmp(env_sq, "10") == 0) {
+      predictors = {Predictor::Zero, Predictor::Gradient, Predictor::Select};
+    } else if (env_sq && strcmp(env_sq, "11") == 0) {
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Gradient,
+                    Predictor::Select};
+    } else {
+      // Default: best compression beating main
+      predictors = {Predictor::Zero, Predictor::Gradient};
+    }
   } else {
     predictors = {predictor};
   }

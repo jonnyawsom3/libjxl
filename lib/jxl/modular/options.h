@@ -37,6 +37,7 @@ enum class Predictor : uint32_t {
   Best = 14,  // Best of Gradient and Weighted
   Variable =
       15,  // Find the best decision tree for predictors/predictor per row
+  Squeezed = 16,  // Zero, Top, Left, Gradient for progressive/squeezed images
 };
 
 constexpr Predictor kUndefinedPredictor = static_cast<Predictor>(~0u);
@@ -44,7 +45,7 @@ constexpr Predictor kUndefinedPredictor = static_cast<Predictor>(~0u);
 constexpr size_t kNumModularPredictors =
     static_cast<size_t>(Predictor::Average4) + 1;
 constexpr size_t kNumModularEncoderPredictors =
-    static_cast<size_t>(Predictor::Variable) + 1;
+    static_cast<size_t>(Predictor::Squeezed) + 1;
 
 static constexpr ptrdiff_t kNumStaticProperties = 2;  // channel, group_id.
 
@@ -108,6 +109,7 @@ struct ModularOptions {
     kACMeta,
     kWPFixedDC,
     kGradientFixedDC,
+    kProgressiveLosslessFixed,
   };
   TreeKind tree_kind = TreeKind::kLearn;
 

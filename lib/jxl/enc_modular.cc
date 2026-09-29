@@ -631,11 +631,10 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
       // TODO(veluca): allow all predictors that don't break residual
       // multipliers in lossy mode.
       cparams_.options.predictor = Predictor::Variable;
-    } else if (cparams_.responsive || cparams_.lossy_palette) {
-      // zero predictor for Squeeze residues and lossy palette indices
-      // TODO: Try adding 'Squeezed' predictor set, with the most
-      // common predictors used by Variable in squeezed images, including none.
+    } else if (cparams_.lossy_palette) {
       cparams_.options.predictor = Predictor::Zero;
+    } else if (cparams_.responsive) {
+      cparams_.options.predictor = Predictor::Squeezed;
     } else if (!cparams_.IsLossless()) {
       // If not responsive and lossy. TODO(veluca): use near_lossless instead?
       cparams_.options.predictor = Predictor::Gradient;
@@ -655,7 +654,8 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   if (!cparams_.ModularPartIsLossless()) {
     if (cparams_.options.predictor == Predictor::Weighted ||
         cparams_.options.predictor == Predictor::Variable ||
-        cparams_.options.predictor == Predictor::Best)
+        cparams_.options.predictor == Predictor::Best ||
+        cparams_.options.predictor == Predictor::Squeezed)
       cparams_.options.predictor = Predictor::Zero;
   }
   tree_splits_.push_back(0);
@@ -682,6 +682,12 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     stream_options_[0].tree_kind = ModularOptions::TreeKind::kWPFixedDC;
   } else if (cparams_.speed_tier == SpeedTier::kThunder) {
     stream_options_[0].tree_kind = ModularOptions::TreeKind::kGradientFixedDC;
+  }
+  if (cparams_.responsive && cparams_.modular_mode && cparams_.IsLossless()) {
+    if (getenv("JXL_PROG_FIXED")) {
+      stream_options_[0].tree_kind =
+          ModularOptions::TreeKind::kProgressiveLosslessFixed;
+    }
   }
   stream_options_[0].histogram_params =
       HistogramParams::ForModular(cparams_, {}, streaming_mode);
@@ -968,6 +974,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
         break;
       }
     }
+    t.squeezes = params;
     do_transform(gi, t, weighted::Header(), pool);
     max_bitdepth += 2;
   }
@@ -1170,6 +1177,19 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
 
   if (!cparams_.custom_fixed_tree.empty()) {
     tree_ = cparams_.custom_fixed_tree;
+  } else if (stream_options_[0].tree_kind ==
+             ModularOptions::TreeKind::kProgressiveLosslessFixed) {
+    size_t total_pixels = 0;
+    int max_bitdepth = 0;
+    for (const Image& img : stream_images_) {
+      max_bitdepth = std::max(max_bitdepth, img.bitdepth);
+      for (const Channel& ch : img.channel) {
+        total_pixels += ch.w * ch.h;
+      }
+    }
+    tree_ = PredefinedTree(stream_options_[0].tree_kind, total_pixels,
+                           max_bitdepth, stream_options_[0].max_properties,
+                           &stream_images_[0]);
   } else if (cparams_.speed_tier < SpeedTier::kFalcon ||
              !cparams_.modular_mode) {
     // Avoid creating a tree with leaves that don't correspond to any pixels.
@@ -1215,7 +1235,8 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
         total_pixels = std::max<size_t>(total_pixels, 1);
 
         trees[chunk] = PredefinedTree(stream_options_[start].tree_kind,
-                                      total_pixels, 8, 0);
+                                      total_pixels, 8, 0,
+                                      &stream_images_[start]);
       }
       return true;
     };

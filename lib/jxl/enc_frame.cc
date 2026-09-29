@@ -1696,6 +1696,8 @@ Status ComputeEncodingData(
         // extra channels on VarDCT images without failing tests.
         (!(cparams.responsive == 1 && cparams.IsLossless()) &&
          cparams.buffering < 3) ||
+        (getenv("JXL_PROG_FIXED") && cparams.responsive == 1 &&
+         cparams.IsLossless()) ||
         !cparams.custom_fixed_tree.empty()) {
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTree(pool));
       JXL_RETURN_IF_ERROR(enc_modular.ComputeTokens(pool));

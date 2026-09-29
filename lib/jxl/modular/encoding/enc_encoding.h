@@ -24,7 +24,7 @@ enum class LayerType : uint8_t;
 struct GroupHeader;
 
 Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
-                    int bitdepth, int prevprop);
+                    int bitdepth, int prevprop, const Image *image = nullptr);
 
 StatusOr<Tree> LearnTree(
     const Image *images, const ModularOptions *opts, uint32_t start,

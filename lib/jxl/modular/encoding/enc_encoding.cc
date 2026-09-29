@@ -477,10 +477,108 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
   return true;
 }
 
+struct ChannelSubtree {
+  Predictor pred = Predictor::Zero;
+  int property = 0;
+  std::vector<int32_t> cutoffs;
+};
+
+Tree MakeFixedChannelTree(const std::vector<ChannelSubtree>& subtrees) {
+  Tree tree;
+  if (subtrees.empty()) {
+    tree.push_back(PropertyDecisionNode::Leaf(Predictor::Gradient));
+    return tree;
+  }
+
+  enum class NodeKind { kChannelSplit, kPropertySplit };
+  struct QueueNode {
+    NodeKind kind;
+    int begin_c;
+    int end_c;
+    int chan;
+    int begin_cut;
+    int end_cut;
+    size_t pos;
+  };
+
+  std::queue<QueueNode> q;
+  tree.push_back(PropertyDecisionNode::Leaf(subtrees[0].pred));
+  q.push(QueueNode{NodeKind::kChannelSplit, 0,
+                   static_cast<int>(subtrees.size() - 1), 0, 0, 0, 0});
+
+  while (!q.empty()) {
+    QueueNode node = q.front();
+    q.pop();
+
+    if (node.kind == NodeKind::kChannelSplit) {
+      if (node.begin_c == node.end_c) {
+        int c = node.begin_c;
+        const auto& st = subtrees[c];
+        if (st.cutoffs.empty()) {
+          tree[node.pos] = PropertyDecisionNode::Leaf(st.pred);
+        } else {
+          QueueNode prop_node{NodeKind::kPropertySplit, 0, 0, c, 0,
+                              static_cast<int>(st.cutoffs.size() - 1),
+                              node.pos};
+          q.push(prop_node);
+        }
+        continue;
+      }
+
+      int mid = (node.begin_c + node.end_c) / 2;
+      size_t lchild = tree.size();
+      size_t rchild = tree.size() + 1;
+      tree[node.pos] = PropertyDecisionNode::Split(0, mid, lchild, rchild);
+
+      // lchild (c > mid): [mid + 1, end_c]
+      tree.push_back(PropertyDecisionNode::Leaf(subtrees[mid + 1].pred));
+      q.push(QueueNode{NodeKind::kChannelSplit, mid + 1, node.end_c, 0, 0, 0,
+                       lchild});
+
+      // rchild (c <= mid): [begin_c, mid]
+      tree.push_back(PropertyDecisionNode::Leaf(subtrees[node.begin_c].pred));
+      q.push(QueueNode{NodeKind::kChannelSplit, node.begin_c, mid, 0, 0, 0,
+                       rchild});
+    } else {
+      int c = node.chan;
+      const auto& st = subtrees[c];
+      int mid_cut = (node.begin_cut + node.end_cut) / 2;
+      int32_t cutoff_val = st.cutoffs[mid_cut];
+      size_t lchild = tree.size();
+      size_t rchild = tree.size() + 1;
+      tree[node.pos] =
+          PropertyDecisionNode::Split(st.property, cutoff_val, lchild, rchild);
+
+      // lchild (prop > cutoff_val): [mid_cut + 1, end_cut]
+      tree.push_back(PropertyDecisionNode::Leaf(st.pred));
+      if (mid_cut + 1 <= node.end_cut) {
+        q.push(QueueNode{NodeKind::kPropertySplit, 0, 0, c, mid_cut + 1,
+                         node.end_cut, lchild});
+      }
+
+      // rchild (prop <= cutoff_val): [begin_cut, mid_cut - 1]
+      tree.push_back(PropertyDecisionNode::Leaf(st.pred));
+      if (node.begin_cut <= mid_cut - 1) {
+        q.push(QueueNode{NodeKind::kPropertySplit, 0, 0, c, node.begin_cut,
+                         mid_cut - 1, rchild});
+      }
+    }
+  }
+  return tree;
+}
+
+Tree MakeFixedChannelTree(const std::vector<Predictor>& predictors) {
+  std::vector<ChannelSubtree> subtrees(predictors.size());
+  for (size_t i = 0; i < predictors.size(); ++i) {
+    subtrees[i].pred = predictors[i];
+  }
+  return MakeFixedChannelTree(subtrees);
+}
+
 }  // namespace
 
 Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
-                    int bitdepth, int prevprop) {
+                    int bitdepth, int prevprop, const Image *image) {
   switch (tree_kind) {
     case ModularOptions::TreeKind::kJpegTranscodeACMeta:
       // All the data is 0, so no need for a fancy tree.
@@ -556,6 +654,129 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
       return MakeFixedTree(
           prevprop > 0 ? kNumNonrefProperties + 2 : kGradientProp, cutoffs,
           Predictor::Gradient, total_pixels, bitdepth);
+    }
+    case ModularOptions::TreeKind::kProgressiveLosslessFixed: {
+      if (image == nullptr || image->channel.empty()) {
+        return {PropertyDecisionNode::Leaf(Predictor::Gradient)};
+      }
+      size_t nb_channels = image->channel.size();
+      enum class SqueezeChanType {
+        kAvg,
+        kHResidual,
+        kVResidual,
+      };
+      const Transform* squeeze_tr = nullptr;
+      for (const auto& tr : image->transform) {
+        if (tr.id == TransformId::kSqueeze) {
+          squeeze_tr = &tr;
+          break;
+        }
+      }
+      std::vector<SqueezeChanType> chan_types;
+      if (squeeze_tr != nullptr) {
+        size_t num_residuals = 0;
+        for (const auto& param : squeeze_tr->squeezes) {
+          num_residuals += param.num_c;
+        }
+        size_t num_base = (nb_channels >= num_residuals)
+                              ? (nb_channels - num_residuals)
+                              : 0;
+        chan_types.assign(num_base, SqueezeChanType::kAvg);
+        for (const auto& param : squeeze_tr->squeezes) {
+          bool horizontal = param.horizontal;
+          bool in_place = param.in_place;
+          uint32_t beginc = param.begin_c;
+          uint32_t endc = param.begin_c + param.num_c - 1;
+          uint32_t offset = in_place ? (endc + 1) : chan_types.size();
+          SqueezeChanType res_type = horizontal ? SqueezeChanType::kHResidual
+                                                : SqueezeChanType::kVResidual;
+          for (uint32_t c = beginc; c <= endc; c++) {
+            if (offset <= chan_types.size()) {
+              chan_types.insert(chan_types.begin() + offset + (c - beginc),
+                                res_type);
+            } else {
+              chan_types.push_back(res_type);
+            }
+          }
+        }
+      }
+      if (chan_types.size() != nb_channels) {
+        chan_types.resize(nb_channels);
+        bool wide = (image->w >= image->h);
+        for (size_t c = 0; c < nb_channels; ++c) {
+          const Channel& ch = image->channel[c];
+          if (c < 3 && ch.w <= 8 && ch.h <= 8) {
+            chan_types[c] = SqueezeChanType::kAvg;
+          } else if (wide) {
+            chan_types[c] = (ch.hshift > ch.vshift) ? SqueezeChanType::kHResidual
+                                                    : SqueezeChanType::kVResidual;
+          } else {
+            chan_types[c] = (ch.hshift >= ch.vshift) ? SqueezeChanType::kHResidual
+                                                     : SqueezeChanType::kVResidual;
+          }
+        }
+      }
+      int threshold = 64;
+      Predictor h_pred = Predictor::Top;    // North (best for H-residuals)
+      Predictor v_pred = Predictor::Left;   // West (best for V-residuals)
+      Predictor avg_pred = Predictor::Gradient;
+
+      const char* env_thresh = getenv("JXL_THRESH");
+      if (env_thresh) threshold = atoi(env_thresh);
+      const char* env_h = getenv("JXL_H_PRED");
+      if (env_h) h_pred = static_cast<Predictor>(atoi(env_h));
+      const char* env_v = getenv("JXL_V_PRED");
+      if (env_v) v_pred = static_cast<Predictor>(atoi(env_v));
+      const char* env_avg = getenv("JXL_AVG_PRED");
+      if (env_avg) avg_pred = static_cast<Predictor>(atoi(env_avg));
+
+      const char* env_ctx = getenv("JXL_CTX");
+      const char* env_prop = getenv("JXL_PROP");
+
+      std::vector<int32_t> default_cutoffs = {
+          -500, -255, -127, -63, -31, -15, -7, -3, -1, 0,
+          1,    3,    7,    15,  31,  63,  127, 255, 500};
+
+      std::vector<ChannelSubtree> subtrees(nb_channels);
+      for (size_t c = 0; c < nb_channels; ++c) {
+        const Channel& ch = image->channel[c];
+        ChannelSubtree& st = subtrees[c];
+        st.property = 9;  // local gradient (kGradientProp)
+        if (chan_types[c] == SqueezeChanType::kAvg) {
+          st.pred = avg_pred;
+        } else if (std::max(ch.w, ch.h) < static_cast<size_t>(threshold)) {
+          st.pred = Predictor::Zero;
+        } else if (chan_types[c] == SqueezeChanType::kHResidual) {
+          st.pred = h_pred;
+        } else {
+          st.pred = v_pred;
+        }
+
+        if (env_prop) {
+          st.property = atoi(env_prop);
+        }
+
+        if (env_ctx != nullptr) {
+          if (strcmp(env_ctx, "none") == 0 || strcmp(env_ctx, "-1") == 0) {
+            st.cutoffs.clear();
+          } else if (strcmp(env_ctx, "0") == 0) {
+            st.cutoffs = {0};
+          } else if (strcmp(env_ctx, "1") == 0) {
+            st.cutoffs = {0, 1};
+          } else if (strcmp(env_ctx, "3") == 0) {
+            st.cutoffs = {-3, 0, 3};
+          } else if (strcmp(env_ctx, "7") == 0) {
+            st.cutoffs = {-7, -3, -1, 0, 1, 3, 7};
+          } else if (strcmp(env_ctx, "9") == 0) {
+            st.cutoffs = {-15, -7, -3, -1, 0, 1, 3, 7, 15};
+          } else if (strcmp(env_ctx, "10") == 0) {
+            st.cutoffs = default_cutoffs;
+          }
+        } else {
+          st.cutoffs = default_cutoffs;
+        }
+      }
+      return MakeFixedChannelTree(subtrees);
     }
     case ModularOptions::TreeKind::kLearn: {
       JXL_DEBUG_ABORT("internal: kLearn is not predefined tree");
@@ -758,7 +979,7 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
     total_pixels = std::max<size_t>(total_pixels, 1);
 
     tree = PredefinedTree(options.tree_kind, total_pixels, image.bitdepth,
-                          options.max_properties);
+                          options.max_properties, &image);
   }
 
   Tree decoded_tree;

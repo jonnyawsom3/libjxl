@@ -474,12 +474,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
       cparams_.decoding_speed_tier == 1) {
     cparams_.decoding_speed_tier = 2;
   }
-  if (cparams_.responsive == 1 && cparams_.IsLossless()) {
-    // RCT selection seems bugged with Squeeze, YCoCg works well.
-    if (cparams_.colorspace < 0) {
-      cparams_.colorspace = 6;
-    }
-  }
+
 
   if (cparams_.ModularPartIsLossless()) {
     const auto disable_wp = [this] () {
@@ -536,6 +531,12 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   cparams_.options.splitting_heuristics_node_threshold =
       75 + 14 * static_cast<int>(cparams_.speed_tier) +
       10 * cparams_.decoding_speed_tier;
+  if (cparams_.responsive) {
+    cparams_.options.splitting_heuristics_node_threshold += 55;
+  }
+  if (const char* env_th = getenv("JXL_NODE_THRESH")) {
+    cparams_.options.splitting_heuristics_node_threshold = atof(env_th);
+  }
 
   {
     // Set properties.
@@ -911,8 +912,87 @@ Status ModularFrameEncoder::ComputeEncodingData(
   if (cparams_.color_transform == ColorTransform::kNone && do_color &&
       gi.channel.size() - gi.nb_meta_channels >= 3 &&
       max_bitdepth + 1 < level_max_bitdepth) {
-    if (cparams_.colorspace < 0 && (!cparams_.ModularPartIsLossless() ||
-                                    cparams_.speed_tier > SpeedTier::kHare)) {
+    if (cparams_.responsive && cparams_.colorspace < 0 &&
+        cparams_.ModularPartIsLossless() &&
+        cparams_.speed_tier <= SpeedTier::kHare) {
+      size_t nb_rcts_to_try = 0;
+      switch (cparams_.speed_tier) {
+        case SpeedTier::kLightning:
+        case SpeedTier::kThunder:
+        case SpeedTier::kFalcon:
+        case SpeedTier::kCheetah:
+          nb_rcts_to_try = 0;
+          break;
+        case SpeedTier::kHare:
+          nb_rcts_to_try = 4;
+          break;
+        case SpeedTier::kWombat:
+          nb_rcts_to_try = 5;
+          break;
+        case SpeedTier::kSquirrel:
+          nb_rcts_to_try = 7;
+          break;
+        case SpeedTier::kKitten:
+          nb_rcts_to_try = 9;
+          break;
+        default:
+          nb_rcts_to_try = 19;
+          break;
+      }
+      float best_cost = std::numeric_limits<float>::max();
+      size_t best_rct = 6;
+      std::vector<Channel> orig;
+      orig.reserve(3);
+      for (size_t c = 0; c < 3; ++c) {
+        Channel& genuine = gi.channel[gi.nb_meta_channels + c];
+        JXL_ASSIGN_OR_RETURN(
+            Channel ch,
+            Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
+                            genuine.hshift, genuine.vshift));
+        orig.emplace_back(std::move(ch));
+        genuine.plane.Swap(orig[c].plane);
+      }
+      for (int rct_type : {0 * 7 + 0, 0 * 7 + 6, 0 * 7 + 5, 1 * 7 + 3, 3 * 7 + 5,
+                           5 * 7 + 5, 1 * 7 + 5, 2 * 7 + 5, 1 * 7 + 1, 0 * 7 + 4,
+                           1 * 7 + 2, 2 * 7 + 1, 2 * 7 + 2, 2 * 7 + 3, 4 * 7 + 4,
+                           4 * 7 + 5, 0 * 7 + 2, 0 * 7 + 1, 0 * 7 + 3}) {
+        if (nb_rcts_to_try == 0) break;
+        nb_rcts_to_try--;
+        if (rct_type == 0) {
+          for (size_t c = 0; c < 3; ++c) {
+            gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+          }
+          JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
+          best_rct = 0;
+          for (size_t c = 0; c < 3; ++c) {
+            gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+          }
+        } else {
+          std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
+          std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
+                                         &gi.channel[gi.nb_meta_channels + 1],
+                                         &gi.channel[gi.nb_meta_channels + 2]};
+          JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, pool));
+          JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+          if (cost < best_cost) {
+            best_rct = rct_type;
+            best_cost = cost;
+          }
+        }
+      }
+      for (size_t c = 0; c < 3; ++c) {
+        gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+      }
+      if (best_rct != 0) {
+        Transform sg(TransformId::kRCT);
+        sg.begin_c = gi.nb_meta_channels;
+        sg.rct_type = best_rct;
+        do_transform(gi, sg, weighted::Header(), pool);
+        max_bitdepth++;
+      }
+      cparams_.colorspace = best_rct;
+    } else if (cparams_.colorspace < 0 && (!cparams_.ModularPartIsLossless() ||
+                                           cparams_.speed_tier > SpeedTier::kHare)) {
       Transform ycocg{TransformId::kRCT};
       ycocg.rct_type = 6;
       ycocg.begin_c = gi.nb_meta_channels;

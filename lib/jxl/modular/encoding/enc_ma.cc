@@ -582,8 +582,8 @@ Status TreeSamples::SetPredictor(Predictor predictor,
       predictors = {Predictor::Zero, Predictor::Top, Predictor::Gradient,
                     Predictor::Select};
     } else {
-      // Default: best compression beating main
-      predictors = {Predictor::Zero, Predictor::Gradient};
+      // Default: refined candidate predictor set
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Gradient};
     }
   } else {
     predictors = {predictor};

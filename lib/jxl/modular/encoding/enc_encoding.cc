@@ -688,8 +688,8 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
           uint32_t beginc = param.begin_c;
           uint32_t endc = param.begin_c + param.num_c - 1;
           uint32_t offset = in_place ? (endc + 1) : chan_types.size();
-          SqueezeChanType res_type = horizontal ? SqueezeChanType::kVResidual
-                                                : SqueezeChanType::kHResidual;
+          SqueezeChanType res_type = horizontal ? SqueezeChanType::kHResidual
+                                                : SqueezeChanType::kVResidual;
           for (uint32_t c = beginc; c <= endc; c++) {
             if (offset <= chan_types.size()) {
               chan_types.insert(chan_types.begin() + offset + (c - beginc),
@@ -708,11 +708,11 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
           if (c < 3 && ch.w <= 8 && ch.h <= 8) {
             chan_types[c] = SqueezeChanType::kAvg;
           } else if (wide) {
-            chan_types[c] = (ch.hshift > ch.vshift) ? SqueezeChanType::kVResidual
-                                                    : SqueezeChanType::kHResidual;
+            chan_types[c] = (ch.hshift > ch.vshift) ? SqueezeChanType::kHResidual
+                                                    : SqueezeChanType::kVResidual;
           } else {
-            chan_types[c] = (ch.hshift >= ch.vshift) ? SqueezeChanType::kVResidual
-                                                     : SqueezeChanType::kHResidual;
+            chan_types[c] = (ch.hshift >= ch.vshift) ? SqueezeChanType::kHResidual
+                                                     : SqueezeChanType::kVResidual;
           }
         }
       }
@@ -747,9 +747,9 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
         } else if (std::max(ch.w, ch.h) < static_cast<size_t>(threshold)) {
           st.pred = Predictor::Zero;
         } else if (chan_types[c] == SqueezeChanType::kHResidual) {
-          st.pred = v_pred;
-        } else {
           st.pred = h_pred;
+        } else {
+          st.pred = v_pred;
         }
 
         if (env_prop) {

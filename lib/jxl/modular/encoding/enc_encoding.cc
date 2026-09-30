@@ -511,7 +511,7 @@ size_t BuildFixedChannelRunTree(
   const size_t rchild =
       BuildFixedChannelRunTree(runs, begin, mid, tree);
 
-  tree[pos] = PropertyDecisionNode::Split(
+  (*tree)[pos] = PropertyDecisionNode::Split(
       0, split_val, lchild, rchild);
 
   return pos;
@@ -547,17 +547,14 @@ Tree MakeFixedChannelTree(
 }
 
 }  // namespace
-std::vector<Predictor> GetProgressiveLosslessFixedPredictors(
-    const Image& image) {
+}  // namespace
+
+std::vector<Predictor> GetProgressiveLosslessFixedPredictors(const Image& image) {
   const size_t num_channels = image.channel.size();
 
-  // Initially every channel is part of the base image.
-  // Each squeeze contributes num_c residual channels.
   size_t num_residual_channels = 0;
-
   for (const Transform& tr : image.transform) {
     if (tr.id != TransformId::kSqueeze) continue;
-
     for (const SqueezeParams& p : tr.squeezes) {
       num_residual_channels += p.num_c;
     }
@@ -565,8 +562,7 @@ std::vector<Predictor> GetProgressiveLosslessFixedPredictors(
 
   JXL_DASSERT(num_residual_channels <= num_channels);
 
-  const size_t num_base_channels =
-      num_channels - num_residual_channels;
+  const size_t num_base_channels = num_channels - num_residual_channels;
 
   enum class SqueezeChanType {
     kBase,
@@ -574,60 +570,35 @@ std::vector<Predictor> GetProgressiveLosslessFixedPredictors(
     kVResidual,
   };
 
-  // This includes metachannels too, which is intentional: squeeze
-  // operates on the non-meta channels beginning at begin_c.
-  std::vector<SqueezeChanType> chan_types(
-      num_base_channels, SqueezeChanType::kBase);
+  std::vector<SqueezeChanType> chan_types(num_base_channels, SqueezeChanType::kBase);
 
-  // Reconstruct the channel insertion order used by MetaSqueeze.
   for (const Transform& tr : image.transform) {
     if (tr.id != TransformId::kSqueeze) continue;
-
     for (const SqueezeParams& p : tr.squeezes) {
-      const SqueezeChanType type =
-          p.horizontal
-              ? SqueezeChanType::kHResidual
-              : SqueezeChanType::kVResidual;
-
+      const SqueezeChanType type = p.horizontal ? SqueezeChanType::kHResidual : SqueezeChanType::kVResidual;
       const size_t begin = p.begin_c;
       const size_t end = begin + p.num_c;
-
       JXL_DASSERT(begin <= chan_types.size());
       JXL_DASSERT(end <= image.channel.size());
-
-      const size_t offset =
-          p.in_place ? end : chan_types.size();
-
+      const size_t offset = p.in_place ? end : chan_types.size();
       JXL_DASSERT(offset <= chan_types.size());
-
-      chan_types.insert(
-          chan_types.begin() + offset,
-          p.num_c,
-          type);
+      chan_types.insert(chan_types.begin() + offset, p.num_c, type);
     }
   }
 
   JXL_DASSERT(chan_types.size() == num_channels);
 
-  std::vector<Predictor> predictors(
-      num_channels, Predictor::Gradient);
+  std::vector<Predictor> predictors(num_channels, Predictor::Gradient);
 
   for (size_t c = 0; c < num_channels; ++c) {
     switch (chan_types[c]) {
       case SqueezeChanType::kBase:
-        // Original / downsampled low-pass channel.
         predictors[c] = Predictor::Gradient;
         break;
-
       case SqueezeChanType::kHResidual:
-        // FwdHSqueeze removes horizontal tendency, so the useful
-        // remaining correlation is vertical.
         predictors[c] = Predictor::Top;
         break;
-
       case SqueezeChanType::kVResidual:
-        // FwdVSqueeze removes vertical tendency, so the useful
-        // remaining correlation is horizontal.
         predictors[c] = Predictor::Left;
         break;
     }
@@ -635,22 +606,10 @@ std::vector<Predictor> GetProgressiveLosslessFixedPredictors(
 
   return predictors;
 }
-  }
-  return tree;
-}
-
-Tree MakeFixedChannelTree(const std::vector<Predictor>& predictors) {
-  std::vector<ChannelSubtree> subtrees(predictors.size());
-  for (size_t i = 0; i < predictors.size(); ++i) {
-    subtrees[i].pred = predictors[i];
-  }
-  return MakeFixedChannelTree(subtrees);
-}
-
-}  // namespace
 
 Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
-                    int bitdepth, int prevprop, const Image *image) {
+                    int bitdepth, int prevprop,
+                    const std::vector<Predictor>* fixed_predictors) {
   switch (tree_kind) {
     case ModularOptions::TreeKind::kJpegTranscodeACMeta:
       // All the data is 0, so no need for a fancy tree.
@@ -728,92 +687,11 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
           Predictor::Gradient, total_pixels, bitdepth);
     }
     case ModularOptions::TreeKind::kProgressiveLosslessFixed: {
-  if (image == nullptr || image->channel.empty()) {
-    return {PropertyDecisionNode::Leaf(Predictor::Gradient)};
-  }
-
-  enum class SqueezeChanType {
-    kBase,
-    kHResidual,
-    kVResidual,
-  };
-
-  const size_t num_channels = image->channel.size();
-
-  // All channels that survive the squeeze sequence are the final
-  // downsampled/base channels and use Gradient.
-  size_t num_residual_channels = 0;
-
-  for (const Transform& tr : image->transform) {
-    if (tr.id != TransformId::kSqueeze) continue;
-    for (const SqueezeParams& p : tr.squeezes) {
-      num_residual_channels += p.num_c;
+      if (fixed_predictors == nullptr) {
+        return {PropertyDecisionNode::Leaf(Predictor::Gradient)};
+      }
+      return MakeFixedChannelTree(*fixed_predictors);
     }
-  }
-
-  JXL_ENSURE(num_residual_channels <= num_channels);
-
-  const size_t num_base_channels =
-      num_channels - num_residual_channels;
-
-  std::vector<SqueezeChanType> chan_types(
-      num_base_channels, SqueezeChanType::kBase);
-
-  // Recreate the exact channel insertion order used by MetaSqueeze().
-  for (const Transform& tr : image->transform) {
-    if (tr.id != TransformId::kSqueeze) continue;
-
-    for (const SqueezeParams& p : tr.squeezes) {
-      const SqueezeChanType type =
-          p.horizontal ? SqueezeChanType::kHResidual
-                       : SqueezeChanType::kVResidual;
-
-      const size_t begin = p.begin_c;
-      const size_t end = begin + p.num_c;
-
-      JXL_ENSURE(begin <= chan_types.size());
-      JXL_ENSURE(end <= image->channel.size());
-
-      const size_t offset =
-          p.in_place ? end : chan_types.size();
-
-      JXL_ENSURE(offset <= chan_types.size());
-
-      chan_types.insert(
-          chan_types.begin() + offset,
-          p.num_c,
-          type);
-    }
-  }
-
-  JXL_ENSURE(chan_types.size() == num_channels);
-
-  std::vector<Predictor> predictors(
-      num_channels, Predictor::Gradient);
-
-  for (size_t c = 0; c < num_channels; ++c) {
-    switch (chan_types[c]) {
-      case SqueezeChanType::kBase:
-        // Squeezed/low-pass/downsampled image.
-        predictors[c] = Predictor::Gradient;
-        break;
-
-      case SqueezeChanType::kHResidual:
-        // Horizontal squeeze residual:
-        // benchmark shows Top/North is the useful predictor.
-        predictors[c] = Predictor::Top;
-        break;
-
-      case SqueezeChanType::kVResidual:
-        // Vertical squeeze residual:
-        // benchmark shows Left/West is the useful predictor.
-        predictors[c] = Predictor::Left;
-        break;
-    }
-  }
-
-  return MakeFixedChannelTree(predictors);
-}
     case ModularOptions::TreeKind::kLearn: {
       JXL_DEBUG_ABORT("internal: kLearn is not predefined tree");
       return {};
@@ -1014,8 +892,13 @@ Status ModularGenericCompress(const Image &image, const ModularOptions &opts,
     }
     total_pixels = std::max<size_t>(total_pixels, 1);
 
+    std::vector<Predictor> fixed_predictors;
+    if (options.tree_kind == ModularOptions::TreeKind::kProgressiveLosslessFixed) {
+      fixed_predictors = GetProgressiveLosslessFixedPredictors(image);
+    }
     tree = PredefinedTree(options.tree_kind, total_pixels, image.bitdepth,
-                          options.max_properties, &image);
+                          options.max_properties, 
+                          options.tree_kind == ModularOptions::TreeKind::kProgressiveLosslessFixed ? &fixed_predictors : nullptr);
   }
 
   Tree decoded_tree;

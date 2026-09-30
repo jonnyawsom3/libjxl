@@ -535,7 +535,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     cparams_.options.splitting_heuristics_node_threshold += 55;
   }
   if (const char* env_th = getenv("JXL_NODE_THRESH")) {
-    cparams_.options.splitting_heuristics_node_threshold = atof(env_th);
+    cparams_.options.splitting_heuristics_node_threshold = atoi(env_th);
   }
 
   {
@@ -943,14 +943,14 @@ Status ModularFrameEncoder::ComputeEncodingData(
       size_t best_rct = 6;
       std::vector<Channel> orig;
       orig.reserve(3);
-      for (size_t c = 0; c < 3; ++c) {
-        Channel& genuine = gi.channel[gi.nb_meta_channels + c];
+      for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
+        Channel& genuine = gi.channel[gi.nb_meta_channels + rgb_c];
         JXL_ASSIGN_OR_RETURN(
             Channel ch,
             Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
                             genuine.hshift, genuine.vshift));
         orig.emplace_back(std::move(ch));
-        genuine.plane.Swap(orig[c].plane);
+        genuine.plane.Swap(orig[rgb_c].plane);
       }
       for (int rct_type : {0 * 7 + 0, 0 * 7 + 6, 0 * 7 + 5, 1 * 7 + 3, 3 * 7 + 5,
                            5 * 7 + 5, 1 * 7 + 5, 2 * 7 + 5, 1 * 7 + 1, 0 * 7 + 4,
@@ -959,13 +959,13 @@ Status ModularFrameEncoder::ComputeEncodingData(
         if (nb_rcts_to_try == 0) break;
         nb_rcts_to_try--;
         if (rct_type == 0) {
-          for (size_t c = 0; c < 3; ++c) {
-            gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+          for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
+            gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
           }
           JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
           best_rct = 0;
-          for (size_t c = 0; c < 3; ++c) {
-            gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+          for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
+            gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
           }
         } else {
           std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
@@ -980,8 +980,8 @@ Status ModularFrameEncoder::ComputeEncodingData(
           }
         }
       }
-      for (size_t c = 0; c < 3; ++c) {
-        gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+      for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
+        gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
       }
       if (best_rct != 0) {
         Transform sg(TransformId::kRCT);
@@ -1273,81 +1273,7 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
 
   // First classify channels in the transformed full image.
   const std::vector<Predictor> full_predictors =
-      [&]() {
-        // We need the predictor vector itself rather than a Tree,
-        // because group streams use local channel numbering.
-        enum class SqueezeChanType {
-          kBase,
-          kHResidual,
-          kVResidual,
-        };
-
-        const Image& full = stream_images_[0];
-        const size_t num_channels = full.channel.size();
-
-        size_t num_residual_channels = 0;
-        for (const Transform& tr : full.transform) {
-          if (tr.id != TransformId::kSqueeze) continue;
-          for (const SqueezeParams& p : tr.squeezes) {
-            num_residual_channels += p.num_c;
-          }
-        }
-
-        JXL_ENSURE(num_residual_channels <= num_channels);
-
-        const size_t num_base_channels =
-            num_channels - num_residual_channels;
-
-        std::vector<SqueezeChanType> types(
-            num_base_channels, SqueezeChanType::kBase);
-
-        for (const Transform& tr : full.transform) {
-          if (tr.id != TransformId::kSqueeze) continue;
-
-          for (const SqueezeParams& p : tr.squeezes) {
-            const SqueezeChanType type =
-                p.horizontal
-                    ? SqueezeChanType::kHResidual
-                    : SqueezeChanType::kVResidual;
-
-            const size_t begin = p.begin_c;
-            const size_t end = begin + p.num_c;
-
-            JXL_ENSURE(begin <= types.size());
-            JXL_ENSURE(end <= full.channel.size());
-
-            const size_t offset =
-                p.in_place ? end : types.size();
-
-            types.insert(
-                types.begin() + offset,
-                p.num_c, type);
-          }
-        }
-
-        JXL_ENSURE(types.size() == num_channels);
-
-        std::vector<Predictor> result(
-            num_channels, Predictor::Gradient);
-
-        for (size_t c = 0; c < num_channels; ++c) {
-          switch (types[c]) {
-            case SqueezeChanType::kBase:
-              result[c] = Predictor::Gradient;
-              break;
-
-            case SqueezeChanType::kHResidual:
-              result[c] = Predictor::Top;
-              break;
-
-            case SqueezeChanType::kVResidual:
-              result[c] = Predictor::Left;
-              break;
-          }
-        }
-
-        return result;
-      }();
+      GetProgressiveLosslessFixedPredictors(stream_images_[0]);
 
   // Build one tree per stream, because `chan` in the MA static
   // property is the LOCAL channel index of that stream.
@@ -1471,8 +1397,7 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
         total_pixels = std::max<size_t>(total_pixels, 1);
 
         trees[chunk] = PredefinedTree(stream_options_[start].tree_kind,
-                                      total_pixels, 8, 0,
-                                      &stream_images_[start]);
+                                      total_pixels, 8, 0);
       }
       return true;
     };

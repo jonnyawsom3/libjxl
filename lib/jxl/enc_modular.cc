@@ -1356,21 +1356,25 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
              !cparams_.modular_mode) {
     // Avoid creating a tree with leaves that don't correspond to any pixels.
     std::vector<size_t> useful_splits;
-    useful_splits.reserve(tree_splits_.size());
-    for (size_t chunk = 0; chunk < tree_splits_.size() - 1; chunk++) {
-      bool has_pixels = false;
-      size_t start = tree_splits_[chunk];
-      size_t stop = tree_splits_[chunk + 1];
-      for (size_t i = start; i < stop; i++) {
-        if (!stream_images_[i].empty()) has_pixels = true;
+    if (cparams_.responsive) {
+      useful_splits = {0, stream_images_.size()};
+    } else {
+      useful_splits.reserve(tree_splits_.size());
+      for (size_t chunk = 0; chunk < tree_splits_.size() - 1; chunk++) {
+        bool has_pixels = false;
+        size_t start = tree_splits_[chunk];
+        size_t stop = tree_splits_[chunk + 1];
+        for (size_t i = start; i < stop; i++) {
+          if (!stream_images_[i].empty()) has_pixels = true;
+        }
+        if (has_pixels) {
+          useful_splits.push_back(tree_splits_[chunk]);
+        }
       }
-      if (has_pixels) {
-        useful_splits.push_back(tree_splits_[chunk]);
-      }
+      // Don't do anything if modular mode does not have any pixels in this image
+      if (useful_splits.empty()) return true;
+      useful_splits.push_back(tree_splits_.back());
     }
-    // Don't do anything if modular mode does not have any pixels in this image
-    if (useful_splits.empty()) return true;
-    useful_splits.push_back(tree_splits_.back());
 
     std::vector<Tree> trees(useful_splits.size() - 1);
     const auto process_chunk = [&](const uint32_t chunk,

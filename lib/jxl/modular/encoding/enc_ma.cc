@@ -583,7 +583,7 @@ Status TreeSamples::SetPredictor(Predictor predictor,
                     Predictor::Select};
     } else {
       // Default: refined candidate predictor set
-      predictors = {Predictor::Zero, Predictor::Top, Predictor::Gradient};
+      predictors = {Predictor::Zero, Predictor::Top, Predictor::Left, Predictor::Gradient};
     }
   } else {
     predictors = {predictor};

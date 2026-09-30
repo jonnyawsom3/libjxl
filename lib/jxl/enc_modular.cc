@@ -1258,18 +1258,174 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
   if (!cparams_.custom_fixed_tree.empty()) {
     tree_ = cparams_.custom_fixed_tree;
   } else if (stream_options_[0].tree_kind ==
-             ModularOptions::TreeKind::kProgressiveLosslessFixed) {
-    size_t total_pixels = 0;
-    int max_bitdepth = 0;
-    for (const Image& img : stream_images_) {
-      max_bitdepth = std::max(max_bitdepth, img.bitdepth);
-      for (const Channel& ch : img.channel) {
-        total_pixels += ch.w * ch.h;
+           ModularOptions::TreeKind::kProgressiveLosslessFixed) {
+  size_t total_pixels = 0;
+  int max_bitdepth = 0;
+
+  for (const Image& img : stream_images_) {
+    max_bitdepth = std::max(max_bitdepth, img.bitdepth);
+    for (const Channel& ch : img.channel) {
+      total_pixels += ch.w * ch.h;
+    }
+  }
+
+  total_pixels = std::max<size_t>(total_pixels, 1);
+
+  // First classify channels in the transformed full image.
+  const std::vector<Predictor> full_predictors =
+      [&]() {
+        // We need the predictor vector itself rather than a Tree,
+        // because group streams use local channel numbering.
+        enum class SqueezeChanType {
+          kBase,
+          kHResidual,
+          kVResidual,
+        };
+
+        const Image& full = stream_images_[0];
+        const size_t num_channels = full.channel.size();
+
+        size_t num_residual_channels = 0;
+        for (const Transform& tr : full.transform) {
+          if (tr.id != TransformId::kSqueeze) continue;
+          for (const SqueezeParams& p : tr.squeezes) {
+            num_residual_channels += p.num_c;
+          }
+        }
+
+        JXL_ENSURE(num_residual_channels <= num_channels);
+
+        const size_t num_base_channels =
+            num_channels - num_residual_channels;
+
+        std::vector<SqueezeChanType> types(
+            num_base_channels, SqueezeChanType::kBase);
+
+        for (const Transform& tr : full.transform) {
+          if (tr.id != TransformId::kSqueeze) continue;
+
+          for (const SqueezeParams& p : tr.squeezes) {
+            const SqueezeChanType type =
+                p.horizontal
+                    ? SqueezeChanType::kHResidual
+                    : SqueezeChanType::kVResidual;
+
+            const size_t begin = p.begin_c;
+            const size_t end = begin + p.num_c;
+
+            JXL_ENSURE(begin <= types.size());
+            JXL_ENSURE(end <= full.channel.size());
+
+            const size_t offset =
+                p.in_place ? end : types.size();
+
+            types.insert(
+                types.begin() + offset,
+                p.num_c, type);
+          }
+        }
+
+        JXL_ENSURE(types.size() == num_channels);
+
+        std::vector<Predictor> result(
+            num_channels, Predictor::Gradient);
+
+        for (size_t c = 0; c < num_channels; ++c) {
+          switch (types[c]) {
+            case SqueezeChanType::kBase:
+              result[c] = Predictor::Gradient;
+              break;
+
+            case SqueezeChanType::kHResidual:
+              result[c] = Predictor::Top;
+              break;
+
+            case SqueezeChanType::kVResidual:
+              result[c] = Predictor::Left;
+              break;
+          }
+        }
+
+        return result;
+      }();
+
+  // Build one tree per stream, because `chan` in the MA static
+  // property is the LOCAL channel index of that stream.
+  std::vector<Tree> trees;
+  std::vector<size_t> tree_splits;
+
+  bool have_tree = false;
+  std::vector<Predictor> previous_predictors;
+
+  for (size_t stream_id = 0;
+       stream_id < stream_images_.size();
+       ++stream_id) {
+    const Image& image = stream_images_[stream_id];
+
+    if (image.empty()) continue;
+
+    std::vector<Predictor> local_predictors(
+        image.channel.size(), Predictor::Gradient);
+
+    if (stream_id == 0) {
+      // GlobalModular / full image.
+      JXL_ENSURE(image.channel.size() <= full_predictors.size());
+
+      for (size_t c = 0; c < image.channel.size(); ++c) {
+        local_predictors[c] = full_predictors[c];
+      }
+    } else {
+      // Group stream: local channel c corresponds to full-image
+      // channel gi_channel_[stream_id][c - nb_meta_channels].
+      JXL_ENSURE(stream_id < gi_channel_.size());
+
+      for (size_t c = image.nb_meta_channels;
+           c < image.channel.size();
+           ++c) {
+        const size_t local_c =
+            c - image.nb_meta_channels;
+
+        JXL_ENSURE(local_c < gi_channel_[stream_id].size());
+
+        const size_t full_c =
+            gi_channel_[stream_id][local_c];
+
+        JXL_ENSURE(full_c < full_predictors.size());
+
+        local_predictors[c] = full_predictors[full_c];
       }
     }
-    tree_ = PredefinedTree(stream_options_[0].tree_kind, total_pixels,
-                           max_bitdepth, stream_options_[0].max_properties,
-                           &stream_images_[0]);
+
+    // Avoid rebuilding an identical stream tree.
+    if (!have_tree || local_predictors != previous_predictors) {
+      tree_splits.push_back(stream_id);
+
+      size_t pixels = 0;
+      for (const Channel& ch : image.channel) {
+        pixels += ch.w * ch.h;
+      }
+      pixels = std::max<size_t>(pixels, 1);
+
+      trees.push_back(
+          PredefinedTree(
+              ModularOptions::TreeKind::kProgressiveLosslessFixed,
+              pixels,
+              image.bitdepth,
+              stream_options_[stream_id].max_properties,
+              &local_predictors));
+
+      previous_predictors = std::move(local_predictors);
+      have_tree = true;
+    }
+  }
+
+  if (trees.empty()) return true;
+
+  tree_splits.push_back(stream_images_.size());
+
+  tree_.clear();
+  JXL_RETURN_IF_ERROR(
+      MergeTrees(trees, tree_splits, 0, trees.size(), &tree_));
   } else if (cparams_.speed_tier < SpeedTier::kFalcon ||
              !cparams_.modular_mode) {
     // Avoid creating a tree with leaves that don't correspond to any pixels.

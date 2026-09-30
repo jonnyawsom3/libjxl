@@ -930,10 +930,10 @@ Status ModularFrameEncoder::ComputeEncodingData(
           nb_rcts_to_try = 5;
           break;
         case SpeedTier::kSquirrel:
-          nb_rcts_to_try = 7;
+          nb_rcts_to_try = 9;
           break;
         case SpeedTier::kKitten:
-          nb_rcts_to_try = 9;
+          nb_rcts_to_try = 14;
           break;
         default:
           nb_rcts_to_try = 19;

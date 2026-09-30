@@ -656,128 +656,92 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
           Predictor::Gradient, total_pixels, bitdepth);
     }
     case ModularOptions::TreeKind::kProgressiveLosslessFixed: {
-      if (image == nullptr || image->channel.empty()) {
-        return {PropertyDecisionNode::Leaf(Predictor::Gradient)};
-      }
-      size_t nb_channels = image->channel.size();
-      enum class SqueezeChanType {
-        kAvg,
-        kHResidual,
-        kVResidual,
-      };
-      const Transform* squeeze_tr = nullptr;
-      for (const auto& tr : image->transform) {
-        if (tr.id == TransformId::kSqueeze) {
-          squeeze_tr = &tr;
-          break;
-        }
-      }
-      std::vector<SqueezeChanType> chan_types;
-      if (squeeze_tr != nullptr) {
-        size_t num_residuals = 0;
-        for (const auto& param : squeeze_tr->squeezes) {
-          num_residuals += param.num_c;
-        }
-        size_t num_base = (nb_channels >= num_residuals)
-                              ? (nb_channels - num_residuals)
-                              : 0;
-        chan_types.assign(num_base, SqueezeChanType::kAvg);
-        for (const auto& param : squeeze_tr->squeezes) {
-          bool horizontal = param.horizontal;
-          bool in_place = param.in_place;
-          uint32_t beginc = param.begin_c;
-          uint32_t endc = param.begin_c + param.num_c - 1;
-          uint32_t offset = in_place ? (endc + 1) : chan_types.size();
-          SqueezeChanType res_type = horizontal ? SqueezeChanType::kHResidual
-                                                : SqueezeChanType::kVResidual;
-          for (uint32_t c = beginc; c <= endc; c++) {
-            if (offset <= chan_types.size()) {
-              chan_types.insert(chan_types.begin() + offset + (c - beginc),
-                                res_type);
-            } else {
-              chan_types.push_back(res_type);
-            }
-          }
-        }
-      }
-      if (chan_types.size() != nb_channels) {
-        chan_types.resize(nb_channels);
-        bool wide = (image->w >= image->h);
-        for (size_t c = 0; c < nb_channels; ++c) {
-          const Channel& ch = image->channel[c];
-          if (c < 3 && ch.w <= 8 && ch.h <= 8) {
-            chan_types[c] = SqueezeChanType::kAvg;
-          } else if (wide) {
-            chan_types[c] = (ch.hshift > ch.vshift) ? SqueezeChanType::kHResidual
-                                                    : SqueezeChanType::kVResidual;
-          } else {
-            chan_types[c] = (ch.hshift >= ch.vshift) ? SqueezeChanType::kHResidual
-                                                     : SqueezeChanType::kVResidual;
-          }
-        }
-      }
-      int threshold = 64;
-      Predictor h_pred = Predictor::Top;    // North (best for H-residuals)
-      Predictor v_pred = Predictor::Left;   // West (best for V-residuals)
-      Predictor avg_pred = Predictor::Gradient;
+  if (image == nullptr || image->channel.empty()) {
+    return {PropertyDecisionNode::Leaf(Predictor::Gradient)};
+  }
 
-      const char* env_thresh = getenv("JXL_THRESH");
-      if (env_thresh) threshold = atoi(env_thresh);
-      const char* env_h = getenv("JXL_H_PRED");
-      if (env_h) h_pred = static_cast<Predictor>(atoi(env_h));
-      const char* env_v = getenv("JXL_V_PRED");
-      if (env_v) v_pred = static_cast<Predictor>(atoi(env_v));
-      const char* env_avg = getenv("JXL_AVG_PRED");
-      if (env_avg) avg_pred = static_cast<Predictor>(atoi(env_avg));
+  enum class SqueezeChanType {
+    kBase,
+    kHResidual,
+    kVResidual,
+  };
 
-      const char* env_ctx = getenv("JXL_CTX");
-      const char* env_prop = getenv("JXL_PROP");
+  const size_t num_channels = image->channel.size();
 
-      std::vector<int32_t> default_cutoffs = {
-          -500, -255, -127, -63, -31, -15, -7, -3, -1, 0,
-          1,    3,    7,    15,  31,  63,  127, 255, 500};
+  // All channels that survive the squeeze sequence are the final
+  // downsampled/base channels and use Gradient.
+  size_t num_residual_channels = 0;
 
-      std::vector<ChannelSubtree> subtrees(nb_channels);
-      for (size_t c = 0; c < nb_channels; ++c) {
-        const Channel& ch = image->channel[c];
-        ChannelSubtree& st = subtrees[c];
-        st.property = 9;  // local gradient (kGradientProp)
-        if (chan_types[c] == SqueezeChanType::kAvg) {
-          st.pred = avg_pred;
-        } else if (std::max(ch.w, ch.h) < static_cast<size_t>(threshold)) {
-          st.pred = Predictor::Zero;
-        } else if (chan_types[c] == SqueezeChanType::kHResidual) {
-          st.pred = h_pred;
-        } else {
-          st.pred = v_pred;
-        }
-
-        if (env_prop) {
-          st.property = atoi(env_prop);
-        }
-
-        if (env_ctx != nullptr) {
-          if (strcmp(env_ctx, "none") == 0 || strcmp(env_ctx, "-1") == 0) {
-            st.cutoffs.clear();
-          } else if (strcmp(env_ctx, "0") == 0) {
-            st.cutoffs = {0};
-          } else if (strcmp(env_ctx, "1") == 0) {
-            st.cutoffs = {0, 1};
-          } else if (strcmp(env_ctx, "3") == 0) {
-            st.cutoffs = {-3, 0, 3};
-          } else if (strcmp(env_ctx, "7") == 0) {
-            st.cutoffs = {-7, -3, -1, 0, 1, 3, 7};
-          } else if (strcmp(env_ctx, "9") == 0) {
-            st.cutoffs = {-15, -7, -3, -1, 0, 1, 3, 7, 15};
-          } else if (strcmp(env_ctx, "10") == 0) {
-            st.cutoffs = default_cutoffs;
-          }
-        } else {
-          st.cutoffs = default_cutoffs;
-        }
-      }
-      return MakeFixedChannelTree(subtrees);
+  for (const Transform& tr : image->transform) {
+    if (tr.id != TransformId::kSqueeze) continue;
+    for (const SqueezeParams& p : tr.squeezes) {
+      num_residual_channels += p.num_c;
     }
+  }
+
+  JXL_ENSURE(num_residual_channels <= num_channels);
+
+  const size_t num_base_channels =
+      num_channels - num_residual_channels;
+
+  std::vector<SqueezeChanType> chan_types(
+      num_base_channels, SqueezeChanType::kBase);
+
+  // Recreate the exact channel insertion order used by MetaSqueeze().
+  for (const Transform& tr : image->transform) {
+    if (tr.id != TransformId::kSqueeze) continue;
+
+    for (const SqueezeParams& p : tr.squeezes) {
+      const SqueezeChanType type =
+          p.horizontal ? SqueezeChanType::kHResidual
+                       : SqueezeChanType::kVResidual;
+
+      const size_t begin = p.begin_c;
+      const size_t end = begin + p.num_c;
+
+      JXL_ENSURE(begin <= chan_types.size());
+      JXL_ENSURE(end <= image->channel.size());
+
+      const size_t offset =
+          p.in_place ? end : chan_types.size();
+
+      JXL_ENSURE(offset <= chan_types.size());
+
+      chan_types.insert(
+          chan_types.begin() + offset,
+          p.num_c,
+          type);
+    }
+  }
+
+  JXL_ENSURE(chan_types.size() == num_channels);
+
+  std::vector<Predictor> predictors(
+      num_channels, Predictor::Gradient);
+
+  for (size_t c = 0; c < num_channels; ++c) {
+    switch (chan_types[c]) {
+      case SqueezeChanType::kBase:
+        // Squeezed/low-pass/downsampled image.
+        predictors[c] = Predictor::Gradient;
+        break;
+
+      case SqueezeChanType::kHResidual:
+        // Horizontal squeeze residual:
+        // benchmark shows Top/North is the useful predictor.
+        predictors[c] = Predictor::Top;
+        break;
+
+      case SqueezeChanType::kVResidual:
+        // Vertical squeeze residual:
+        // benchmark shows Left/West is the useful predictor.
+        predictors[c] = Predictor::Left;
+        break;
+    }
+  }
+
+  return MakeFixedChannelTree(predictors);
+}
     case ModularOptions::TreeKind::kLearn: {
       JXL_DEBUG_ABORT("internal: kLearn is not predefined tree");
       return {};

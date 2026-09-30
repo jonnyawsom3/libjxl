@@ -477,92 +477,164 @@ Status EncodeModularChannelMAANS(const Image &image, pixel_type chan,
   return true;
 }
 
-struct ChannelSubtree {
-  Predictor pred = Predictor::Zero;
-  int property = 0;
-  std::vector<int32_t> cutoffs;
+namespace {
+
+struct FixedChannelRun {
+  size_t begin;
+  size_t end;
+  Predictor predictor;
 };
 
-Tree MakeFixedChannelTree(const std::vector<ChannelSubtree>& subtrees) {
-  Tree tree;
-  if (subtrees.empty()) {
-    tree.push_back(PropertyDecisionNode::Leaf(Predictor::Gradient));
-    return tree;
+size_t BuildFixedChannelRunTree(
+    const std::vector<FixedChannelRun>& runs,
+    size_t begin, size_t end, Tree* tree) {
+  JXL_DASSERT(begin < end);
+
+  if (end - begin == 1) {
+    const size_t pos = tree->size();
+    tree->push_back(
+        PropertyDecisionNode::Leaf(runs[begin].predictor));
+    return pos;
   }
 
-  enum class NodeKind { kChannelSplit, kPropertySplit };
-  struct QueueNode {
-    NodeKind kind;
-    int begin_c;
-    int end_c;
-    int chan;
-    int begin_cut;
-    int end_cut;
-    size_t pos;
+  const size_t mid = begin + (end - begin) / 2;
+
+  const size_t pos = tree->size();
+  tree->push_back(PropertyDecisionNode());
+
+  // c > split_val selects the upper run range.
+  const int split_val =
+      static_cast<int>(runs[mid].begin) - 1;
+
+  const size_t lchild =
+      BuildFixedChannelRunTree(runs, mid, end, tree);
+  const size_t rchild =
+      BuildFixedChannelRunTree(runs, begin, mid, tree);
+
+  tree[pos] = PropertyDecisionNode::Split(
+      0, split_val, lchild, rchild);
+
+  return pos;
+}
+
+Tree MakeFixedChannelTree(
+    const std::vector<Predictor>& predictors) {
+  if (predictors.empty()) {
+    return {
+        PropertyDecisionNode::Leaf(Predictor::Gradient)};
+  }
+
+  std::vector<FixedChannelRun> runs;
+  runs.reserve(predictors.size());
+
+  for (size_t c = 0; c < predictors.size(); ++c) {
+    if (runs.empty() ||
+        runs.back().predictor != predictors[c]) {
+      runs.push_back(
+          FixedChannelRun{c, c + 1, predictors[c]});
+    } else {
+      runs.back().end = c + 1;
+    }
+  }
+
+  Tree tree;
+  tree.reserve(2 * runs.size() - 1);
+
+  BuildFixedChannelRunTree(
+      runs, 0, runs.size(), &tree);
+
+  return tree;
+}
+
+}  // namespace
+std::vector<Predictor> GetProgressiveLosslessFixedPredictors(
+    const Image& image) {
+  const size_t num_channels = image.channel.size();
+
+  // Initially every channel is part of the base image.
+  // Each squeeze contributes num_c residual channels.
+  size_t num_residual_channels = 0;
+
+  for (const Transform& tr : image.transform) {
+    if (tr.id != TransformId::kSqueeze) continue;
+
+    for (const SqueezeParams& p : tr.squeezes) {
+      num_residual_channels += p.num_c;
+    }
+  }
+
+  JXL_DASSERT(num_residual_channels <= num_channels);
+
+  const size_t num_base_channels =
+      num_channels - num_residual_channels;
+
+  enum class SqueezeChanType {
+    kBase,
+    kHResidual,
+    kVResidual,
   };
 
-  std::queue<QueueNode> q;
-  tree.push_back(PropertyDecisionNode::Leaf(subtrees[0].pred));
-  q.push(QueueNode{NodeKind::kChannelSplit, 0,
-                   static_cast<int>(subtrees.size() - 1), 0, 0, 0, 0});
+  // This includes metachannels too, which is intentional: squeeze
+  // operates on the non-meta channels beginning at begin_c.
+  std::vector<SqueezeChanType> chan_types(
+      num_base_channels, SqueezeChanType::kBase);
 
-  while (!q.empty()) {
-    QueueNode node = q.front();
-    q.pop();
+  // Reconstruct the channel insertion order used by MetaSqueeze.
+  for (const Transform& tr : image.transform) {
+    if (tr.id != TransformId::kSqueeze) continue;
 
-    if (node.kind == NodeKind::kChannelSplit) {
-      if (node.begin_c == node.end_c) {
-        int c = node.begin_c;
-        const auto& st = subtrees[c];
-        if (st.cutoffs.empty()) {
-          tree[node.pos] = PropertyDecisionNode::Leaf(st.pred);
-        } else {
-          QueueNode prop_node{NodeKind::kPropertySplit, 0, 0, c, 0,
-                              static_cast<int>(st.cutoffs.size() - 1),
-                              node.pos};
-          q.push(prop_node);
-        }
-        continue;
-      }
+    for (const SqueezeParams& p : tr.squeezes) {
+      const SqueezeChanType type =
+          p.horizontal
+              ? SqueezeChanType::kHResidual
+              : SqueezeChanType::kVResidual;
 
-      int mid = (node.begin_c + node.end_c) / 2;
-      size_t lchild = tree.size();
-      size_t rchild = tree.size() + 1;
-      tree[node.pos] = PropertyDecisionNode::Split(0, mid, lchild, rchild);
+      const size_t begin = p.begin_c;
+      const size_t end = begin + p.num_c;
 
-      // lchild (c > mid): [mid + 1, end_c]
-      tree.push_back(PropertyDecisionNode::Leaf(subtrees[mid + 1].pred));
-      q.push(QueueNode{NodeKind::kChannelSplit, mid + 1, node.end_c, 0, 0, 0,
-                       lchild});
+      JXL_DASSERT(begin <= chan_types.size());
+      JXL_DASSERT(end <= image.channel.size());
 
-      // rchild (c <= mid): [begin_c, mid]
-      tree.push_back(PropertyDecisionNode::Leaf(subtrees[node.begin_c].pred));
-      q.push(QueueNode{NodeKind::kChannelSplit, node.begin_c, mid, 0, 0, 0,
-                       rchild});
-    } else {
-      int c = node.chan;
-      const auto& st = subtrees[c];
-      int mid_cut = (node.begin_cut + node.end_cut) / 2;
-      int32_t cutoff_val = st.cutoffs[mid_cut];
-      size_t lchild = tree.size();
-      size_t rchild = tree.size() + 1;
-      tree[node.pos] =
-          PropertyDecisionNode::Split(st.property, cutoff_val, lchild, rchild);
+      const size_t offset =
+          p.in_place ? end : chan_types.size();
 
-      // lchild (prop > cutoff_val): [mid_cut + 1, end_cut]
-      tree.push_back(PropertyDecisionNode::Leaf(st.pred));
-      if (mid_cut + 1 <= node.end_cut) {
-        q.push(QueueNode{NodeKind::kPropertySplit, 0, 0, c, mid_cut + 1,
-                         node.end_cut, lchild});
-      }
+      JXL_DASSERT(offset <= chan_types.size());
 
-      // rchild (prop <= cutoff_val): [begin_cut, mid_cut - 1]
-      tree.push_back(PropertyDecisionNode::Leaf(st.pred));
-      if (node.begin_cut <= mid_cut - 1) {
-        q.push(QueueNode{NodeKind::kPropertySplit, 0, 0, c, node.begin_cut,
-                         mid_cut - 1, rchild});
-      }
+      chan_types.insert(
+          chan_types.begin() + offset,
+          p.num_c,
+          type);
     }
+  }
+
+  JXL_DASSERT(chan_types.size() == num_channels);
+
+  std::vector<Predictor> predictors(
+      num_channels, Predictor::Gradient);
+
+  for (size_t c = 0; c < num_channels; ++c) {
+    switch (chan_types[c]) {
+      case SqueezeChanType::kBase:
+        // Original / downsampled low-pass channel.
+        predictors[c] = Predictor::Gradient;
+        break;
+
+      case SqueezeChanType::kHResidual:
+        // FwdHSqueeze removes horizontal tendency, so the useful
+        // remaining correlation is vertical.
+        predictors[c] = Predictor::Top;
+        break;
+
+      case SqueezeChanType::kVResidual:
+        // FwdVSqueeze removes vertical tendency, so the useful
+        // remaining correlation is horizontal.
+        predictors[c] = Predictor::Left;
+        break;
+    }
+  }
+
+  return predictors;
+}
   }
   return tree;
 }

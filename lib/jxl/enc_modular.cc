@@ -939,19 +939,48 @@ Status ModularFrameEncoder::ComputeEncodingData(
           nb_rcts_to_try = 19;
           break;
       }
+      const size_t genuine_w = gi.channel[gi.nb_meta_channels].w;
+      const size_t genuine_h = gi.channel[gi.nb_meta_channels].h;
+      const size_t tile_w = std::min<size_t>(256, genuine_w);
+      const size_t tile_h = std::min<size_t>(256, genuine_h);
+      const size_t grid_x =
+          std::min<size_t>(6, (genuine_w + tile_w - 1) / tile_w);
+      const size_t grid_y =
+          std::min<size_t>(4, (genuine_h + tile_h - 1) / tile_h);
+      const size_t sample_w = grid_x * tile_w;
+      const size_t sample_h = grid_y * tile_h;
+
+      JXL_ASSIGN_OR_RETURN(
+          Image sample_orig,
+          Image::Create(memory_manager, sample_w, sample_h, gi.bitdepth, 3));
+      JXL_ASSIGN_OR_RETURN(
+          Image sample_gi,
+          Image::Create(memory_manager, sample_w, sample_h, gi.bitdepth, 3));
+
+      for (size_t gy = 0; gy < grid_y; ++gy) {
+        size_t src_y =
+            (grid_y == 1)
+                ? 0
+                : ((gy + 1) * (genuine_h - tile_h)) / (grid_y + 1);
+        for (size_t gx = 0; gx < grid_x; ++gx) {
+          size_t src_x =
+              (grid_x == 1)
+                  ? 0
+                  : ((gx + 1) * (genuine_w - tile_w)) / (grid_x + 1);
+          for (size_t c = 0; c < 3; ++c) {
+            const Channel& src_ch = gi.channel[gi.nb_meta_channels + c];
+            Channel& dst_ch = sample_orig.channel[c];
+            for (size_t y = 0; y < tile_h; ++y) {
+              memcpy(dst_ch.Row(gy * tile_h + y) + gx * tile_w,
+                     src_ch.Row(src_y + y) + src_x,
+                     tile_w * sizeof(pixel_type));
+            }
+          }
+        }
+      }
+
       float best_cost = std::numeric_limits<float>::max();
       size_t best_rct = 6;
-      std::vector<Channel> orig;
-      orig.reserve(3);
-      for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
-        Channel& genuine = gi.channel[gi.nb_meta_channels + rgb_c];
-        JXL_ASSIGN_OR_RETURN(
-            Channel ch,
-            Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
-                            genuine.hshift, genuine.vshift));
-        orig.emplace_back(std::move(ch));
-        genuine.plane.Swap(orig[rgb_c].plane);
-      }
       for (int rct_type : {0 * 7 + 0, 0 * 7 + 6, 0 * 7 + 5, 1 * 7 + 3, 3 * 7 + 5,
                            5 * 7 + 5, 1 * 7 + 5, 2 * 7 + 5, 1 * 7 + 1, 0 * 7 + 4,
                            1 * 7 + 2, 2 * 7 + 1, 2 * 7 + 2, 2 * 7 + 3, 4 * 7 + 4,
@@ -959,29 +988,22 @@ Status ModularFrameEncoder::ComputeEncodingData(
         if (nb_rcts_to_try == 0) break;
         nb_rcts_to_try--;
         if (rct_type == 0) {
-          for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
-            gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
-          }
-          JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
+          JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(sample_orig));
           best_rct = 0;
-          for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
-            gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
-          }
         } else {
-          std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
-          std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
-                                         &gi.channel[gi.nb_meta_channels + 1],
-                                         &gi.channel[gi.nb_meta_channels + 2]};
-          JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, pool));
-          JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+          std::array<const Channel*, 3> in = {&sample_orig.channel[0],
+                                              &sample_orig.channel[1],
+                                              &sample_orig.channel[2]};
+          std::array<Channel*, 3> out = {&sample_gi.channel[0],
+                                         &sample_gi.channel[1],
+                                         &sample_gi.channel[2]};
+          JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, /*pool=*/nullptr));
+          JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(sample_gi));
           if (cost < best_cost) {
             best_rct = rct_type;
             best_cost = cost;
           }
         }
-      }
-      for (size_t rgb_c = 0; rgb_c < 3; ++rgb_c) {
-        gi.channel[gi.nb_meta_channels + rgb_c].plane.Swap(orig[rgb_c].plane);
       }
       if (best_rct != 0) {
         Transform sg(TransformId::kRCT);

@@ -1466,55 +1466,105 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
       case SpeedTier::kTectonicPlate:
       case SpeedTier::kGlacier:
       case SpeedTier::kTortoise:
-        nb_rcts_to_try = 42;
+        nb_rcts_to_try = 78;
         break;
     }
-    float best_cost = std::numeric_limits<float>::max();
-    size_t best_rct = 0;
-    bool need_to_restore = (nb_rcts_to_try > 1);
-    std::vector<Channel> orig;
-    orig.reserve(3);
-    // Try all permutations
-    for (int rct_type = 0; rct_type < 42; ++rct_type) {
-      if (nb_rcts_to_try == 0) break;
+  float best_cost = std::numeric_limits<float>::max();
+  size_t best_rct1 = 0;
+  size_t best_rct2 = 0;
+  bool need_to_restore = (nb_rcts_to_try > 1);
+  std::vector<Channel> orig;
+  orig.reserve(3);
+  std::vector<Channel> tmp;
+  tmp.reserve(3);
+
+  for (size_t c = 0; c < 3; ++c) {
+    Channel& genuine = gi.channel[gi.nb_meta_channels + c];
+    JXL_ASSIGN_OR_RETURN(
+        Channel ch,
+        Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
+                        genuine.hshift, genuine.vshift));
+    orig.emplace_back(std::move(ch));
+    genuine.plane.Swap(orig[c].plane);
+
+    JXL_ASSIGN_OR_RETURN(
+        Channel ch2,
+        Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
+                        genuine.hshift, genuine.vshift));
+    tmp.emplace_back(std::move(ch2));
+  }
+
+  // no-op rct_type; use as baseline cost
+  JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
+
+  std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
+  std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
+                                 &gi.channel[gi.nb_meta_channels + 1],
+                                 &gi.channel[gi.nb_meta_channels + 2]};
+  std::array<Channel*, 3> tmp_out = {&tmp[0], &tmp[1], &tmp[2]};
+
+  // Try all 41 non-zero single RCTs.
+  for (int rct_type = 1; rct_type < 42 && nb_rcts_to_try > 0; ++rct_type) {
+    nb_rcts_to_try--;
+    JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, /* pool */ nullptr));
+    JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+    if (cost < best_cost) {
+      best_rct1 = rct_type;
+      best_rct2 = 0;
+      best_cost = cost;
+    }
+  }
+
+  // Try permutation RCT followed by an actual RCT.
+  // 6 permutation-only RCTs (type 0) * 6 actual RCT types (1..6) = 36.
+  for (int permutation_rct = 0;
+       permutation_rct < 42 && nb_rcts_to_try > 0;
+       permutation_rct += 7) {
+    JXL_RETURN_IF_ERROR(
+        FwdRct(in, tmp_out, permutation_rct, /* pool */ nullptr));
+
+    std::array<const Channel*, 3> tmp_in = {
+        &tmp[0], &tmp[1], &tmp[2]};
+
+    for (int type = 1; type < 7 && nb_rcts_to_try > 0; ++type) {
       nb_rcts_to_try--;
-      // no-op rct_type; use as baseline cost
-      if (rct_type == 0) {
-        JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
-        for (size_t c = 0; c < 3; ++c) {
-          Channel& genuine = gi.channel[gi.nb_meta_channels + c];
-          JXL_ASSIGN_OR_RETURN(
-              Channel ch,
-              Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
-                              genuine.hshift, genuine.vshift));
-          orig.emplace_back(std::move(ch));
-          genuine.plane.Swap(orig[c].plane);
-        }
-      } else {
-        std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
-        std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
-                                       &gi.channel[gi.nb_meta_channels + 1],
-                                       &gi.channel[gi.nb_meta_channels + 2]};
-        JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, /* pool */ nullptr));
-        JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
-        if (cost < best_cost) {
-          best_rct = rct_type;
-          best_cost = cost;
-        }
+
+      JXL_RETURN_IF_ERROR(
+          FwdRct(tmp_in, out, type, /* pool */ nullptr));
+      JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+
+      if (cost < best_cost) {
+        best_rct1 = permutation_rct;
+        best_rct2 = type;
+        best_cost = cost;
       }
     }
-    if (need_to_restore) {
-      for (size_t c = 0; c < 3; ++c) {
-        gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
-      }
+  }
+
+  if (need_to_restore) {
+    for (size_t c = 0; c < 3; ++c) {
+      gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
     }
-    // Apply the best RCT to the image for future encoding.
-    if (best_rct != 0) {
-      Transform sg(TransformId::kRCT);
-      sg.begin_c = gi.nb_meta_channels;
-      sg.rct_type = best_rct;
-      do_transform(gi, sg, weighted::Header());
-    }
+  }
+
+  // Apply the best RCT to the image for future encoding.
+  if (best_rct2 != 0) {
+    Transform sg(TransformId::kRCT);
+    sg.begin_c = gi.nb_meta_channels;
+    sg.rct_type = best_rct1;
+    do_transform(gi, sg, weighted::Header());
+
+    Transform sg2(TransformId::kRCT);
+    sg2.begin_c = gi.nb_meta_channels;
+    sg2.rct_type = best_rct2;
+    do_transform(gi, sg2, weighted::Header());
+  } else if (best_rct1 != 0) {
+    Transform sg(TransformId::kRCT);
+    sg.begin_c = gi.nb_meta_channels;
+    sg.rct_type = best_rct1;
+    do_transform(gi, sg, weighted::Header());
+  }
+}
   } else {
     // No need to try anything, just use the default options.
   }

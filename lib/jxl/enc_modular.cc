@@ -1438,7 +1438,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
 
   // lossless and no specific color transform specified: try Nothing, YCoCg,
   // and 17 RCTs
-    if (cparams.color_transform == ColorTransform::kNone &&
+  if (cparams.color_transform == ColorTransform::kNone &&
       cparams.IsLossless() && cparams.colorspace < 0 &&
       gi.channel.size() - gi.nb_meta_channels >= 3 &&
       cparams.responsive == JXL_FALSE && do_color &&
@@ -1466,151 +1466,53 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
       case SpeedTier::kTectonicPlate:
       case SpeedTier::kGlacier:
       case SpeedTier::kTortoise:
-        nb_rcts_to_try = 19;
+        nb_rcts_to_try = 42;
         break;
     }
-
     float best_cost = std::numeric_limits<float>::max();
-    int best_rct1 = 0;
-    int best_rct2 = 0;
-
-    // These should be 19 actually different transforms; the remaining ones
-    // are equivalent to one of these (note that the first two are do-nothing
-    // and YCoCg) modulo channel reordering (which only matters in the case of
-    // MA-with-prev-channels-properties) and/or sign (e.g. RmG vs GmR).
-    constexpr std::array<int, 19> rct_types = {
-        0 * 7 + 0, 0 * 7 + 6, 0 * 7 + 5, 1 * 7 + 3, 3 * 7 + 5,
-        5 * 7 + 5, 1 * 7 + 5, 2 * 7 + 5, 1 * 7 + 1, 0 * 7 + 4,
-        1 * 7 + 2, 2 * 7 + 1, 2 * 7 + 2, 2 * 7 + 3, 4 * 7 + 4,
-        4 * 7 + 5, 0 * 7 + 2, 0 * 7 + 1, 0 * 7 + 3};
-
-    // Keep the original input around, plus one temporary buffer for the
-    // intermediate result of the first RCT.
-    std::array<Channel, 3> orig;
-    std::array<Channel, 3> temp;
-
-    for (size_t c = 0; c < 3; ++c) {
-      Channel& genuine = gi.channel[gi.nb_meta_channels + c];
-
-      JXL_ASSIGN_OR_RETURN(
-          orig[c],
-          Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
-                          genuine.hshift, genuine.vshift));
-      JXL_ASSIGN_OR_RETURN(
-          temp[c],
-          Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
-                          genuine.hshift, genuine.vshift));
-
-      genuine.plane.Swap(orig[c].plane);
-    }
-
-    // Evaluate every ordered pair. The first RCT writes to gi, then the
-    // second RCT consumes gi and writes to temp.
-    for (size_t i = 0; i < nb_rcts_to_try; ++i) {
-      const int rct1 = rct_types[i];
-
-      // Restore the working image to the original input before starting
-      // each candidate chain.
-      for (size_t c = 0; c < 3; ++c) {
-        gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
-      }
-
-      if (rct1 != 0) {
-        std::array<const Channel*, 3> in = {
-            &orig[0], &orig[1], &orig[2]};
-        std::array<Channel*, 3> out = {
-            &gi.channel[gi.nb_meta_channels + 0],
-            &gi.channel[gi.nb_meta_channels + 1],
-            &gi.channel[gi.nb_meta_channels + 2]};
-
-        JXL_RETURN_IF_ERROR(
-            FwdRct(in, out, rct1, /* pool */ nullptr));
-      }
-
-      for (size_t j = 0; j < nb_rcts_to_try; ++j) {
-        const int rct2 = rct_types[j];
-
-        // The first stage result is either still in orig (rct1 == 0) or in
-        // gi. The second stage writes to temp.
-        if (rct2 != 0) {
-          if (rct1 == 0) {
-            std::array<const Channel*, 3> in = {
-                &orig[0], &orig[1], &orig[2]};
-            std::array<Channel*, 3> out = {
-                &temp[0], &temp[1], &temp[2]};
-            JXL_RETURN_IF_ERROR(
-                FwdRct(in, out, rct2, /* pool */ nullptr));
-          } else {
-            std::array<const Channel*, 3> in = {
-                &gi.channel[gi.nb_meta_channels + 0],
-                &gi.channel[gi.nb_meta_channels + 1],
-                &gi.channel[gi.nb_meta_channels + 2]};
-            std::array<Channel*, 3> out = {
-                &temp[0], &temp[1], &temp[2]};
-            JXL_RETURN_IF_ERROR(
-                FwdRct(in, out, rct2, /* pool */ nullptr));
-          }
-
-          // Temporarily put the final result into gi so EstimateCost sees it.
-          for (size_t c = 0; c < 3; ++c) {
-            gi.channel[gi.nb_meta_channels + c].plane.Swap(temp[c].plane);
-          }
-
-          JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
-
-          for (size_t c = 0; c < 3; ++c) {
-            gi.channel[gi.nb_meta_channels + c].plane.Swap(temp[c].plane);
-          }
-
-          if (cost < best_cost) {
-            best_cost = cost;
-            best_rct1 = rct1;
-            best_rct2 = rct2;
-          }
-        } else {
-          // No second transform: the first-stage result is already in
-          // gi when rct1 != 0. For (0, 0), the result is in orig.
-          float cost;
-          if (rct1 == 0) {
-            for (size_t c = 0; c < 3; ++c) {
-              gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
-            }
-
-            JXL_ASSIGN_OR_RETURN(cost, EstimateCost(gi));
-
-            for (size_t c = 0; c < 3; ++c) {
-              gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
-            }
-          } else {
-            JXL_ASSIGN_OR_RETURN(cost, EstimateCost(gi));
-          }
-
-          if (cost < best_cost) {
-            best_cost = cost;
-            best_rct1 = rct1;
-            best_rct2 = rct2;
-          }
+    size_t best_rct = 0;
+    bool need_to_restore = (nb_rcts_to_try > 1);
+    std::vector<Channel> orig;
+    orig.reserve(3);
+    // Try all permutations
+    for (int rct_type = 0; rct_type < 42; ++rct_type) {
+      if (nb_rcts_to_try == 0) break;
+      nb_rcts_to_try--;
+      // no-op rct_type; use as baseline cost
+      if (rct_type == 0) {
+        JXL_ASSIGN_OR_RETURN(best_cost, EstimateCost(gi));
+        for (size_t c = 0; c < 3; ++c) {
+          Channel& genuine = gi.channel[gi.nb_meta_channels + c];
+          JXL_ASSIGN_OR_RETURN(
+              Channel ch,
+              Channel::Create(genuine.memory_manager(), genuine.w, genuine.h,
+                              genuine.hshift, genuine.vshift));
+          orig.emplace_back(std::move(ch));
+          genuine.plane.Swap(orig[c].plane);
+        }
+      } else {
+        std::array<const Channel*, 3> in = {&orig[0], &orig[1], &orig[2]};
+        std::array<Channel*, 3> out = {&gi.channel[gi.nb_meta_channels + 0],
+                                       &gi.channel[gi.nb_meta_channels + 1],
+                                       &gi.channel[gi.nb_meta_channels + 2]};
+        JXL_RETURN_IF_ERROR(FwdRct(in, out, rct_type, /* pool */ nullptr));
+        JXL_ASSIGN_OR_RETURN(float cost, EstimateCost(gi));
+        if (cost < best_cost) {
+          best_rct = rct_type;
+          best_cost = cost;
         }
       }
     }
-
-    // Restore the original image before installing the selected chain.
-    for (size_t c = 0; c < 3; ++c) {
-      gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+    if (need_to_restore) {
+      for (size_t c = 0; c < 3; ++c) {
+        gi.channel[gi.nb_meta_channels + c].plane.Swap(orig[c].plane);
+      }
     }
-
-    // Apply the selected RCT chain for future encoding.
-    if (best_rct1 != 0) {
+    // Apply the best RCT to the image for future encoding.
+    if (best_rct != 0) {
       Transform sg(TransformId::kRCT);
       sg.begin_c = gi.nb_meta_channels;
-      sg.rct_type = best_rct1;
-      do_transform(gi, sg, weighted::Header());
-    }
-
-    if (best_rct2 != 0) {
-      Transform sg(TransformId::kRCT);
-      sg.begin_c = gi.nb_meta_channels;
-      sg.rct_type = best_rct2;
+      sg.rct_type = best_rct;
       do_transform(gi, sg, weighted::Header());
     }
   } else {

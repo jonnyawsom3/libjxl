@@ -1956,7 +1956,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
           static_cast<jxl::Override>(value);
       break;
     case JXL_ENC_FRAME_SETTING_GROUP_ORDER:
-      frame_settings->values.cparams.centerfirst = (value == 1);
+      frame_settings->values.cparams.centerfirst = (value != 0);
       break;
     case JXL_ENC_FRAME_SETTING_GROUP_ORDER_CENTER_X:
       if (value < -1) {

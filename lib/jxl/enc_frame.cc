@@ -1798,7 +1798,7 @@ Status PermuteGroups(const CompressParams& cparams,
 
   // permutation maps canonical group index -> codestream group index.
   for (size_t i = 0; i < dc_group_order.size(); ++i) {
-    permutation[1 + dc_group_order[i]] = 1 + i;
+    (*permutation)[1 + dc_group_order[i]] = 1 + i;
   }
 
   // Center-first ordering for AC groups.
@@ -2190,8 +2190,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   std::vector<size_t> dc_group_order;
   size_t group_size = frame_header.ToFrameDimensions().group_dim;
   JXL_RETURN_IF_ERROR(ComputePermutationForStreaming(
-      frame_data.xsize, frame_data.ysize, group_size, num_passes, permutation,
-      dc_group_order));
+    cparams, frame_data.xsize, frame_data.ysize, group_size, num_passes,
+    permutation, dc_group_order));
   enc_state->shared.num_histograms = dc_group_order.size();
   size_t dc_group_size = group_size * kBlockDim;
   size_t dc_group_xsize = DivCeil(frame_data.xsize, dc_group_size);

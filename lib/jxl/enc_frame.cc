@@ -1733,11 +1733,11 @@ Status PermuteGroups(const CompressParams& cparams,
   if (!cparams.centerfirst || (num_passes == 1 && num_groups == 1)) {
     return true;
   }
-  // Don't permute global DC/AC or DC.
+
+  // Don't permute global DC/AC.
   permutation->resize(frame_dim.num_dc_groups + 2);
   std::iota(permutation->begin(), permutation->end(), 0);
-  std::vector<coeff_order_t> ac_group_order(num_groups);
-  std::iota(ac_group_order.begin(), ac_group_order.end(), 0);
+
   const size_t group_dim = frame_dim.group_dim;
 
   // The center of the image is either given by parameters or chosen
@@ -1747,7 +1747,7 @@ Status PermuteGroups(const CompressParams& cparams,
   // Calculate the coordinate scaling for LF frames.
   // libjxl only implements 2 LF frames, so won't overflow.
   const size_t dc_scale = size_t{1} << (3 * dc_level);
-  
+
   int64_t imag_cx;
   if (cparams.center_x != static_cast<size_t>(-1)) {
     imag_cx = cparams.center_x / dc_scale;
@@ -1764,43 +1764,90 @@ Status PermuteGroups(const CompressParams& cparams,
     imag_cy = frame_dim.ysize / 2;
   }
 
+  // Center-first ordering for DC groups.
+  const size_t dc_group_dim = group_dim * kBlockDim;
+  std::vector<coeff_order_t> dc_group_order(frame_dim.num_dc_groups);
+  std::iota(dc_group_order.begin(), dc_group_order.end(), 0);
+
+  const int64_t dc_cx =
+      (imag_cx / dc_group_dim) * dc_group_dim + dc_group_dim / 2;
+  const int64_t dc_cy =
+      (imag_cy / dc_group_dim) * dc_group_dim + dc_group_dim / 2;
+
+  const double dc_direction =
+      -std::atan2(imag_cy - dc_cy, imag_cx - dc_cx);
+  const int64_t dc_side =
+      std::fmod((dc_direction + 5 * kPi / 4), 2 * kPi) * 2 / kPi;
+
+  auto get_distance_from_dc_center = [&](size_t gid) {
+    Rect r = frame_dim.DCGroupRect(gid);
+    const int64_t gcx = r.x0() + dc_group_dim / 2;
+    const int64_t gcy = r.y0() + dc_group_dim / 2;
+    const int64_t dx = gcx - dc_cx;
+    const int64_t dy = gcy - dc_cy;
+    const double angle = std::remainder(
+        std::atan2(dy, dx) + kPi / 4 + dc_side * (kPi / 2), 2 * kPi);
+    return std::make_pair(std::max(std::abs(dx), std::abs(dy)), angle);
+  };
+
+  std::sort(dc_group_order.begin(), dc_group_order.end(),
+            [&](coeff_order_t a, coeff_order_t b) {
+              return get_distance_from_dc_center(a) <
+                     get_distance_from_dc_center(b);
+            });
+
+  // permutation maps canonical group index -> codestream group index.
+  for (size_t i = 0; i < dc_group_order.size(); ++i) {
+    permutation[1 + dc_group_order[i]] = 1 + i;
+  }
+
+  // Center-first ordering for AC groups.
+  std::vector<coeff_order_t> ac_group_order(num_groups);
+  std::iota(ac_group_order.begin(), ac_group_order.end(), 0);
+
   // The center of the group containing the center of the image.
-  int64_t cx = (imag_cx / group_dim) * group_dim + group_dim / 2;
-  int64_t cy = (imag_cy / group_dim) * group_dim + group_dim / 2;
+  const int64_t cx = (imag_cx / group_dim) * group_dim + group_dim / 2;
+  const int64_t cy = (imag_cy / group_dim) * group_dim + group_dim / 2;
+
   // This identifies in what area of the central group the center of the image
   // lies in.
-  double direction = -std::atan2(imag_cy - cy, imag_cx - cx);
+  const double direction = -std::atan2(imag_cy - cy, imag_cx - cx);
+
   // This identifies the side of the central group the center of the image
   // lies closest to. This can take values 0, 1, 2, 3 corresponding to left,
   // bottom, right, top.
-  int64_t side = std::fmod((direction + 5 * kPi / 4), 2 * kPi) * 2 / kPi;
+  const int64_t side =
+      std::fmod((direction + 5 * kPi / 4), 2 * kPi) * 2 / kPi;
+
   auto get_distance_from_center = [&](size_t gid) {
     Rect r = frame_dim.GroupRect(gid);
-    int64_t gcx = r.x0() + group_dim / 2;
-    int64_t gcy = r.y0() + group_dim / 2;
-    int64_t dx = gcx - cx;
-    int64_t dy = gcy - cy;
-    // The angle is determined by taking atan2 and adding an appropriate
-    // starting point depending on the side we want to start on.
-    double angle = std::remainder(
+    const int64_t gcx = r.x0() + group_dim / 2;
+    const int64_t gcy = r.y0() + group_dim / 2;
+    const int64_t dx = gcx - cx;
+    const int64_t dy = gcy - cy;
+    const double angle = std::remainder(
         std::atan2(dy, dx) + kPi / 4 + side * (kPi / 2), 2 * kPi);
-    // Concentric squares in clockwise order.
     return std::make_pair(std::max(std::abs(dx), std::abs(dy)), angle);
   };
+
   std::sort(ac_group_order.begin(), ac_group_order.end(),
             [&](coeff_order_t a, coeff_order_t b) {
-              return get_distance_from_center(a) < get_distance_from_center(b);
+              return get_distance_from_center(a) <
+                     get_distance_from_center(b);
             });
+
   std::vector<coeff_order_t> inv_ac_group_order(ac_group_order.size(), 0);
   for (size_t i = 0; i < ac_group_order.size(); i++) {
     inv_ac_group_order[ac_group_order[i]] = i;
   }
+
   for (size_t i = 0; i < num_passes; i++) {
-    size_t pass_start = permutation->size();
+    const size_t pass_start = permutation->size();
     for (coeff_order_t v : inv_ac_group_order) {
       permutation->push_back(pass_start + v);
     }
   }
+
   if (group_codes == nullptr) return true;
   std::vector<std::unique_ptr<BitWriter>> new_group_codes(group_codes->size());
   for (size_t i = 0; i < permutation->size(); i++) {
@@ -1878,10 +1925,11 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
   return true;
 }
 
-Status ComputePermutationForStreaming(size_t xsize, size_t ysize,
-                                      size_t group_size, size_t num_passes,
-                                      std::vector<coeff_order_t>& permutation,
-                                      std::vector<size_t>& dc_group_order) {
+Status ComputePermutationForStreaming(
+    const CompressParams& cparams, size_t xsize, size_t ysize,
+    size_t group_size, size_t num_passes,
+    std::vector<coeff_order_t>& permutation,
+    std::vector<size_t>& dc_group_order) {
   // This is only valid in VarDCT mode, otherwise there can be group shift.
   const size_t dc_group_size = group_size * kBlockDim;
   const size_t group_xsize = DivCeil(xsize, group_size);
@@ -1891,33 +1939,92 @@ Status ComputePermutationForStreaming(size_t xsize, size_t ysize,
   const size_t num_groups = group_xsize * group_ysize;
   const size_t num_dc_groups = dc_group_xsize * dc_group_ysize;
   const size_t num_sections = 2 + num_dc_groups + num_passes * num_groups;
+
   permutation.resize(num_sections);
   size_t new_ix = 0;
-  // DC Global is first
+
+  // DC Global is first.
   permutation[0] = new_ix++;
-  // TODO(szabadka) Change the dc group order to center-first.
-  for (size_t dc_y = 0; dc_y < dc_group_ysize; ++dc_y) {
-    for (size_t dc_x = 0; dc_x < dc_group_xsize; ++dc_x) {
-      size_t dc_ix = dc_y * dc_group_xsize + dc_x;
-      dc_group_order.push_back(dc_ix);
-      permutation[1 + dc_ix] = new_ix++;
-      size_t ac_y0 = dc_y * kBlockDim;
-      size_t ac_x0 = dc_x * kBlockDim;
-      size_t ac_y1 = std::min<size_t>(group_ysize, ac_y0 + kBlockDim);
-      size_t ac_x1 = std::min<size_t>(group_xsize, ac_x0 + kBlockDim);
-      for (size_t pass = 0; pass < num_passes; ++pass) {
-        for (size_t ac_y = ac_y0; ac_y < ac_y1; ++ac_y) {
-          for (size_t ac_x = ac_x0; ac_x < ac_x1; ++ac_x) {
-            size_t group_ix = ac_y * group_xsize + ac_x;
-            size_t old_ix =
-                AcGroupIndex(pass, group_ix, num_groups, num_dc_groups);
-            permutation[old_ix] = new_ix++;
-          }
+
+  // The DC groups are encoded center-first when requested. Otherwise preserve
+  // the existing row-major order.
+  dc_group_order.resize(num_dc_groups);
+  std::iota(dc_group_order.begin(), dc_group_order.end(), 0);
+
+  if (cparams.centerfirst && num_dc_groups > 1) {
+    const int64_t imag_cx =
+        cparams.center_x != static_cast<size_t>(-1)
+            ? static_cast<int64_t>(cparams.center_x)
+            : static_cast<int64_t>(xsize / 2);
+    const int64_t imag_cy =
+        cparams.center_y != static_cast<size_t>(-1)
+            ? static_cast<int64_t>(cparams.center_y)
+            : static_cast<int64_t>(ysize / 2);
+
+    JXL_RETURN_IF_ERROR(imag_cx < static_cast<int64_t>(xsize));
+    JXL_RETURN_IF_ERROR(imag_cy < static_cast<int64_t>(ysize));
+
+    const int64_t dc_cx =
+        (imag_cx / dc_group_size) * dc_group_size + dc_group_size / 2;
+    const int64_t dc_cy =
+        (imag_cy / dc_group_size) * dc_group_size + dc_group_size / 2;
+
+    const double direction =
+        -std::atan2(imag_cy - dc_cy, imag_cx - dc_cx);
+    const int64_t side =
+        std::fmod((direction + 5 * kPi / 4), 2 * kPi) * 2 / kPi;
+
+    auto get_distance_from_center = [&](size_t gid) {
+      const size_t dc_y = gid / dc_group_xsize;
+      const size_t dc_x = gid % dc_group_xsize;
+      const int64_t gcx =
+          dc_x * dc_group_size + dc_group_size / 2;
+      const int64_t gcy =
+          dc_y * dc_group_size + dc_group_size / 2;
+      const int64_t dx = gcx - dc_cx;
+      const int64_t dy = gcy - dc_cy;
+      const double angle = std::remainder(
+          std::atan2(dy, dx) + kPi / 4 + side * (kPi / 2), 2 * kPi);
+      return std::make_pair(std::max(std::abs(dx), std::abs(dy)), angle);
+    };
+
+    std::sort(dc_group_order.begin(), dc_group_order.end(),
+              [&](size_t a, size_t b) {
+                return get_distance_from_center(a) <
+                       get_distance_from_center(b);
+              });
+  }
+
+  for (size_t i = 0; i < num_dc_groups; ++i) {
+    const size_t dc_ix = dc_group_order[i];
+
+    // DC sections are stored in canonical order in permutation, but are
+    // assigned codestream positions according to dc_group_order.
+    permutation[1 + dc_ix] = new_ix++;
+
+    const size_t dc_y = dc_ix / dc_group_xsize;
+    const size_t dc_x = dc_ix % dc_group_xsize;
+
+    const size_t ac_y0 = dc_y * kBlockDim;
+    const size_t ac_x0 = dc_x * kBlockDim;
+    const size_t ac_y1 =
+        std::min<size_t>(group_ysize, ac_y0 + kBlockDim);
+    const size_t ac_x1 =
+        std::min<size_t>(group_xsize, ac_x0 + kBlockDim);
+
+    for (size_t pass = 0; pass < num_passes; ++pass) {
+      for (size_t ac_y = ac_y0; ac_y < ac_y1; ++ac_y) {
+        for (size_t ac_x = ac_x0; ac_x < ac_x1; ++ac_x) {
+          const size_t group_ix = ac_y * group_xsize + ac_x;
+          const size_t old_ix =
+              AcGroupIndex(pass, group_ix, num_groups, num_dc_groups);
+          permutation[old_ix] = new_ix++;
         }
       }
     }
   }
-  // AC Global is last
+
+  // AC Global is last.
   permutation[1 + num_dc_groups] = new_ix++;
   JXL_ENSURE(new_ix == num_sections);
   return true;

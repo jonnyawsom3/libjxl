@@ -110,7 +110,6 @@ static int QuantizeColorToImplicitPaletteIndex(
 
 }  // namespace palette_internal
 
-
 // Reorder a palette using Oxipng's ezeng color co-occurrence algorithm.
 // This is based on `ezeng_reindex`, `pairwise_swap_search`, and
 // `apply_most_popular_color` in Oxipng's palette optimizer.
@@ -195,10 +194,10 @@ static void OxipngEzengReorder(
     }
   }
 
-  std::sort(edges.begin(), edges.end(),
-            [](const Edge &a, const Edge &b) {
-              return a.weight > b.weight;
-            });
+  std::stable_sort(edges.begin(), edges.end(),
+                   [](const Edge &a, const Edge &b) {
+                     return a.weight > b.weight;
+                   });
 
   // With no non-zero edges there is no useful ezeng starting pair.
   if (edges.empty()) {
@@ -360,12 +359,13 @@ static void OxipngEzengReorder(
 
     if (first_idx >= remapping.size() / 2) {
       std::reverse(remapping.begin(), remapping.end());
+      // Rust: rotate_right(first_idx + 1).
       std::rotate(remapping.begin(),
-                  remapping.begin() + first_idx + 1,
+                  remapping.end() - static_cast<ptrdiff_t>(first_idx + 1),
                   remapping.end());
     } else {
       std::rotate(remapping.begin(),
-                  remapping.begin() + first_idx,
+                  remapping.begin() + static_cast<ptrdiff_t>(first_idx),
                   remapping.end());
     }
   }
@@ -605,16 +605,23 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     }
   }
 
+  // The implicit palette uses integer shifts/scaling internally and cannot
+  // represent 32-bit samples with the int32_t modular pixel type. At exactly
+  // 32 bpc, use the explicit palette only; this still allows lossless channel,
+  // global, and local palettes and keeps the palette mapping exact.
+  const bool use_implicit_palette = input.bitdepth < 32;
   std::map<std::vector<pixel_type>, bool> implicit_color;
   std::vector<std::vector<pixel_type>> implicit_colors;
-  implicit_colors.reserve(palette_internal::kImplicitPaletteSize);
-  for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
-    for (size_t i = 0; i < nb; i++) {
-      color[i] = palette_internal::GetPaletteValue(nullptr, k, i, 0, 0,
-                                                   input.bitdepth);
+  if (use_implicit_palette) {
+    implicit_colors.reserve(palette_internal::kImplicitPaletteSize);
+    for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
+      for (size_t i = 0; i < nb; i++) {
+        color[i] = palette_internal::GetPaletteValue(nullptr, k, i, 0, 0,
+                                                     input.bitdepth);
+      }
+      implicit_color[color] = true;
+      implicit_colors.push_back(color);
     }
-    implicit_color[color] = true;
-    implicit_colors.push_back(color);
   }
 
   std::map<std::vector<pixel_type>, size_t> color_freq_map;
@@ -630,7 +637,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
       }
       const bool new_color = candidate_palette.insert(color).second;
       if (new_color) {
-        if (implicit_color[color]) {
+        if (use_implicit_palette && implicit_color[color]) {
           implicit_colors_used++;
         } else {
           candidate_palette_imageorder.push_back(color);
@@ -645,22 +652,51 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
 
   nb_colors = nb_deltas + candidate_palette_imageorder.size();
 
-  // not useful to make a single-color palette
-  if (!lossy && nb_colors + implicit_colors_used == 1) return false;
-  // TODO(jon): if this happens (e.g. solid white group), special-case it for
-  // faster encode
+  // A solid multi-channel group is a special case: represent it as a
+  // one-entry explicit palette and a zero-valued index image. This avoids
+  // running the general palette search and gives the modular encoder a very
+  // cheap index plane while preserving the exact pixel values in the palette.
+  if (!lossy && candidate_palette.size() == 1) {
+    const std::vector<pixel_type> &solid_color = *candidate_palette.begin();
+    JXL_DASSERT(solid_color.size() == nb);
+    JXL_DEBUG_V(6, "Channels %i-%i are solid; using a one-color palette.",
+                begin_c, end_c);
 
-  for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
-    color = implicit_colors[k];
-    // still add the color to the explicit palette if it is frequent enough
-    if (color_freq_map[color] > 10) {
-      nb_colors++;
-      candidate_palette_imageorder.push_back(color);
+    JXL_ASSIGN_OR_RETURN(Channel pch, Channel::Create(memory_manager, 1, nb));
+    pch.hshift = -1;
+    pch.vshift = -1;
+    for (size_t c = 0; c < nb; ++c) {
+      pch.Row(c)[0] = solid_color[c];
     }
+
+    for (size_t y = 0; y < h; ++y) {
+      pixel_type *p = input.channel[begin_c].Row(y);
+      std::fill(p, p + w, 0);
+    }
+
+    predictor = Predictor::Zero;
+    nb_colors = 1;
+    nb_deltas = 0;
+    input.nb_meta_channels++;
+    input.channel.erase(input.channel.begin() + begin_c + 1,
+                        input.channel.begin() + end_c + 1);
+    input.channel.insert(input.channel.begin(), std::move(pch));
+    return true;
   }
-  for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
-    color = implicit_colors[k];
-    inv_palette[color] = nb_colors + k;
+
+  if (use_implicit_palette) {
+    for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
+      color = implicit_colors[k];
+      // still add the color to the explicit palette if it is frequent enough
+      if (color_freq_map[color] > 10) {
+        nb_colors++;
+        candidate_palette_imageorder.push_back(color);
+      }
+    }
+    for (size_t k = 0; k < palette_internal::kImplicitPaletteSize; k++) {
+      color = implicit_colors[k];
+      inv_palette[color] = nb_colors + k;
+    }
   }
 
   JXL_DEBUG_V(6, "Channels %i-%i can be represented using a %i-color palette.",
@@ -684,7 +720,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     }
   }
   int clr = 0;
-  if (ordered && nb >= 3 && candidate_palette_imageorder.size() > 2) {
+  if (ordered && candidate_palette_imageorder.size() > 2) {
     JXL_DEBUG_V(7, "Palette of %i colors, using Oxipng ezeng order", nb_colors);
     std::vector<std::vector<pixel_type>> ordered_palette;
     OxipngEzengReorder(input, begin_c, candidate_palette_imageorder,

@@ -625,7 +625,6 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   }
 
   std::map<std::vector<pixel_type>, size_t> color_freq_map;
-  uint32_t implicit_colors_used = 0;
   for (size_t y = 0; y < h; y++) {
     for (uint32_t c = 0; c < nb; c++) {
       p_in[c] = input.channel[begin_c + c].Row(y);
@@ -636,14 +635,10 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
         color[c] = p_in[c][x];
       }
       const bool new_color = candidate_palette.insert(color).second;
-      if (new_color) {
-        if (use_implicit_palette && implicit_color[color]) {
-          implicit_colors_used++;
-        } else {
-          candidate_palette_imageorder.push_back(color);
-          if (candidate_palette_imageorder.size() > nb_colors) {
-            return false;  // too many colors
-          }
+      if (new_color && (!use_implicit_palette || !implicit_color[color])) {
+        candidate_palette_imageorder.push_back(color);
+        if (candidate_palette_imageorder.size() > nb_colors) {
+          return false;  // too many colors
         }
       }
       color_freq_map[color] += 1;
@@ -918,7 +913,7 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
     }
   }
   if (!delta_used) {
-    predictor = Predictor::Zero;
+    predictor = Predictor::Left;
   }
   if (palette_iteration_data.final_run) {
     input.nb_meta_channels++;

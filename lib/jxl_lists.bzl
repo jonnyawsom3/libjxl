@@ -20,7 +20,6 @@ libjxl_base_sources = [
     "jxl/base/fast_math-inl.h",
     "jxl/base/float.h",
     "jxl/base/iaca.h",
-    "jxl/base/include_jpeglib.h",
     "jxl/base/matrix_ops.h",
     "jxl/base/os_macros.h",
     "jxl/base/override.h",
@@ -438,6 +437,7 @@ libjxl_extras_sources = [
     "extras/exif.cc",
     "extras/exif.h",
     "extras/gain_map.cc",
+    "extras/include_jpeglib.h",
     "extras/mmap.cc",
     "extras/mmap.h",
     "extras/packed_image.cc",
@@ -458,7 +458,7 @@ libjxl_gbench_sources = [
 
 libjxl_major_version = 0
 
-libjxl_minor_version = 12
+libjxl_minor_version = 13
 
 libjxl_patch_version = 0
 

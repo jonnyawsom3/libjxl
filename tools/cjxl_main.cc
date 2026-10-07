@@ -141,6 +141,16 @@ struct CompressArgs {
         "    Recommended range: 0.5 .. 3.0.",
         &alpha_distance, &ParseFloat, 1);
 
+    cmdline->AddOptionValue(
+        '\0', "strip_alpha", "-1|0|1|2",
+        "Alpha stripping mode:\n"
+        "    -1 = Encoder chooses (default: strip if empty for lossy, "
+        "keep for lossless).\n"
+        "     0 = Never strip (always keep alpha).\n"
+        "     1 = Always strip alpha.\n"
+        "     2 = Strip if empty (fully opaque).",
+        &strip_alpha, &ParseInt64, 1);
+
     cmdline->AddOptionFlag('p', "progressive",
                            "More progressive/responsive decoding.",
                            &progressive, &SetBooleanTrue, 1);
@@ -213,7 +223,8 @@ struct CompressArgs {
         "rendering intent\n"
         "      -x color_space=RGB_D65_202_Rel_PeQ is Rec.2100 PQ with relative "
         "rendering intent\n"
-        "    Shorthands: sRGB, DisplayP3, Adobe98, Rec2100PQ, Rec2100HLG\n"
+        "    Shorthands: sRGB, DisplayP3, Adobe98, ProPhoto, Rec2100PQ, "
+        "Rec2100HLG\n"
         "    The key 'icc_pathname' refers to a binary file containing an ICC "
         "profile.\n"
         "    The keys 'exif', 'xmp', and 'jumbf' refer to a binary file "
@@ -240,13 +251,13 @@ struct CompressArgs {
 
     cmdline->AddOptionValue(
         '\0', "buffering", "-1..3",
-        "How frames are buffered when encoding, which affects memory usage and "
-        "compression.\n    "
+        "Controls how much input buffering libjxl uses, affecting memory usage "
+        "and compression quality.\n    "
         "-1 = encoder chooses (default). "
-        "0 = buffer everything (most memory, best compression).\n    "
-        "1 = stream input for large images, buffer output. "
-        "2 = stream input, buffer output.\n    "
-        "3 = stream both input and output (least memory, worst compression)",
+        "0 = buffer entire image (most memory, best compression).\n    "
+        "1 = stream input for large images. "
+        "2 = stream input with a lower threshold.\n    "
+        "3 = deprecated; use --output_mode to control output streaming.",
         &buffering, &ParseInt64, -1);
 
     cmdline->AddOptionValue('\0', "faster_decoding", "0..4",
@@ -354,6 +365,13 @@ struct CompressArgs {
         "    0 = disable. 1 = enable.",
         &jpeg_reconstruction_cfl, &ParseOverride, 3);
 
+    cmdline->AddOptionValue(
+        '\0', "jpeg_reconstruction_lfs", "-1|0|1",
+        "Disable/enable LF Smoothing for lossless "
+        "JPEG reconstruction.\n"
+        "    -1 = default (let encoder decide), 0 = disable, 1 = enable.",
+        &jpeg_reconstruction_lfs, &ParseInt64, -1);
+
     cmdline->AddOptionValue('\0', "num_reps", "REPS",
                             "How many times to compress, for benchmarking.",
                             &num_reps, &ParseUnsigned, 3);
@@ -366,6 +384,14 @@ struct CompressArgs {
     cmdline->AddOptionFlag('\0', "streaming_output",
                            "Enable incremental writing of the output file.",
                            &streaming_output, &SetBooleanTrue, 3);
+
+    cmdline->AddOptionValue(
+        '\0', "output_mode", "-1..2",
+        "Output mode: -1 = default (let encoder decide),"
+        "0 = buffer output internally./n"
+        "    1 = streaming with seeking, 2 = OOO jxlp"
+        "(ftyp v1, no seeking required).",
+        &output_mode, &ParseInt64, 3);
 
     cmdline->AddOptionFlag('\0', "disable_output",
                            "Do not write an output file.", &disable_output,
@@ -488,6 +514,7 @@ struct CompressArgs {
   jxl::Override print_profile = jxl::Override::kDefault;
   bool streaming_input = false;
   bool streaming_output = false;
+  int64_t output_mode = -1;
 
   bool verbose = false;
 
@@ -515,6 +542,7 @@ struct CompressArgs {
   bool modular_lossy_palette = false;
   int64_t progressive_dc = -1;
   int64_t upsampling_mode = -1;
+  int64_t jpeg_reconstruction_lfs = -1;
   int32_t premultiply = -1;
   bool already_downsampled = false;
   jxl::Override jpeg_reconstruction_cfl = jxl::Override::kDefault;
@@ -561,6 +589,7 @@ struct CompressArgs {
   CommandLineParser::OptionId opt_alpha_distance_id = -1;
   CommandLineParser::OptionId opt_quality_id = -1;
   CommandLineParser::OptionId opt_modular_group_size_id = -1;
+  int64_t strip_alpha = -1;
 };
 
 const char* ModeFromArgs(const CompressArgs& args) {
@@ -707,6 +736,11 @@ void ProcessFlags(const jxl::extras::Codec codec,
   ProcessBoolFlag(args->noise, JXL_ENC_FRAME_SETTING_NOISE, params);
 
   params->allow_expert_options = args->allow_expert_options;
+  if (args->strip_alpha < -1 || args->strip_alpha > 2) {
+    std::cerr << "Invalid --strip_alpha. Must be -1, 0, 1, or 2.\n";
+    exit(EXIT_FAILURE);
+  }
+  params->strip_alpha = static_cast<int32_t>(args->strip_alpha);
   if (args->disable_perceptual_optimizations) {
     params->AddOption(JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS, 1);
   }
@@ -782,13 +816,22 @@ void ProcessFlags(const jxl::extras::Codec codec,
 
   // Set progressive options before processing flags
   if (args->progressive) {
-    args->qprogressive_ac = true;
+    // progressive_ac and qprogressive_ac should be made into
+    // a single parameter like progressive_dc to allow overriding.
+    args->progressive_ac = true;
     if (args->progressive_dc == -1) {
       args->progressive_dc = 1;
     }
-    args->group_order = jxl::Override::kOn;
-    args->responsive = 1;
-    responsive_set = true;
+    if (args->group_order == jxl::Override::kDefault) {
+      args->group_order = jxl::Override::kOn;
+    }
+    if (args->patches == jxl::Override::kDefault) {
+      args->patches = jxl::Override::kOff;
+    }
+    if (args->responsive == -1) {
+      args->responsive = 1;
+      responsive_set = true;
+    }
   }
 
   if (args->group_order != jxl::Override::kOn &&
@@ -889,6 +932,11 @@ void ProcessFlags(const jxl::extras::Codec codec,
   if (jpeg_bytes) {
     ProcessBoolFlag(args->jpeg_reconstruction_cfl,
                     JXL_ENC_FRAME_SETTING_JPEG_RECON_CFL, params);
+    ProcessFlag<int64_t>(
+      "jpeg_reconstruction_lfs", args->jpeg_reconstruction_lfs,
+      JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS, params,
+      [](int64_t x) { return (-1 <= x && x <= 1); },
+      "Valid values are -1, 0, 1.");
     ProcessBoolFlag(args->compress_boxes,
                     JXL_ENC_FRAME_SETTING_JPEG_COMPRESS_BOXES, params);
   }
@@ -1149,10 +1197,8 @@ int main(int argc, char** argv) {
   params.runner = JxlThreadParallelRunner;
   params.runner_opaque = runner.get();
 
-  if (args.streaming_input) {
-    params.options.emplace_back(JXL_ENC_FRAME_SETTING_BUFFERING,
-                                static_cast<int64_t>(3), 0);
-  }
+  params.options.emplace_back(JXL_ENC_FRAME_SETTING_OUTPUT_MODE,
+                              args.output_mode, 0);
 
   jpegxl::tools::SpeedStats stats;
   jpegxl::tools::JxlOutputProcessor output_processor;

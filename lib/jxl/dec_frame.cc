@@ -202,14 +202,6 @@ Status FrameDecoder::InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
   if (group_codes_begin + section_sizes_sum_ < group_codes_begin) {
     return JXL_FAILURE("Invalid group codes");
   }
-
-  if (!frame_header_.chroma_subsampling.Is444() &&
-      !(frame_header_.flags & FrameHeader::kSkipAdaptiveDCSmoothing) &&
-      frame_header_.encoding == FrameEncoding::kVarDCT) {
-    return JXL_FAILURE(
-        "Non-444 chroma subsampling is not allowed when adaptive DC "
-        "smoothing is enabled");
-  }
   return true;
 }
 
@@ -270,11 +262,11 @@ Status FrameDecoder::ProcessDCGlobal(BitReader* br) {
   PassesSharedState& shared = dec_state_->shared_storage;
   JxlMemoryManager* memory_manager = shared.memory_manager;
   if (frame_header_.flags & FrameHeader::kPatches) {
-    bool uses_extra_channels = false;
+    bool uses_extra_channels;
     JXL_RETURN_IF_ERROR(shared.image_features.patches.Decode(
         memory_manager, br, frame_dim_.xsize_padded, frame_dim_.ysize_padded,
         shared.metadata->m.num_extra_channels, &uses_extra_channels));
-    if (uses_extra_channels && frame_header_.upsampling != 1) {
+    if (frame_header_.upsampling != 1) {
       for (size_t ecups : frame_header_.extra_channel_upsampling) {
         if (ecups != frame_header_.upsampling) {
           return JXL_FAILURE(
@@ -289,7 +281,7 @@ Status FrameDecoder::ProcessDCGlobal(BitReader* br) {
   shared.image_features.splines.Clear();
   if (frame_header_.flags & FrameHeader::kSplines) {
     JXL_RETURN_IF_ERROR(shared.image_features.splines.Decode(
-        memory_manager, br, frame_dim_.xsize * frame_dim_.ysize));
+        br, frame_dim_.xsize * frame_dim_.ysize));
   }
   if (frame_header_.flags & FrameHeader::kNoise) {
     JXL_RETURN_IF_ERROR(DecodeNoise(br, &shared.image_features.noise_params));
@@ -347,7 +339,9 @@ Status FrameDecoder::FinalizeDC() {
   JxlMemoryManager* memory_manager = dec_state_->memory_manager();
   if (frame_header_.encoding == FrameEncoding::kVarDCT &&
       !(frame_header_.flags & FrameHeader::kSkipAdaptiveDCSmoothing) &&
-      !(frame_header_.flags & FrameHeader::kUseDcFrame)) {
+      !(frame_header_.flags & FrameHeader::kUseDcFrame) &&
+      // Skip smoothing when reconstructing to JPEG.
+      !decoded_->IsJPEG()) {
     JXL_RETURN_IF_ERROR(AdaptiveDCSmoothing(
         memory_manager, dec_state_->shared->quantizer.MulDC(),
         &dec_state_->shared_storage.dc_storage, pool_));

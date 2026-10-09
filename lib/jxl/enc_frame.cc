@@ -643,13 +643,10 @@ struct PixelStatsForChromacityAdjustment {
     CalcExposedBlue(&opsin->Plane(1), &opsin->Plane(2), rect);
   }
   int HowMuchIsXChannelPixelized() const {
-    if (dx >= 0.026) {
-      return 3;
-    }
-    if (dx >= 0.022) {
+    if (dx >= 0.03f) {
       return 2;
     }
-    if (dx >= 0.015) {
+    if (dx >= 0.017f) {
       return 1;
     }
     return 0;
@@ -677,18 +674,23 @@ void ComputeChromacityAdjustments(const CompressParams& cparams,
     return;
   }
   // 1) Distance based approach for chromacity adjustment:
-  float x_qm_scale_steps[3] = {2.5f, 5.5f, 9.5f};
-  frame_header->x_qm_scale = 3;
+  float x_qm_scale_steps[4] = {1.25f, 7.0f, 15.0f, 24.0f};
+  frame_header->x_qm_scale = 2;
   for (float x_qm_scale_step : x_qm_scale_steps) {
     if (cparams.original_butteraugli_distance > x_qm_scale_step) {
       frame_header->x_qm_scale++;
     }
   }
+  if (cparams.butteraugli_distance < 0.299f) {
+    // Favor chroma preservation at very high quality, where artifacts are
+    // particularly visible when zoomed in.
+    frame_header->x_qm_scale++;
+  }
   // 2) Pixel-based approach for chromacity adjustment:
   // look at the individual pixels and make a guess how difficult
   // the image would be based on the worst case pixel.
   PixelStatsForChromacityAdjustment pixel_stats;
-  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
+  if (cparams.speed_tier <= SpeedTier::kWombat) {
     pixel_stats.Calc(&opsin, rect);
   }
   // For X take the most severe adjustment.
@@ -1150,24 +1152,12 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
                                  AuxOut* aux_out) {
   JXL_ENSURE((rect.xsize() % kBlockDim) == 0 &&
              (rect.ysize() % kBlockDim) == 0);
-  JxlMemoryManager* memory_manager = enc_state->memory_manager();
-  // Save pre-Gaborish opsin for AR control field heuristics computation.
-  Image3F orig_opsin;
-  JXL_ASSIGN_OR_RETURN(
-      orig_opsin, Image3F::Create(memory_manager, rect.xsize(), rect.ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(rect, *opsin, Rect(orig_opsin), &orig_opsin));
-  JXL_RETURN_IF_ERROR(orig_opsin.ShrinkTo(enc_state->shared.frame_dim.xsize,
-                                          enc_state->shared.frame_dim.ysize));
-
   JXL_RETURN_IF_ERROR(LossyFrameHeuristics(frame_header, enc_state, enc_modular,
                                            linear, opsin, rect, cms, pool,
                                            aux_out));
 
   JXL_RETURN_IF_ERROR(InitializePassesEncoder(
       frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out));
-
-  JXL_RETURN_IF_ERROR(
-      ComputeARHeuristics(frame_header, enc_state, orig_opsin, rect, pool));
 
   JXL_RETURN_IF_ERROR(ComputeACMetadata(pool, enc_state, enc_modular));
 

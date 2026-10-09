@@ -36,13 +36,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             const Rect& rect, const JxlCmsInterface& cms,
                             ThreadPool* pool, AuxOut* aux_out);
 
-Status ComputeARHeuristics(const FrameHeader& frame_header,
-                           PassesEncoderState* enc_state,
-                           const Image3F& orig_opsin, const Rect& rect,
-                           ThreadPool* pool);
-
-void FindBestBlockEntropyModel(PassesEncoderState& enc_state);
-
 Status DownsampleImage2_Iterative(Image3F* opsin);
 Status DownsampleImage2_Sharper(Image3F* opsin);
 

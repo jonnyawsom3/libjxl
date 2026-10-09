@@ -37,7 +37,6 @@
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/enc_ac_strategy.h"
 #include "lib/jxl/enc_adaptive_quantization.h"
-#include "lib/jxl/enc_ar_control_field.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_chroma_from_luma.h"
 #include "lib/jxl/enc_gaborish.h"
@@ -770,6 +769,246 @@ Status DownsampleImage2_Iterative(Image3F* opsin) {
   return true;
 }
 
+namespace {
+
+// Scratch storage for the local Laplacian-based EPF sharpness heuristic. These
+// buffers are reused per worker thread, so EPF selection does not need to
+// reconstruct/decode the frame multiple times.
+struct ARControlFieldTempImages {
+  Status InitOnce(JxlMemoryManager* memory_manager) {
+    if (laplacian_sqrsum.xsize() != 0) return true;
+    JXL_ASSIGN_OR_RETURN(
+        laplacian_sqrsum,
+        ImageF::Create(memory_manager, kEncTileDim + 4, kEncTileDim + 4));
+    JXL_ASSIGN_OR_RETURN(
+        sqrsum_00,
+        ImageF::Create(memory_manager, kEncTileDim / 4, kEncTileDim / 4));
+    JXL_ASSIGN_OR_RETURN(
+        sqrsum_22,
+        ImageF::Create(memory_manager, kEncTileDim / 4 + 1,
+                       kEncTileDim / 4 + 1));
+    return true;
+  }
+
+  ImageF laplacian_sqrsum;
+  ImageF sqrsum_00;
+  ImageF sqrsum_22;
+};
+
+Status ComputeARControlFieldTile(const FrameHeader& frame_header,
+                                 const Image3F& opsin,
+                                 const ImageF& initial_quant_field,
+                                 PassesEncoderState* enc_state,
+                                 const Rect& rect,
+                                 ARControlFieldTempImages* temp_image) {
+  constexpr size_t N = kBlockDim;
+  PassesSharedState& shared = enc_state->shared;
+  ImageB& epf_sharpness = shared.epf_sharpness;
+  JXL_DASSERT(epf_sharpness.xsize() == shared.frame_dim.xsize_blocks &&
+              epf_sharpness.ysize() == shared.frame_dim.ysize_blocks);
+  if (enc_state->cparams.butteraugli_distance <
+          kMinButteraugliForDynamicAR ||
+      enc_state->cparams.speed_tier > SpeedTier::kWombat ||
+      frame_header.loop_filter.epf_iters == 0) {
+    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, rect);
+    return true;
+  }
+
+  const float kChannelWeights[3] = {4.35f, 4.35f, 0.287f};
+  const float kChannelWeightsLapNeg[3] = {
+      -0.125f * kChannelWeights[0], -0.125f * kChannelWeights[1],
+      -0.125f * kChannelWeights[2]};
+  const size_t by0 = rect.y0();
+  const size_t by1 = rect.y1();
+  const size_t bx0 = rect.x0();
+  const size_t bx1 = rect.x1();
+  ImageF& laplacian_sqrsum = temp_image->laplacian_sqrsum;
+
+  // Calculate the per-pixel squared 3x3 Laplacian. This estimates the local
+  // visibility/propagation of quantization artifacts without round-tripping
+  // the encoded image.
+  const size_t y0 = by0 == 0 ? 2 : 0;
+  const size_t y1 = by1 * N + 4 <= opsin.ysize() + 2
+                        ? (by1 - by0) * N + 4
+                        : opsin.ysize() + 2 - by0 * N;
+  const size_t x0 = bx0 == 0 ? 2 : 0;
+  const size_t x1 = bx1 * N + 4 <= opsin.xsize() + 2
+                        ? (bx1 - bx0) * N + 4
+                        : opsin.xsize() + 2 - bx0 * N;
+  for (size_t y = y0; y < y1; ++y) {
+    float* const out = laplacian_sqrsum.Row(y);
+    const size_t cy = y + by0 * N - 2;
+    const size_t cy_prev = cy > 0 ? cy - 1 : cy;
+    const size_t cy_next = cy + 1 < opsin.ysize() ? cy + 1 : cy;
+    const float* top[3];
+    const float* mid[3];
+    const float* bottom[3];
+    for (size_t c = 0; c < 3; ++c) {
+      top[c] = opsin.PlaneRow(c, cy_prev);
+      mid[c] = opsin.PlaneRow(c, cy);
+      bottom[c] = opsin.PlaneRow(c, cy_next);
+    }
+    for (size_t x = x0; x < x1; ++x) {
+      const size_t cx = x + bx0 * N - 2;
+      const size_t cx_prev = cx > 0 ? cx - 1 : cx;
+      const size_t cx_next = cx + 1 < opsin.xsize() ? cx + 1 : cx;
+      float sum_sq = 0.0f;
+      for (size_t c = 0; c < 3; ++c) {
+        const float neighbors =
+            mid[c][cx_prev] + mid[c][cx_next] + top[c][cx_prev] +
+            top[c][cx] + top[c][cx_next] + bottom[c][cx_prev] +
+            bottom[c][cx] + bottom[c][cx_next];
+        const float laplacian = kChannelWeights[c] * mid[c][cx] +
+                                kChannelWeightsLapNeg[c] * neighbors;
+        sum_sq += laplacian * laplacian;
+      }
+      out[x] = sum_sq;
+    }
+  }
+
+  // Aggregate the Laplacian energy over 4x4 regions, using both a block-locked
+  // grid and a grid shifted by two pixels. The latter provides a conservative
+  // local masking estimate around transform boundaries.
+  ImageF& sqrsum_00 = temp_image->sqrsum_00;
+  const size_t sqrsum_00_stride =
+      static_cast<size_t>(sqrsum_00.PixelsPerRow());
+  for (size_t y = 0; y < (by1 - by0) * 2; ++y) {
+    const float* rows_in[4];
+    for (size_t iy = 0; iy < 4; ++iy) {
+      rows_in[iy] = laplacian_sqrsum.ConstRow(y * 4 + iy + 2);
+    }
+    float* const row_out = sqrsum_00.Row(y);
+    for (size_t x = 0; x < (bx1 - bx0) * 2; ++x) {
+      float sum = 0.0f;
+      for (size_t iy = 0; iy < 4; ++iy) {
+        for (size_t ix = 0; ix < 4; ++ix) {
+          sum += rows_in[iy][x * 4 + ix + 2];
+        }
+      }
+      row_out[x] = std::sqrt(sum) * 0.25f;
+    }
+  }
+
+  ImageF& sqrsum_22 = temp_image->sqrsum_22;
+  const size_t sqrsum_22_stride =
+      static_cast<size_t>(sqrsum_22.PixelsPerRow());
+  for (size_t y = 0; y < (by1 - by0) * 2 + 1; ++y) {
+    const float* rows_in[4];
+    for (size_t iy = 0; iy < 4; ++iy) {
+      rows_in[iy] = laplacian_sqrsum.ConstRow(y * 4 + iy);
+    }
+    float* const row_out = sqrsum_22.Row(y);
+    const size_t sy = y * 4 + by0 * N > 0 ? 0 : 2;
+    const size_t ey = y * 4 + by0 * N + 4 <= opsin.ysize() + 2
+                          ? 4
+                          : opsin.ysize() - y * 4 - by0 * N + 2;
+    for (size_t x = 0; x < (bx1 - bx0) * 2 + 1; ++x) {
+      const size_t sx = x * 4 + bx0 * N > 0 ? x * 4 : x * 4 + 2;
+      const size_t ex = x * 4 + bx0 * N + 4 <= opsin.xsize() + 2
+                            ? x * 4 + 4
+                            : opsin.xsize() - bx0 * N + 2;
+      float sum = 0.0f;
+      if (ex - sx == 4 && ey - sy == 4) {
+        for (size_t iy = 0; iy < 4; ++iy) {
+          for (size_t ix = 0; ix < 4; ++ix) {
+            sum += rows_in[iy][sx + ix];
+          }
+        }
+        row_out[x] = std::sqrt(sum) * 0.25f;
+      } else {
+        for (size_t iy = sy; iy < ey; ++iy) {
+          for (size_t ix = sx; ix < ex; ++ix) {
+            sum += rows_in[iy][ix];
+          }
+        }
+        row_out[x] = std::sqrt(sum / ((ex - sx) * (ey - sy)));
+      }
+    }
+  }
+
+  const size_t sharpness_stride =
+      static_cast<size_t>(epf_sharpness.PixelsPerRow());
+  for (size_t by = by0; by < by1; ++by) {
+    const AcStrategyRow acs_row = shared.ac_strategy.ConstRow(by);
+    uint8_t* const out_row = epf_sharpness.Row(by);
+    const float* const quant_row = initial_quant_field.ConstRow(by);
+    for (size_t bx = bx0; bx < bx1; ++bx) {
+      const AcStrategy acs = acs_row[bx];
+      if (!acs.IsFirstBlock()) continue;
+      const float quant_val = 1.0f / quant_row[bx];
+      const auto sq00 = [&](size_t y, size_t x) {
+        return sqrsum_00.Row(0)[((by - by0) * 2 + y) * sqrsum_00_stride +
+                                (bx - bx0) * 2 + x];
+      };
+      const auto sq22 = [&](size_t y, size_t x) {
+        return sqrsum_22.Row(0)[((by - by0) * 2 + y) * sqrsum_22_stride +
+                                (bx - bx0) * 2 + x];
+      };
+      float sqrsum_integral_transform = 0.0f;
+      for (size_t iy = 0; iy < acs.covered_blocks_y() * 2; ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x() * 2; ++ix) {
+          const float value = sq00(iy, ix);
+          sqrsum_integral_transform += value * value;
+        }
+      }
+      sqrsum_integral_transform /=
+          4.0f * acs.covered_blocks_x() * acs.covered_blocks_y();
+      sqrsum_integral_transform = std::sqrt(sqrsum_integral_transform);
+
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
+          const float minval_1 =
+              std::min(sq00(2 * iy, 2 * ix), sq00(2 * iy, 2 * ix + 1));
+          const float minval_2 =
+              std::min(sq00(2 * iy + 1, 2 * ix),
+                       sq00(2 * iy + 1, 2 * ix + 1));
+          float minval = std::min(std::min(minval_1, minval_2),
+                                  sq22(2 * iy + 1, 2 * ix + 1));
+          const float minval2_1 =
+              std::min(sq22(2 * iy, 2 * ix), sq22(2 * iy, 2 * ix + 1));
+          const float minval2_2 =
+              std::min(sq22(2 * iy, 2 * ix + 2), sq22(2 * iy + 1, 2 * ix));
+          const float minval2_3 =
+              std::min(sq22(2 * iy + 1, 2 * ix + 1),
+                       sq22(2 * iy + 1, 2 * ix + 2));
+          const float minval2_4 =
+              std::min(sq22(2 * iy + 2, 2 * ix),
+                       sq22(2 * iy + 2, 2 * ix + 1));
+          const float minval2_5 = std::min(minval2_1, minval2_2);
+          const float minval2_6 = std::min(minval2_3, minval2_4);
+          const float minval2 = std::min(
+              std::min(minval2_5, minval2_6), sq22(2 * iy + 2, 2 * ix + 2));
+          const float minval3 = std::min(minval, minval2);
+          minval *= 0.125f;
+          minval += 0.625f * minval3;
+          minval += 0.125f * std::min(1.5f * minval3,
+                                      sq22(2 * iy + 1, 2 * ix + 1));
+          minval += 0.125f * minval2;
+
+          constexpr float kDeltaLimit = 3.2f;
+          const float bias = 0.0625f * quant_val;
+          const float delta =
+              (sqrsum_integral_transform + (kDeltaLimit + 0.05f) * bias) /
+              (minval + bias);
+          int out = delta > kDeltaLimit ? 4 : 0;
+          const float threshold = 0.0625f * quant_val;
+          constexpr float kSmoothLimit = 0.085f;
+          const float smooth =
+              0.20f * (sq00(2 * iy, 2 * ix) + sq00(2 * iy, 2 * ix + 1) +
+                       sq00(2 * iy + 1, 2 * ix) +
+                       sq00(2 * iy + 1, 2 * ix + 1) + minval);
+          if (smooth < kSmoothLimit * threshold) out = 4;
+          out_row[bx + sharpness_stride * iy + ix] =
+              static_cast<uint8_t>(out);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             PassesEncoderState* enc_state,
                             ModularFrameEncoder* modular_frame_encoder,
@@ -816,6 +1055,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   }
 
   const float quant_dc = InitialQuantDC(cparams.butteraugli_distance);
+  const float initial_q = 0.79f / cparams.butteraugli_distance;
+  quantizer.ComputeGlobalScaleAndQuant(quant_dc, initial_q, 0);
 
   // TODO(veluca): we can now run all the code from here to FindBestQuantizer
   // (excluded) one rect at a time. Do that.
@@ -838,7 +1079,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   AcStrategyHeuristics acs_heuristics(memory_manager, cparams);
   CfLHeuristics cfl_heuristics(memory_manager);
-  ArControlFieldHeuristics ar_heuristics;
+  std::vector<ARControlFieldTempImages> ar_control_field_temp_images;
   ImageF initial_quant_field;
   ImageF initial_quant_masking;
 
@@ -846,8 +1087,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // Call InitialQuantField only in Hare mode or slower. Otherwise, rely
   // on simple heuristics in FindBestAcStrategy, or set a constant for Falcon
   // mode.
-  const float initial_q = 0.79f / cparams.butteraugli_distance;
-  quantizer.ComputeGlobalScaleAndQuant(quant_dc, initial_q, 0);
   if (cparams.speed_tier > SpeedTier::kHare ||
       cparams.disable_perceptual_optimizations) {
     JXL_ASSIGN_OR_RETURN(initial_quant_field,
@@ -930,10 +1169,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(
         acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
 
-    // Estimate EPF detail preservation locally from the source image and the
-    // chosen transforms. This avoids multiple full-frame reconstructions.
-    JXL_RETURN_IF_ERROR(ar_heuristics.RunRect(
-        r, *opsin, initial_quant_field, frame_header, enc_state, thread));
+    // Select EPF sharpness from the local Laplacian and quantization field.
+    // This is much cheaper than reconstructing the image for each EPF setting.
+    JXL_RETURN_IF_ERROR(ComputeARControlFieldTile(
+        frame_header, *opsin, initial_quant_field, enc_state, r,
+        &ar_control_field_temp_images[thread]));
 
     // Always set the initial quant field, so we can compute the CfL map with
     // more accuracy. The initial quant field might change in slower modes, but
@@ -956,7 +1196,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
-    JXL_RETURN_IF_ERROR(ar_heuristics.PrepareForThreads(num_threads));
+    ar_control_field_temp_images.resize(num_threads);
+    for (auto& temp : ar_control_field_temp_images) {
+      JXL_RETURN_IF_ERROR(temp.InitOnce(memory_manager));
+    }
     return true;
   };
   JXL_RETURN_IF_ERROR(
@@ -966,8 +1209,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
-    ImageB& epf_sharpness = shared.epf_sharpness;
-    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     JXL_RETURN_IF_ERROR(FindBestQuantizer(frame_header, linear, *opsin,
                                           initial_quant_field, enc_state, cms,
                                           pool, aux_out));

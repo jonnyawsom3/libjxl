@@ -7,6 +7,7 @@
 #define LIB_JXL_ENC_ADAPTIVE_QUANTIZATION_H_
 
 #include <jxl/cms_interface.h>
+#include <jxl/memory_manager.h>
 
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
@@ -25,6 +26,22 @@ namespace jxl {
 
 struct AuxOut;
 class AcStrategyImage;
+
+// Scratch storage for the local Laplacian EPF sharpness heuristic.
+// One instance is reused by each worker thread.
+struct ARControlFieldTempImages {
+  Status InitOnce(JxlMemoryManager* memory_manager);
+  ImageF laplacian_sqrsum;
+  ImageF sqrsum_00;
+  ImageF sqrsum_22;
+};
+
+Status ComputeARControlFieldTile(const FrameHeader& frame_header,
+                                 const Image3F& opsin,
+                                 const ImageF& initial_quant_field,
+                                 PassesEncoderState* enc_state,
+                                 const Rect& rect,
+                                 ARControlFieldTempImages* temp_image);
 
 // Returns an image subsampled by kBlockDim in each direction. If the value
 // at pixel (x,y) in the returned image is greater than 1.0, it means that

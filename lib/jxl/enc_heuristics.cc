@@ -789,6 +789,17 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
+  // The DC CfL multipliers are encoded once globally, but streaming encoding
+  // recreates the ColorCorrelationMap for each DC group. Reuse the first
+  // group's values for all later groups instead of fitting a different local
+  // transform to each chunk (which the decoder cannot reproduce).
+  if (streaming_mode && !initialize_global_state &&
+      cparams.speed_tier <= SpeedTier::kHare &&
+      enc_state->cfl_dc_multipliers_initialized) {
+    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
+    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
+  }
+
   // Find and subtract splines.
   bool override_splines = cparams.custom_splines.HasAny();
   if (override_splines) {
@@ -958,15 +969,19 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // Fit the frame-global DC CfL multipliers from the DC coefficients. The
-  // newer code retained dc_values and wrote them in ComputeTile, but dropped
-  // this final fitting pass, leaving both global DC multipliers at zero.
-  if (cparams.speed_tier <= SpeedTier::kHare) {
-    // In one-shot mode this fits the frame-global DC multipliers. In streaming
-    // mode CfLHeuristics contains the current DC group only, so fit that group's
-    // multipliers rather than leaving them at the default zero values.
+  // Fit DC CfL once. In one-shot mode all frame samples are available. In
+  // streaming mode, the first DC group's fit is used as the frame-global fit;
+  // save it and reuse it for all subsequent groups. Fitting independently per
+  // chunk is invalid because the DC multipliers are transmitted only once.
+  if (cparams.speed_tier <= SpeedTier::kHare &&
+      (!streaming_mode || initialize_global_state)) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+    if (streaming_mode) {
+      enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
+      enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
+      enc_state->cfl_dc_multipliers_initialized = true;
+    }
   }
 
   // Refine quantization levels.

@@ -769,9 +769,6 @@ Status DownsampleImage2_Iterative(Image3F* opsin) {
   return true;
 }
 
-namespace {
-
-
 Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             PassesEncoderState* enc_state,
                             ModularFrameEncoder* modular_frame_encoder,

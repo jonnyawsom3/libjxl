@@ -443,7 +443,7 @@ struct AdaptiveQuantizationImpl {
 
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
                      const Rect& rect_in, const Rect& rect_out,
-                     const int thread, ImageF* mask, ImageF* mask1x1) {
+                     const int thread, ImageF* mask) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
     const size_t xsize = xyb.xsize();
@@ -457,51 +457,6 @@ struct AdaptiveQuantizationImpl {
     const float match_gamma_offset = 0.019;
 
     const HWY_FULL(float) df;
-
-    size_t y_start_1x1 = rect_in.y0() + rect_out.y0() * 8;
-    size_t y_end_1x1 = y_start_1x1 + rect_out.ysize() * 8;
-
-    size_t x_start_1x1 = rect_in.x0() + rect_out.x0() * 8;
-    size_t x_end_1x1 = x_start_1x1 + rect_out.xsize() * 8;
-
-    if (rect_in.x0() != 0 && rect_out.x0() == 0) x_start_1x1 -= 2;
-    if (rect_in.x1() < xsize && rect_out.x1() * 8 == rect_in.xsize()) {
-      x_end_1x1 += 2;
-    }
-    if (rect_in.y0() != 0 && rect_out.y0() == 0) y_start_1x1 -= 2;
-    if (rect_in.y1() < ysize && rect_out.y1() * 8 == rect_in.ysize()) {
-      y_end_1x1 += 2;
-    }
-
-    // Computes image (padded to multiple of 8x8) of local pixel differences.
-    // Subsample both directions by 4.
-    // 1x1 Laplacian of intensity.
-    for (size_t y = y_start_1x1; y < y_end_1x1; ++y) {
-      const size_t y2 = y + 1 < ysize ? y + 1 : y;
-      const size_t y1 = y > 0 ? y - 1 : y;
-      const float* row_in = xyb.ConstPlaneRow(1, y);
-      const float* row_in1 = xyb.ConstPlaneRow(1, y1);
-      const float* row_in2 = xyb.ConstPlaneRow(1, y2);
-      float* mask1x1_out = mask1x1->Row(y);
-      auto scalar_pixel1x1 = [&](size_t x) {
-        const size_t x2 = x + 1 < xsize ? x + 1 : x;
-        const size_t x1 = x > 0 ? x - 1 : x;
-        const float base =
-            0.25f * (row_in2[x] + row_in1[x] + row_in[x1] + row_in[x2]);
-        const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
-            row_in[x] + match_gamma_offset);
-        float diff = std::abs(gammac * (row_in[x] - base));
-        static const double kScaler = 1.0;
-        diff *= kScaler;
-        diff = std::log1p(diff);
-        static const float kMul = 1.0;
-        static const float kOffset = 0.01;
-        mask1x1_out[x] = kMul / (diff + kOffset);
-      };
-      for (size_t x = x_start_1x1; x < x_end_1x1; ++x) {
-        scalar_pixel1x1(x);
-      }
-    }
 
     size_t y_start = rect_in.y0() + rect_out.y0() * 8;
     size_t y_end = y_start + rect_out.ysize() * 8;
@@ -609,40 +564,10 @@ struct AdaptiveQuantizationImpl {
   ImageF diff_buffer;
 };
 
-Status Blur1x1Masking(JxlMemoryManager* memory_manager, ThreadPool* pool,
-                      ImageF* mask1x1, const Rect& rect) {
-  // Blur the mask1x1 to obtain the masking image.
-  // Before blurring it contains an image of absolute value of the
-  // Laplacian of the intensity channel.
-  static const float kFilterMask1x1[5] = {
-    0.364911248, 0.05, 0.1688888021, 0.221069183, 0.306563504,
-  };
-  double sum =
-      1.0 + 4 * (kFilterMask1x1[0] + kFilterMask1x1[1] + kFilterMask1x1[2] +
-                 kFilterMask1x1[4] + 2 * kFilterMask1x1[3]);
-  if (sum < 1e-5) {
-    sum = 1e-5;
-  }
-  const float normalize = static_cast<float>(1.0 / sum);
-  WeightsSymmetric5 weights =
-      WeightsSymmetric5{{HWY_REP4(normalize)},
-                        {HWY_REP4(normalize * kFilterMask1x1[0])},
-                        {HWY_REP4(normalize * kFilterMask1x1[2])},
-                        {HWY_REP4(normalize * kFilterMask1x1[1])},
-                        {HWY_REP4(normalize * kFilterMask1x1[4])},
-                        {HWY_REP4(normalize * kFilterMask1x1[3])}};
-  JXL_ASSIGN_OR_RETURN(
-      ImageF temp, ImageF::Create(memory_manager, rect.xsize(), rect.ysize()));
-  JXL_RETURN_IF_ERROR(
-      Symmetric5(*mask1x1, rect, weights, pool, &temp, Rect(temp)));
-  *mask1x1 = std::move(temp);
-  return true;
-}
-
 StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
-                                         ImageF* mask, ImageF* mask1x1) {
+                                         ImageF* mask) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
   JXL_ENSURE(rect.ysize() % kBlockDim == 0);
   AdaptiveQuantizationImpl impl;
@@ -653,8 +578,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
       impl.aq_map, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
   JXL_ASSIGN_OR_RETURN(
       *mask, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
-  JXL_ASSIGN_OR_RETURN(
-      *mask1x1, ImageF::Create(memory_manager, xyb.xsize(), xyb.ysize()));
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(impl.PrepareBuffers(memory_manager, num_threads));
     return true;
@@ -670,7 +593,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, thread, mask, mask1x1));
+                                         rect_out, thread, mask));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -678,7 +601,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare, process_tile,
                                 "AQ DiffPrecompute"));
 
-  JXL_RETURN_IF_ERROR(Blur1x1Masking(memory_manager, pool, mask1x1, rect));
   return std::move(impl).aq_map;
 }
 
@@ -1249,7 +1171,9 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
   constexpr int kOriginalComparisonRound = 1;
   int iters = kDefaultButteraugliIters;
-  if (cparams.speed_tier <= SpeedTier::kTortoise) {
+  // Match the pre-regression search budget: only Tortoise uses four
+  // optimization rounds; Glacier and faster tiers use two.
+  if (cparams.speed_tier == SpeedTier::kTortoise) {
     iters = kMaxButteraugliIters;
   }
   for (int i = 0; i < iters + 1; ++i) {
@@ -1534,10 +1458,10 @@ float InitialQuantDC(float butteraugli_target) {
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask, ImageF* mask1x1) {
+                                   ImageF* mask) {
   const float quant_ac = kAcQuant / butteraugli_target;
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask, mask1x1);
+      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,

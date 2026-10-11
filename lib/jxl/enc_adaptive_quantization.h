@@ -52,8 +52,7 @@ Status ComputeARControlFieldTile(const FrameHeader& frame_header,
 StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* initial_quant_mask,
-                                   ImageF* initial_quant_mask1x1);
+                                   ImageF* initial_quant_mask);
 
 float InitialQuantDC(float butteraugli_target);
 

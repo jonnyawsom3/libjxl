@@ -786,7 +786,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
-  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
@@ -862,12 +861,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
-    if (cparams.disable_perceptual_optimizations) {
-      JXL_ASSIGN_OR_RETURN(
-          initial_quant_masking1x1,
-          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
-      FillImage(masking, &initial_quant_masking1x1);
-    }
   } else {
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
@@ -877,8 +870,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1));
+                          1.0f, &initial_quant_masking));
     JXL_RETURN_IF_ERROR(
         quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
   }
@@ -903,8 +895,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking,
-                                          initial_quant_masking1x1, &matrices));
+                                          initial_quant_masking, &matrices));
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);

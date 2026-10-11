@@ -609,7 +609,8 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
                                     const Image3F& opsin,
                                     const ImageF& initial_quant_field,
                                     PassesEncoderState* enc_state,
-                                    const Rect& rect,
+                                    const Rect& block_rect,
+                                    const Rect& opsin_rect,
                                     ARControlFieldTempImages* temp_image) {
   constexpr size_t N = kBlockDim;
   ImageB* JXL_RESTRICT epf_sharpness = &enc_state->shared.epf_sharpness;
@@ -621,7 +622,7 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
   if (enc_state->cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
       enc_state->cparams.speed_tier > SpeedTier::kWombat ||
       frame_header.loop_filter.epf_iters == 0) {
-    FillPlane(static_cast<uint8_t>(4), epf_sharpness, rect);
+    FillPlane(static_cast<uint8_t>(4), epf_sharpness, block_rect);
     return;
   }
 
@@ -634,24 +635,35 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
   const size_t sharpness_stride =
       static_cast<size_t>(epf_sharpness->PixelsPerRow());
 
-  size_t by0 = rect.y0();
-  size_t by1 = rect.y0() + rect.ysize();
-  size_t bx0 = rect.x0();
-  size_t bx1 = rect.x0() + rect.xsize();
+  const size_t by0 = block_rect.y0();
+  const size_t by1 = block_rect.y1();
+  const size_t bx0 = block_rect.x0();
+  const size_t bx1 = block_rect.x1();
+  // In streaming mode, opsin includes a border around the currently encoded
+  // chunk. Block coordinates and source-pixel coordinates therefore have
+  // different origins. Keep the block rectangle for output indexing, and use
+  // opsin_rect to locate the corresponding pixels in the bordered source.
+  const size_t source_y0 = opsin_rect.y0() + by0 * N;
+  const size_t source_y1 = opsin_rect.y0() + by1 * N;
+  const size_t source_x0 = opsin_rect.x0() + bx0 * N;
+  const size_t source_x1 = opsin_rect.x0() + bx1 * N;
+  JXL_DASSERT(source_x1 <= opsin.xsize() && source_y1 <= opsin.ysize());
   ImageF& laplacian_sqrsum = temp_image->laplacian_sqrsum;
   // Calculate the L2 of the 3x3 Laplacian in an integral transform
   // (for example 32x32 dct). This relates to transforms ability
   // to propagate artefacts.
-  size_t y0 = by0 == 0 ? 2 : 0;
-  size_t y1 = by1 * N + 4 <= opsin.ysize() + 2 ? (by1 - by0) * N + 4
-                                               : opsin.ysize() + 2 - by0 * N;
-  size_t x0 = bx0 == 0 ? 2 : 0;
-  size_t x1 = bx1 * N + 4 <= opsin.xsize() + 2 ? (bx1 - bx0) * N + 4
-                                               : opsin.xsize() + 2 - bx0 * N;
+  size_t y0 = source_y0 == 0 ? 2 : 0;
+  size_t y1 = source_y1 + 4 <= opsin.ysize() + 2
+                  ? (by1 - by0) * N + 4
+                  : opsin.ysize() + 2 - source_y0;
+  size_t x0 = source_x0 == 0 ? 2 : 0;
+  size_t x1 = source_x1 + 4 <= opsin.xsize() + 2
+                  ? (bx1 - bx0) * N + 4
+                  : opsin.xsize() + 2 - source_x0;
   HWY_FULL(float) df;
   for (size_t y = y0; y < y1; y++) {
     float* JXL_RESTRICT laplacian_sqrsum_row = laplacian_sqrsum.Row(y);
-    size_t cy = y + by0 * N - 2;
+    size_t cy = y + source_y0 - 2;
     const float* JXL_RESTRICT in_row_t[3];
     const float* JXL_RESTRICT in_row[3];
     const float* JXL_RESTRICT in_row_b[3];
@@ -661,7 +673,7 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
       in_row_b[c] = opsin.PlaneRow(c, cy + 1 < opsin.ysize() ? cy + 1 : cy);
     }
     auto compute_laplacian_scalar = [&](size_t x) {
-      size_t cx = x + bx0 * N - 2;
+      size_t cx = x + source_x0 - 2;
       const size_t prevX = cx >= 1 ? cx - 1 : cx;
       const size_t nextX = cx + 1 < opsin.xsize() ? cx + 1 : cx;
       float sumsqr = 0;
@@ -677,13 +689,13 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
       laplacian_sqrsum_row[x] = sumsqr;
     };
     size_t x = x0;
-    for (; x + bx0 * N < 3; x++) {
+    for (; x + source_x0 < 3; x++) {
       compute_laplacian_scalar(x);
     }
     // Interior. One extra pixel of border as the last pixel is special.
-    for (; x + Lanes(df) <= x1 && x + Lanes(df) + bx0 * N - 1 <= opsin.xsize();
+    for (; x + Lanes(df) <= x1 && x + Lanes(df) + source_x0 - 1 <= opsin.xsize();
          x += Lanes(df)) {
-      size_t cx = x + bx0 * N - 2;
+      size_t cx = x + source_x0 - 2;
       auto sumsqr = Zero(df);
       for (size_t c = 0; c < 3; c++) {
         auto laplacian =
@@ -748,17 +760,17 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
     float* JXL_RESTRICT row_out = sqrsum_22_row + y * sqrsum_22_stride;
     // ignore pixels outside the image.
     // Y coordinates are relative to by0*8+y*4.
-    size_t sy = y * 4 + by0 * 8 > 0 ? 0 : 2;
-    size_t ey = y * 4 + by0 * 8 + 4 <= opsin.ysize() + 2
+    size_t sy = y * 4 + source_y0 > 0 ? 0 : 2;
+    size_t ey = y * 4 + source_y0 + 4 <= opsin.ysize() + 2
                     ? 4
-                    : opsin.ysize() - y * 4 - by0 * 8 + 2;
+                    : opsin.ysize() - y * 4 - source_y0 + 2;
     for (size_t x = 0; x < (bx1 - bx0) * 2 + 1; x++) {
       // ignore pixels outside the image.
-      // X coordinates are relative to bx0*8.
-      size_t sx = x * 4 + bx0 * 8 > 0 ? x * 4 : x * 4 + 2;
-      size_t ex = x * 4 + bx0 * 8 + 4 <= opsin.xsize() + 2
+      // X coordinates are relative to source_x0.
+      size_t sx = x * 4 + source_x0 > 0 ? x * 4 : x * 4 + 2;
+      size_t ex = x * 4 + source_x0 + 4 <= opsin.xsize() + 2
                       ? x * 4 + 4
-                      : opsin.xsize() - bx0 * 8 + 2;
+                      : opsin.xsize() - source_x0 - x * 4 + 2;
       if (ex - sx == 4 && ey - sy == 4) {
         auto sum = Zero(df4);
         for (size_t iy = 0; iy < 4; iy++) {
@@ -899,11 +911,13 @@ Status ComputeARControlFieldTile(const FrameHeader& frame_header,
                                  const Image3F& opsin,
                                  const ImageF& initial_quant_field,
                                  PassesEncoderState* enc_state,
-                                 const Rect& rect,
+                                 const Rect& block_rect,
+                                 const Rect& opsin_rect,
                                  ARControlFieldTempImages* temp_image) {
   JXL_ENSURE(temp_image != nullptr);
   HWY_DYNAMIC_DISPATCH(ProcessARControlFieldTileImpl)(
-      frame_header, opsin, initial_quant_field, enc_state, rect, temp_image);
+      frame_header, opsin, initial_quant_field, enc_state, block_rect,
+      opsin_rect, temp_image);
   return true;
 }
 

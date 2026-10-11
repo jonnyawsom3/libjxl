@@ -923,7 +923,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // Select EPF sharpness from the local Laplacian and quantization field.
     // This is much cheaper than reconstructing the image for each EPF setting.
     JXL_RETURN_IF_ERROR(ComputeARControlFieldTile(
-        frame_header, *opsin, initial_quant_field, enc_state, r,
+        frame_header, *opsin, initial_quant_field, enc_state, r, rect,
         &ar_control_field_temp_images[thread]));
 
     // Always set the initial quant field, so we can compute the CfL map with
@@ -961,8 +961,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // Fit the frame-global DC CfL multipliers from the DC coefficients. The
   // newer code retained dc_values and wrote them in ComputeTile, but dropped
   // this final fitting pass, leaving both global DC multipliers at zero.
-  if (initialize_global_state && !streaming_mode &&
-      cparams.speed_tier <= SpeedTier::kHare) {
+  if (cparams.speed_tier <= SpeedTier::kHare) {
+    // In one-shot mode this fits the frame-global DC multipliers. In streaming
+    // mode CfLHeuristics contains the current DC group only, so fit that group's
+    // multipliers rather than leaving them at the default zero values.
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
   }

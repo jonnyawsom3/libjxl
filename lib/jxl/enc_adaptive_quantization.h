@@ -40,7 +40,8 @@ Status ComputeARControlFieldTile(const FrameHeader& frame_header,
                                  const Image3F& opsin,
                                  const ImageF& initial_quant_field,
                                  PassesEncoderState* enc_state,
-                                 const Rect& rect,
+                                 const Rect& block_rect,
+                                 const Rect& opsin_rect,
                                  ARControlFieldTempImages* temp_image);
 
 // Returns an image subsampled by kBlockDim in each direction. If the value

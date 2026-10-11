@@ -205,6 +205,20 @@ Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
   return true;
 }
 
+void ComputeDC(const ImageF& dc_values, bool fast, int32_t* dc_x,
+               int32_t* dc_b) {
+  constexpr float kDistanceMultiplierDC = 1e-5f;
+  const float* JXL_RESTRICT dc_values_yx = dc_values.Row(0);
+  const float* JXL_RESTRICT dc_values_x = dc_values.Row(1);
+  const float* JXL_RESTRICT dc_values_yb = dc_values.Row(2);
+  const float* JXL_RESTRICT dc_values_b = dc_values.Row(3);
+  *dc_x = FindBestMultiplier(dc_values_yx, dc_values_x, dc_values.xsize(),
+                             0.0f, kDistanceMultiplierDC, fast);
+  *dc_b = FindBestMultiplier(dc_values_yb, dc_values_b, dc_values.xsize(),
+                             jxl::cms::kYToBRatio, kDistanceMultiplierDC,
+                             fast);
+}
+
 Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const DequantMatrices& dequant,
                    const AcStrategyImage* ac_strategy,
@@ -362,6 +376,7 @@ HWY_AFTER_NAMESPACE();
 namespace jxl {
 
 HWY_EXPORT(InitDCStorage);
+HWY_EXPORT(ComputeDC);
 HWY_EXPORT(ComputeTile);
 
 Status CfLHeuristics::Init(const Rect& rect) {
@@ -369,6 +384,15 @@ Status CfLHeuristics::Init(const Rect& rect) {
   size_t ysize_blocks = rect.ysize() / kBlockDim;
   return HWY_DYNAMIC_DISPATCH(InitDCStorage)(
       memory_manager, xsize_blocks * ysize_blocks, &dc_values);
+}
+
+Status CfLHeuristics::ComputeDC(bool fast, ColorCorrelationMap* cmap) {
+  int32_t ytox_dc = 0;
+  int32_t ytob_dc = 0;
+  HWY_DYNAMIC_DISPATCH(ComputeDC)(dc_values, fast, &ytox_dc, &ytob_dc);
+  cmap->SetYToXDC(ytox_dc);
+  cmap->SetYToBDC(ytob_dc);
+  return true;
 }
 
 Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,

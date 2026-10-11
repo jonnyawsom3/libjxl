@@ -132,6 +132,10 @@ struct ColorCorrelationMap {
   const ColorCorrelation& base() const { return base_; }
   Status DecodeDC(BitReader* br) { return base_.DecodeDC(br); }
 
+  // Set the frame-global DC CfL multipliers fitted by the encoder.
+  void SetYToXDC(int32_t ytox_dc) { base_.SetYToXDC(ytox_dc); }
+  void SetYToBDC(int32_t ytob_dc) { base_.SetYToBDC(ytob_dc); }
+
   ImageSB ytox_map;
   ImageSB ytob_map;
 

@@ -958,6 +958,15 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
+  // Fit the frame-global DC CfL multipliers from the DC coefficients. The
+  // newer code retained dc_values and wrote them in ComputeTile, but dropped
+  // this final fitting pass, leaving both global DC multipliers at zero.
+  if (initialize_global_state && !streaming_mode &&
+      cparams.speed_tier <= SpeedTier::kHare) {
+    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
+        /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+  }
+
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
     JXL_RETURN_IF_ERROR(FindBestQuantizer(frame_header, linear, *opsin,

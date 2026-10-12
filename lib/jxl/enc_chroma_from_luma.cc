@@ -167,21 +167,6 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
       if (std::abs(step) < 3e-3) break;
     }
   }
-  // CFL seems to be tricky for larger transforms for HF components
-  // close to zero. This heuristic brings the solutions closer to zero
-  // and reduces red-green oscillations. A better approach would
-  // look into variance of the multiplier within separate (e.g. 8x8)
-  // areas and only apply this heuristic where there is a high variance.
-  // This would give about 1 % more compression density.
-  float towards_zero = 2.6;
-  if (x >= towards_zero) {
-    x -= towards_zero;
-  } else if (x <= -towards_zero) {
-    x += towards_zero;
-  } else {
-    x = 0;
-  }
-  return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
 
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,

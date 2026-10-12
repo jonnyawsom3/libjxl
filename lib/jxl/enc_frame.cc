@@ -666,10 +666,9 @@ struct PixelStatsForChromacityAdjustment {
   }
 };
 
-void ComputeChromacityAdjustments(
-    const CompressParams& cparams, const Image3F& opsin, const Rect& rect,
-    const PixelStatsForChromacityAdjustment* frame_pixel_stats,
-    FrameHeader* frame_header) {
+void ComputeChromacityAdjustments(const CompressParams& cparams,
+                                  const Image3F& opsin, const Rect& rect,
+                                  FrameHeader* frame_header) {
   if (frame_header->encoding != FrameEncoding::kVarDCT ||
       cparams.max_error_mode) {
     return;
@@ -692,95 +691,13 @@ void ComputeChromacityAdjustments(
   // the image would be based on the worst case pixel.
   PixelStatsForChromacityAdjustment pixel_stats;
   if (cparams.speed_tier <= SpeedTier::kWombat) {
-    // Chunked mode must use frame-wide maxima for global QM choices. Using
-    // only the first chunk makes the frame header depend on image layout.
-    if (frame_pixel_stats != nullptr) {
-      pixel_stats = *frame_pixel_stats;
-    } else {
-      pixel_stats.Calc(&opsin, rect);
-    }
+    pixel_stats.Calc(&opsin, rect);
   }
   // For X take the most severe adjustment.
   frame_header->x_qm_scale = std::max<int>(
       frame_header->x_qm_scale, 2 + pixel_stats.HowMuchIsXChannelPixelized());
   // B only adjusted by pixel-based approach.
   frame_header->b_qm_scale = 2 + pixel_stats.HowMuchIsBChannelPixelized();
-}
-
-// Computes the pixel-based chroma QM statistics across the complete source
-// frame using bounded-size patches. This preserves the old frame-wide max
-// decision while keeping chunked encoding's peak working set local.
-Status ComputeFrameWidePixelStatsForChromacityAdjustment(
-    const CompressParams& cparams, const FrameInfo& frame_info,
-    const CodecMetadata& metadata, JxlEncoderChunkedFrameAdapter& frame_data,
-    const FrameHeader& frame_header, const JxlCmsInterface& cms,
-    ThreadPool* pool, JxlMemoryManager* memory_manager,
-    PixelStatsForChromacityAdjustment* frame_stats) {
-  JXL_ENSURE(frame_stats != nullptr);
-  *frame_stats = PixelStatsForChromacityAdjustment();
-  const size_t kStatsTileDim = 512;
-  const Rect frame_rect(0, 0, frame_data.xsize, frame_data.ysize);
-  JxlChunkedFrameInputSource input = frame_data.GetInputSource();
-  const ColorEncoding c_enc = metadata.m.color_encoding;
-  const ExtraChannelInfo* alpha_eci = metadata.m.Find(ExtraChannel::kAlpha);
-  const ExtraChannelInfo* black_eci = metadata.m.Find(ExtraChannel::kBlack);
-  const size_t alpha_idx =
-      alpha_eci ? alpha_eci - metadata.m.extra_channel_info.data() : 0;
-  const size_t black_idx =
-      black_eci ? black_eci - metadata.m.extra_channel_info.data() : 0;
-
-  for (size_t y0 = 0; y0 < frame_data.ysize; y0 += kStatsTileDim) {
-    for (size_t x0 = 0; x0 < frame_data.xsize; x0 += kStatsTileDim) {
-      const Rect tile(x0, y0,
-                      std::min(kStatsTileDim, frame_data.xsize - x0),
-                      std::min(kStatsTileDim, frame_data.ysize - y0));
-      const Rect patch_rect = tile.Extend(kBlockDim, frame_rect);
-      JXL_ASSIGN_OR_RETURN(
-          Image3F color,
-          Image3F::Create(memory_manager,
-                          RoundUpToBlockDim(patch_rect.xsize()),
-                          RoundUpToBlockDim(patch_rect.ysize())));
-      JXL_RETURN_IF_ERROR(color.ShrinkTo(patch_rect.xsize(), patch_rect.ysize()));
-
-      std::vector<ImageF> extra_channels(metadata.m.num_extra_channels);
-      for (auto& extra_channel : extra_channels) {
-        JXL_ASSIGN_OR_RETURN(
-            extra_channel,
-            ImageF::Create(memory_manager, patch_rect.xsize(),
-                           patch_rect.ysize()));
-      }
-      ImageF* alpha = alpha_eci ? &extra_channels[alpha_idx] : nullptr;
-      ImageF* black = black_eci ? &extra_channels[black_idx] : nullptr;
-      bool has_interleaved_alpha = false;
-      JXL_RETURN_IF_ERROR(CopyColorChannels(
-          input, patch_rect, frame_info, metadata.m, pool, &color, alpha,
-          &has_interleaved_alpha));
-      JXL_RETURN_IF_ERROR(CopyExtraChannels(
-          input, patch_rect, frame_info, metadata.m, has_interleaved_alpha,
-          pool, &extra_channels));
-
-      if (frame_header.color_transform == ColorTransform::kXYB &&
-          frame_info.ib_needs_color_transform) {
-        JXL_RETURN_IF_ERROR(ToXYB(c_enc, metadata.m.IntensityTarget(), black,
-                                  pool, &color, cms, nullptr));
-      }
-      if (alpha && !alpha_eci->alpha_associated &&
-          frame_header.frame_type == FrameType::kRegularFrame &&
-          !ApplyOverride(cparams.keep_invisible, cparams.IsLossless()) &&
-          cparams.ec_resampling == cparams.resampling &&
-          !cparams.disable_perceptual_optimizations) {
-        SimplifyInvisible(&color, *alpha, cparams.IsLossless());
-      }
-
-      PixelStatsForChromacityAdjustment tile_stats;
-      tile_stats.Calc(&color, Rect(color));
-      frame_stats->dx = std::max(frame_stats->dx, tile_stats.dx);
-      frame_stats->db = std::max(frame_stats->db, tile_stats.db);
-      frame_stats->exposed_blue =
-          std::max(frame_stats->exposed_blue, tile_stats.exposed_blue);
-    }
-  }
-  return true;
 }
 
 void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
@@ -1235,9 +1152,9 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
                                  AuxOut* aux_out) {
   JXL_ENSURE((rect.xsize() % kBlockDim) == 0 &&
              (rect.ysize() % kBlockDim) == 0);
-  JXL_RETURN_IF_ERROR(LossyFrameHeuristics(
-      frame_header, enc_state, enc_modular, linear, opsin, rect, cms, pool,
-      aux_out));
+  JXL_RETURN_IF_ERROR(LossyFrameHeuristics(frame_header, enc_state, enc_modular,
+                                           linear, opsin, rect, cms, pool,
+                                           aux_out));
 
   JXL_RETURN_IF_ERROR(InitializePassesEncoder(
       frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out));
@@ -1715,17 +1632,8 @@ Status ComputeEncodingData(
                   RoundUpToBlockDim(xsize), RoundUpToBlockDim(ysize));
 
   if (enc_state.initialize_global_state && !jpeg_data) {
-    PixelStatsForChromacityAdjustment frame_pixel_stats;
-    const PixelStatsForChromacityAdjustment* frame_pixel_stats_ptr = nullptr;
-    if (frame_header.encoding == FrameEncoding::kVarDCT &&
-        !cparams.max_error_mode && cparams.speed_tier <= SpeedTier::kWombat) {
-      JXL_RETURN_IF_ERROR(ComputeFrameWidePixelStatsForChromacityAdjustment(
-          cparams, frame_info, *metadata, frame_data, frame_header, cms, pool,
-          memory_manager, &frame_pixel_stats));
-      frame_pixel_stats_ptr = &frame_pixel_stats;
-    }
     ComputeChromacityAdjustments(cparams, color, group_rect,
-                                 frame_pixel_stats_ptr, &mutable_frame_header);
+                                 &mutable_frame_header);
   }
 
   bool has_jpeg_data = (jpeg_data != nullptr);

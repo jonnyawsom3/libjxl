@@ -789,14 +789,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
-  // The state may be reused between frames; never carry a prior frame's DC
-  // chroma predictor into a new frame's first streaming chunk.
-  if (streaming_mode && initialize_global_state) {
-    enc_state->cfl_dc_multipliers_initialized = false;
-    enc_state->cfl_ytox_dc = 0;
-    enc_state->cfl_ytob_dc = 0;
-  }
-
   // Find and subtract splines.
   bool override_splines = cparams.custom_splines.HasAny();
   if (override_splines) {
@@ -884,7 +876,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   // Apply inverse-gaborish.
   if (frame_header.loop_filter.gab) {
-    float weight[3] = {1.0f, 1.0f, 1.0f};
+    // Slightly tune inverse-gaborish per channel to reduce ringing.
+    float weight[3] = {
+        1.0036278514398933f,
+        0.99406123118127299f,
+        0.99719338015886894f,
+    };
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
 
@@ -961,27 +958,15 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // Fit DC CfL over all samples in one-shot mode. In streaming mode, only the
-  // first chunk can supply the global fit before the header is emitted. Keep
-  // this fit out of subsequent chunks' block-selection decisions; applying a
-  // first-chunk estimate before analysis otherwise changes transform choices
-  // spatially and can make block costs depend on which chunk was processed.
-  if (cparams.speed_tier <= SpeedTier::kHare && !streaming_mode) {
+  // The DC CfL multipliers are serialized once in frame-global DC metadata.
+  // The streaming path only has the current chunk's samples here, so fitting
+  // them would incorrectly turn a local estimate into a frame-global transform
+  // (and can introduce chunk-dependent brightness/chroma shifts). Keep the
+  // default DC multipliers for streaming/local encoding. When the entire frame
+  // is available, retain the pre-regression full-frame fit.
+  if (!streaming_mode && cparams.speed_tier <= SpeedTier::kHare) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
-  } else if (cparams.speed_tier <= SpeedTier::kHare && streaming_mode &&
-             initialize_global_state) {
-    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
-        /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
-    enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
-    enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
-    enc_state->cfl_dc_multipliers_initialized = true;
-  } else if (cparams.speed_tier <= SpeedTier::kHare && streaming_mode &&
-             enc_state->cfl_dc_multipliers_initialized) {
-    // Apply the frame-global values after this chunk's local AC/CfL decisions,
-    // not before them. The values are signaled once and remain constant.
-    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
-    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
   }
 
   // Refine quantization levels.

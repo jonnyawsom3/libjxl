@@ -760,18 +760,24 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
     float* JXL_RESTRICT row_out = sqrsum_22_row + y * sqrsum_22_stride;
     // ignore pixels outside the image.
     // Y coordinates are relative to by0*8+y*4.
-    size_t sy = y * 4 + source_y0 > 0 ? 0 : 2;
-    size_t ey = y * 4 + source_y0 + 4 <= opsin.ysize() + 2
-                    ? 4
-                    : opsin.ysize() - y * 4 - source_y0 + 2;
+    const size_t available_y = opsin.ysize() + 2 - source_y0;
+    const size_t window_start_y = y * 4 + source_y0;
+    const size_t sy = window_start_y < 2 ? 2 - window_start_y : 0;
+    // rows_in[0..3] already refer to rows y*4..y*4+3. Keep ey relative to
+    // those four rows; using y*4+4 here indexes past rows_in near the bottom
+    // edge, which can contaminate EPF sharpness in the last tile row.
+    const size_t ey = y * 4 < available_y
+                          ? std::min<size_t>(4, available_y - y * 4)
+                          : 0;
     for (size_t x = 0; x < (bx1 - bx0) * 2 + 1; x++) {
-      // ignore pixels outside the image.
-      // X coordinates are relative to source_x0.
-      size_t sx = x * 4 + source_x0 > 0 ? x * 4 : x * 4 + 2;
-      size_t ex = x * 4 + source_x0 + 4 <= opsin.xsize() + 2
-                      ? x * 4 + 4
-                      : opsin.xsize() - source_x0 - x * 4 + 2;
-      if (ex - sx == 4 && ey - sy == 4) {
+      // Coordinates are relative to this tile's Laplacian buffer. Clip the
+      // window endpoint to the remaining valid source extent; do not subtract
+      // the window offset a second time (which underflowed at chunk edges).
+      const size_t available_x = opsin.xsize() + 2 - source_x0;
+      const size_t window_start_x = x * 4 + source_x0;
+      const size_t sx = x * 4 + (window_start_x < 2 ? 2 - window_start_x : 0);
+      const size_t ex = std::min(x * 4 + 4, available_x);
+      if (ex >= sx && ey >= sy && ex - sx == 4 && ey - sy == 4) {
         auto sum = Zero(df4);
         for (size_t iy = 0; iy < 4; iy++) {
           for (size_t ix = 0; ix < 4; ix += Lanes(df4)) {
@@ -779,7 +785,7 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
           }
         }
         row_out[x] = GetLane(Sqrt(SumOfLanes(df4, sum))) * (1.0f / 4.0f);
-      } else {
+      } else if (ex > sx && ey > sy) {
         float sum = 0;
         for (size_t iy = sy; iy < ey; iy++) {
           for (size_t ix = sx; ix < ex; ix++) {
@@ -787,6 +793,8 @@ void ProcessARControlFieldTileImpl(const FrameHeader& frame_header,
           }
         }
         row_out[x] = std::sqrt(sum / ((ex - sx) * (ey - sy)));
+      } else {
+        row_out[x] = 0.0f;
       }
     }
   }

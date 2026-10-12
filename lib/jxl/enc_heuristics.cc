@@ -789,15 +789,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
-  // The DC CfL multipliers are encoded once globally, but streaming encoding
-  // recreates the ColorCorrelationMap for each DC group. Reuse the first
-  // group's values for all later groups instead of fitting a different local
-  // transform to each chunk (which the decoder cannot reproduce).
-  if (streaming_mode && !initialize_global_state &&
-      cparams.speed_tier <= SpeedTier::kHare &&
-      enc_state->cfl_dc_multipliers_initialized) {
-    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
-    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
+  // The state may be reused between frames; never carry a prior frame's DC
+  // chroma predictor into a new frame's first streaming chunk.
+  if (streaming_mode && initialize_global_state) {
+    enc_state->cfl_dc_multipliers_initialized = false;
+    enc_state->cfl_ytox_dc = 0;
+    enc_state->cfl_ytob_dc = 0;
   }
 
   // Find and subtract splines.
@@ -887,12 +884,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   // Apply inverse-gaborish.
   if (frame_header.loop_filter.gab) {
-    // Slightly tune inverse-gaborish per channel to reduce ringing.
-    float weight[3] = {
-        1.0036278514398933f,
-        0.99406123118127299f,
-        0.99719338015886894f,
-    };
+    float weight[3] = {1.0f, 1.0f, 1.0f};
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
 
@@ -969,19 +961,27 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // Fit DC CfL once. In one-shot mode all frame samples are available. In
-  // streaming mode, the first DC group's fit is used as the frame-global fit;
-  // save it and reuse it for all subsequent groups. Fitting independently per
-  // chunk is invalid because the DC multipliers are transmitted only once.
-  if (cparams.speed_tier <= SpeedTier::kHare &&
-      (!streaming_mode || initialize_global_state)) {
+  // Fit DC CfL over all samples in one-shot mode. In streaming mode, only the
+  // first chunk can supply the global fit before the header is emitted. Keep
+  // this fit out of subsequent chunks' block-selection decisions; applying a
+  // first-chunk estimate before analysis otherwise changes transform choices
+  // spatially and can make block costs depend on which chunk was processed.
+  if (cparams.speed_tier <= SpeedTier::kHare && !streaming_mode) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
-    if (streaming_mode) {
-      enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
-      enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
-      enc_state->cfl_dc_multipliers_initialized = true;
-    }
+  } else if (cparams.speed_tier <= SpeedTier::kHare && streaming_mode &&
+             initialize_global_state) {
+    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
+        /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+    enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
+    enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
+    enc_state->cfl_dc_multipliers_initialized = true;
+  } else if (cparams.speed_tier <= SpeedTier::kHare && streaming_mode &&
+             enc_state->cfl_dc_multipliers_initialized) {
+    // Apply the frame-global values after this chunk's local AC/CfL decisions,
+    // not before them. The values are signaled once and remain constant.
+    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
+    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
   }
 
   // Refine quantization levels.

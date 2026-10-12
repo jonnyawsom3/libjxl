@@ -877,11 +877,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // Apply inverse-gaborish.
   if (frame_header.loop_filter.gab) {
     // Slightly tune inverse-gaborish per channel to reduce ringing.
-    float weight[3] = {
-        1.0036278514398933f,
-        0.99406123118127299f,
-        0.99719338015886894f,
-    };
+    // Match the Main inverse-Gaborish kernel in enc_gaborish.cc.
+    float weight[3] = {1.0f, 1.0f, 1.0f};
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
 
@@ -964,7 +961,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // (and can introduce chunk-dependent brightness/chroma shifts). Keep the
   // default DC multipliers for streaming/local encoding. When the entire frame
   // is available, retain the pre-regression full-frame fit.
-  if (!streaming_mode && cparams.speed_tier <= SpeedTier::kHare) {
+  if (cparams.speed_tier <= SpeedTier::kHare) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
   }

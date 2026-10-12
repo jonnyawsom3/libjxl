@@ -167,6 +167,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
       if (std::abs(step) < 3e-3) break;
     }
   }
+  return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
 
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,

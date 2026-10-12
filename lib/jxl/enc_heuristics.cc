@@ -789,6 +789,17 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
+  // The DC CfL multipliers are serialized once in frame-global DC metadata.
+  // Reuse the first chunk's values for all subsequent chunks; fitting new
+  // values from each local chunk would encode DC coefficients with a transform
+  // different from the one the decoder has received.
+  if (streaming_mode && !initialize_global_state &&
+      cparams.speed_tier <= SpeedTier::kHare &&
+      enc_state->cfl_dc_multipliers_initialized) {
+    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
+    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
+  }
+
   // Find and subtract splines.
   bool override_splines = cparams.custom_splines.HasAny();
   if (override_splines) {
@@ -955,15 +966,18 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // The DC CfL multipliers are serialized once in frame-global DC metadata.
-  // The streaming path only has the current chunk's samples here, so fitting
-  // them would incorrectly turn a local estimate into a frame-global transform
-  // (and can introduce chunk-dependent brightness/chroma shifts). Keep the
-  // default DC multipliers for streaming/local encoding. When the entire frame
-  // is available, retain the pre-regression full-frame fit.
-  if (cparams.speed_tier <= SpeedTier::kHare) {
+  // Fit the DC CfL multipliers once, using the first chunk in streaming mode
+  // (or the full frame in one-shot mode). These values are written in the
+  // frame-global DC metadata and must remain identical for every DC group.
+  if (cparams.speed_tier <= SpeedTier::kHare &&
+      (!streaming_mode || initialize_global_state)) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
         /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+    if (streaming_mode) {
+      enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
+      enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
+      enc_state->cfl_dc_multipliers_initialized = true;
+    }
   }
 
   // Refine quantization levels.

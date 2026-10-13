@@ -52,10 +52,6 @@ struct CfLHeuristics {
                      const ImageI* raw_quant_field, const Quantizer* quantizer,
                      bool fast, size_t thread, ColorCorrelationMap* cmap);
 
-  // Restore the global DC chroma-from-luma multipliers estimated from all
-  // blocks. These are separate from the per-tile AC multipliers.
-  Status ComputeDC(bool fast, ColorCorrelationMap* cmap);
-
   JxlMemoryManager* memory_manager;
   ImageF dc_values;
   AlignedMemory mem;

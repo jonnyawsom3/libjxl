@@ -893,127 +893,170 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
                            ThreadPool* pool) {
+  static_cast<void>(rect);
+  static_cast<void>(pool);
   const CompressParams& cparams = enc_state->cparams;
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
-  const ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageB& epf_sharpness = shared.epf_sharpness;
-  JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
-  float clamped_butteraugli = std::min(5.0f, cparams.butteraugli_distance);
+  // The 0.8.x encoder used a local Laplacian-based estimate instead of
+  // decoding the complete frame repeatedly for candidate EPF values. Keeping
+  // this estimate makes EPF selection inexpensive and avoids the stronger
+  // smoothing that can result from the newer round-trip search.
   if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
       cparams.speed_tier > SpeedTier::kWombat ||
-      frame_header.loop_filter.epf_iters == 0) {
+      frame_header.loop_filter.epf_iters == 0 || orig_opsin.xsize() == 0 ||
+      orig_opsin.ysize() == 0) {
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     return true;
   }
 
-  std::vector<uint8_t> epf_steps;
-  if (cparams.butteraugli_distance > 4.5f) {
-    epf_steps.push_back(0);
-    epf_steps.push_back(4);
-  } else {
-    epf_steps.push_back(0);
-    epf_steps.push_back(2);
-    epf_steps.push_back(7);
+  const size_t width = orig_opsin.xsize();
+  const size_t height = orig_opsin.ysize();
+  const size_t blocks_x =
+      std::min(frame_dim.xsize_blocks, epf_sharpness.xsize());
+  const size_t blocks_y =
+      std::min(frame_dim.ysize_blocks, epf_sharpness.ysize());
+  if (blocks_x == 0 || blocks_y == 0) {
+    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
+    return true;
   }
-  static const int kNumEPFVals = 8;
-  size_t epf_steps_lut[kNumEPFVals] = {0};
-  {
-    for (size_t i = 0; i < epf_steps.size(); ++i) {
-      epf_steps_lut[epf_steps[i]] = i;
+
+  // Squared 3x3 Laplacian, using the weights in the original 0.8.x control
+  // field heuristic.
+  const float channel_weights[3] = {4.35f, 4.35f, 0.287f};
+  std::vector<float> laplacian_sqrsum(width * height, 0.0f);
+  const auto pixel = [&](size_t c, size_t x, size_t y) {
+    return orig_opsin.ConstPlaneRow(c, y)[x];
+  };
+  for (size_t y = 0; y < height; ++y) {
+    const size_t py = y > 0 ? y - 1 : y;
+    const size_t ny = y + 1 < height ? y + 1 : y;
+    for (size_t x = 0; x < width; ++x) {
+      const size_t px = x > 0 ? x - 1 : x;
+      const size_t nx = x + 1 < width ? x + 1 : x;
+      float sum = 0.0f;
+      for (size_t c = 0; c < 3; ++c) {
+        const float w = channel_weights[c];
+        const float center = pixel(c, x, y);
+        const float neighbors =
+            pixel(c, px, py) + pixel(c, x, py) + pixel(c, nx, py) +
+            pixel(c, px, y) + pixel(c, nx, y) + pixel(c, px, ny) +
+            pixel(c, x, ny) + pixel(c, nx, ny);
+        const float lap = w * center - (w * 0.125f) * neighbors;
+        sum += lap * lap;
+      }
+      laplacian_sqrsum[y * width + x] = sum;
     }
   }
-  std::array<ImageF, kNumEPFVals> error_images;
-  for (uint8_t val : epf_steps) {
-    FillPlane(val, &epf_sharpness, Rect(epf_sharpness));
-    JXL_ASSIGN_OR_RETURN(
-        Image3F decoded,
-        ReconstructImage(frame_header, shared, enc_state->coeffs, pool));
-    JXL_ASSIGN_OR_RETURN(error_images[val],
-                         ImageF::Create(memory_manager, frame_dim.xsize_blocks,
-                                        frame_dim.ysize_blocks));
-    for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
-      float* error_row = error_images[val].Row(by);
-      for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
-        error_row[bx] = ComputeBlockL2Distance(
-            orig_opsin, decoded, initial_quant_masking1x1, by, bx);
+
+  const size_t grid_x = 2 * blocks_x;
+  const size_t grid_y = 2 * blocks_y;
+  std::vector<float> sq00(grid_x * grid_y, 0.0f);
+  std::vector<float> sq22((grid_x + 1) * (grid_y + 1), 0.0f);
+
+  const auto rms_cell = [&](int x0, int y0) {
+    const size_t sx = static_cast<size_t>(std::max(0, x0));
+    const size_t sy = static_cast<size_t>(std::max(0, y0));
+    const size_t ex =
+        std::min(width, static_cast<size_t>(std::max(0, x0 + 4)));
+    const size_t ey =
+        std::min(height, static_cast<size_t>(std::max(0, y0 + 4)));
+    if (sx >= ex || sy >= ey) return 0.0f;
+    float sum = 0.0f;
+    for (size_t y = sy; y < ey; ++y) {
+      for (size_t x = sx; x < ex; ++x) {
+        sum += laplacian_sqrsum[y * width + x];
       }
     }
-  }
-  std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
-  std::vector<size_t> totals(9, 1);
-  static const float kFavorNoSmoothing = 0.99;
-  for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
-    uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
-    uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
-    for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
-      uint8_t best_val = 0;
-      float best_error = std::numeric_limits<float>::max();
-      uint8_t top_val = by > 0 ? prev_row[bx] : 0;
-      uint8_t left_val = bx > 0 ? out_row[bx - 1] : 0;
-      float top_error = error_images[top_val].Row(by)[bx];
-      float left_error = error_images[left_val].Row(by)[bx];
-      for (uint8_t val : epf_steps) {
-        float error = error_images[val].Row(by)[bx];
-        if (val == 0) {
-          error *= kFavorNoSmoothing;
-        }
-        if (error < best_error) {
-          best_val = val;
-          best_error = error;
-        }
-      }
-      if (best_error < std::min(top_error, left_error)) {
-        out_row[bx] = best_val;
-      } else if (top_error < left_error) {
-        out_row[bx] = top_val;
-      } else {
-        out_row[bx] = left_val;
-      }
-      int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
-      ++histo[context][out_row[bx]];
-      ++totals[context];
+    return std::sqrt(sum / static_cast<float>((ex - sx) * (ey - sy)));
+  };
+
+  for (size_t gy = 0; gy < grid_y; ++gy) {
+    for (size_t gx = 0; gx < grid_x; ++gx) {
+      sq00[gy * grid_x + gx] =
+          rms_cell(static_cast<int>(gx * 4), static_cast<int>(gy * 4));
     }
   }
-  const float c3base = 0.98017198824148288;
-  const float c3clamp = 0.85970338919928291;
-  const float c3 = std::max(c3clamp, std::pow(c3base, clamped_butteraugli));
-  static const float c5 = 0.1087690359555803;
-  float mul[3 * 3 * 3] = {0};
-  for (uint8_t top_val : epf_steps) {
-    for (uint8_t left_val : epf_steps) {
-      for (uint8_t val : epf_steps) {
-        int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
-        const auto& ctx_histo = histo[context];
-        const int mulix = epf_steps_lut[val] + 3 * context;
-        mul[mulix] =
-            1.0 / (1.0 + c5 * std::log1p(ctx_histo[val] / totals[context]) /
-                             clamped_butteraugli);
-        if (val == 0) {
-          mul[mulix] *= c3;
-        }
-      }
+  const size_t grid22_x = grid_x + 1;
+  for (size_t gy = 0; gy <= grid_y; ++gy) {
+    for (size_t gx = 0; gx <= grid_x; ++gx) {
+      sq22[gy * grid22_x + gx] =
+          rms_cell(static_cast<int>(gx * 4) - 2,
+                   static_cast<int>(gy * 4) - 2);
     }
   }
-  for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
-    uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
-    uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
-    for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
-      uint8_t best_val = 0;
-      float best_error = std::numeric_limits<float>::max();
-      uint8_t top_val = by > 0 ? prev_row[bx] : 0;
-      uint8_t left_val = bx > 0 ? out_row[bx - 1] : 0;
-      int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
-      for (uint8_t val : epf_steps) {
-        int mulix = epf_steps_lut[val] + 3 * context;
-        float error = error_images[val].Row(by)[bx] * mul[mulix];
-        if (error < best_error) {
-          best_val = val;
-          best_error = error;
+
+  const auto s00 = [&](size_t by, size_t bx) {
+    return sq00[by * grid_x + bx];
+  };
+  const auto s22 = [&](size_t by, size_t bx) {
+    return sq22[by * grid22_x + bx];
+  };
+  // This function is called once for the current encoding rect (the entire
+  // frame in buffered mode, one DC group in streaming mode). Use the current
+  // rect's quant field and scale; do not attempt to accumulate the old
+  // whole-frame statistics separately for each streamed group.
+  const ImageI& raw_quant_field = shared.raw_quant_field;
+  const float quant_scale = shared.quantizer.Scale();
+  const float kDeltaLimit = 3.2f;
+  const float kSmoothLimit = 0.085f;
+
+  for (size_t by = 0; by < blocks_y; ++by) {
+    AcStrategyRow acs_row = shared.ac_strategy.ConstRow(by);
+    const int32_t* const quant_row = raw_quant_field.Row(by);
+    for (size_t bx = 0; bx < blocks_x; ++bx) {
+      const AcStrategy acs = acs_row[bx];
+      if (!acs.IsFirstBlock()) continue;
+
+      const float q = std::max(1.0e-6f,
+                                static_cast<float>(quant_row[bx]) * quant_scale);
+      const float quant_val = 1.0f / q;
+      float integral_transform = 0.0f;
+      for (size_t iy = 0; iy < acs.covered_blocks_y() * 2; ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x() * 2; ++ix) {
+          const float v = s00(2 * by + iy, 2 * bx + ix);
+          integral_transform += v * v;
         }
       }
-      out_row[bx] = best_val;
+      integral_transform /= static_cast<float>(
+          4 * acs.covered_blocks_x() * acs.covered_blocks_y());
+      integral_transform = std::sqrt(integral_transform);
+
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
+          const size_t gx = 2 * (bx + ix);
+          const size_t gy = 2 * (by + iy);
+          const float min00 = std::min(
+              std::min(s00(gy, gx), s00(gy, gx + 1)),
+              std::min(s00(gy + 1, gx), s00(gy + 1, gx + 1)));
+          const float minval = std::min(min00, s22(gy + 1, gx + 1));
+          const float minval2 = std::min(
+              std::min(std::min(s22(gy, gx), s22(gy, gx + 1)),
+                       std::min(s22(gy, gx + 2), s22(gy + 1, gx))),
+              std::min(std::min(s22(gy + 1, gx + 1), s22(gy + 1, gx + 2)),
+                       std::min(std::min(s22(gy + 2, gx), s22(gy + 2, gx + 1)),
+                                s22(gy + 2, gx + 2))));
+          const float minval3 = std::min(minval, minval2);
+          const float blended_min =
+              0.125f * minval + 0.625f * minval3 +
+              0.125f * std::min(1.5f * minval3, s22(gy + 1, gx + 1)) +
+              0.125f * minval2;
+
+          const float bias = 0.0625f * quant_val;
+          const float delta =
+              (integral_transform + (kDeltaLimit + 0.05f) * bias) /
+              (blended_min + bias);
+          int out = delta > kDeltaLimit ? 4 : 0;
+          const float threshold = 0.0625f * quant_val;
+          const float smooth =
+              0.20f * (s00(gy, gx) + s00(gy, gx + 1) + s00(gy + 1, gx) +
+                       s00(gy + 1, gx + 1) + blended_min);
+          if (smooth < kSmoothLimit * threshold) out = 4;
+          epf_sharpness.Row(by + iy)[bx + ix] = static_cast<uint8_t>(out);
+        }
+      }
     }
   }
 
@@ -1103,7 +1146,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(initial_quant_masking,
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
-    float q = 0.79 / cparams.butteraugli_distance;
+    float q = 0.841f / cparams.butteraugli_distance;
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
@@ -1118,7 +1161,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
     if (!frame_header.loop_filter.gab) {
-      butteraugli_distance_for_iqf *= 0.62f;
+      butteraugli_distance_for_iqf *= 0.73f;
     }
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
@@ -1135,10 +1178,11 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   if (frame_header.loop_filter.gab) {
     // Changing the weight here to 0.99f would help to reduce ringing in
     // generation loss.
+    const float kInverseGaborishWeight = 0.9908511000000001f;
     float weight[3] = {
-        1.0f,
-        1.0f,
-        1.0f,
+        kInverseGaborishWeight,
+        kInverseGaborishWeight,
+        kInverseGaborishWeight,
     };
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
@@ -1172,7 +1216,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
           r, *opsin, rect, matrices,
           /*ac_strategy=*/nullptr,
           /*raw_quant_field=*/nullptr,
-          /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+          /*quantizer=*/nullptr, cparams, /*fast=*/false, thread, &cmap));
     }
 
     // Choose block sizes.
@@ -1191,7 +1235,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     if (cparams.speed_tier <= SpeedTier::kHare) {
       JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
           r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field, &quantizer,
-          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap));
+          cparams, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread,
+          &cmap));
     }
     return true;
   };

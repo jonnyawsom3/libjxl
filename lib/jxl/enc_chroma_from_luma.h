@@ -29,6 +29,7 @@ namespace jxl {
 struct AuxOut;
 enum class LayerType : uint8_t;
 class Quantizer;
+struct CompressParams;
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
                                 BitWriter* writer, LayerType layer,
@@ -50,7 +51,8 @@ struct CfLHeuristics {
                      const Rect& opsin_rect, const DequantMatrices& dequant,
                      const AcStrategyImage* ac_strategy,
                      const ImageI* raw_quant_field, const Quantizer* quantizer,
-                     bool fast, size_t thread, ColorCorrelationMap* cmap);
+                     const CompressParams& cparams, bool fast, size_t thread,
+                     ColorCorrelationMap* cmap);
 
   JxlMemoryManager* memory_manager;
   ImageF dc_values;
@@ -63,7 +65,7 @@ struct CfLHeuristics {
     const size_t dc_scratch_size =
         3 * AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
     return AcStrategy::kMaxCoeffArea * 3        // Blocks
-           + kColorTileDim * kColorTileDim * 4  // AC coeff storage
+           + kColorTileDim * kColorTileDim * 5  // AC coeff + weights
            + AcStrategy::kMaxCoeffArea * 2      // Scratch space
            + dct_scratch_size + dc_scratch_size;
   }

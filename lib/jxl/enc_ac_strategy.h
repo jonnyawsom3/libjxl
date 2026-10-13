@@ -43,7 +43,11 @@ struct ACSConfig {
   const float* JXL_RESTRICT src_rows[3];
   size_t src_stride;
   float info_loss_multiplier;
+  float info_loss_multiplier2;
+  float cost1;
+  float cost2;
   float cost_delta;
+  float base_entropy;
   float zeros_mul;
   const float& Pixel(size_t c, size_t x, size_t y) const {
     return src_rows[c][y * src_stride + x];

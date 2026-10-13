@@ -71,6 +71,7 @@ namespace {
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::AbsDiff;
 using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::Div;
 using hwy::HWY_NAMESPACE::And;
 using hwy::HWY_NAMESPACE::Gt;
 using hwy::HWY_NAMESPACE::IfThenElseZero;
@@ -93,14 +94,14 @@ float ComputeMaskForAcStrategyUse(const float out_val) {
 
 template <class D, class V>
 V ComputeMask(const D d, const V out_val) {
-  const auto kBase = Set(d, -0.7647f);
-  const auto kMul4 = Set(d, 9.4708735624378946f);
-  const auto kMul2 = Set(d, 17.35036561631863f);
-  const auto kOffset2 = Set(d, 302.59587815579727f);
-  const auto kMul3 = Set(d, 6.7943250517376494f);
-  const auto kOffset3 = Set(d, 3.7179635626140772f);
+  const auto kBase = Set(d, -0.74174993f);
+  const auto kMul4 = Set(d, 3.2353257320940401f);
+  const auto kMul2 = Set(d, 12.906028311180409f);
+  const auto kOffset2 = Set(d, 305.04035728311436f);
+  const auto kMul3 = Set(d, 5.0220313103171232f);
+  const auto kOffset3 = Set(d, 2.1925739705298404f);
   const auto kOffset4 = Mul(Set(d, 0.25f), kOffset3);
-  const auto kMul0 = Set(d, 0.80061762862741759f);
+  const auto kMul0 = Set(d, 0.74760422233706747f);
   const auto k1 = Set(d, 1.0f);
 
   // Avoid division by zero.
@@ -117,11 +118,11 @@ V ComputeMask(const D d, const V out_val) {
 }
 
 // mul and mul2 represent a scaling difference between jxl and butteraugli.
-const float kSGmul = 226.77216153508914f;
-const float kSGmul2 = 1.0f / 73.377132366608819f;
+static const float kSGmul = 226.0480446705883f;
+static const float kSGmul2 = 1.0f / 73.377132366608819f;
 // Includes correction factor for std::log -> log2.
-const float kSGRetMul = kSGmul2 * 18.6580932135f * kInvLog2e;
-const float kSGVOffset = 7.7825991679894591f;
+static const float kSGRetMul = kSGmul2 * 18.6580932135f * 0.693147181f;
+static const float kSGVOffset = 7.14672470003f;
 
 template <bool invert, typename D, typename V>
 V RatioOfDerivativesOfCubicRootToSimpleGamma(const D d, V v) {
@@ -134,8 +135,8 @@ V RatioOfDerivativesOfCubicRootToSimpleGamma(const D d, V v) {
   float kEpsilon = 1e-2;
   v = ZeroIfNegative(v);
   const auto kNumMul = Set(d, kSGRetMul * 3 * kSGmul);
-  const auto kVOffset = Set(d, kSGVOffset * kInvLog2e + kEpsilon);
-  const auto kDenMul = Set(d, kInvLog2e * kSGmul);
+  const auto kVOffset = Set(d, kSGVOffset * 0.693147181f + kEpsilon);
+  const auto kDenMul = Set(d, 0.693147181f * kSGmul);
 
   const auto v2 = Mul(v, v);
 
@@ -184,164 +185,143 @@ V GammaModulation(const D d, const size_t x, const size_t y,
   JXL_DASSERT(kBias > jxl::cms::kOpsinAbsorbanceBias[1]);
   JXL_DASSERT(kBias > jxl::cms::kOpsinAbsorbanceBias[2]);
   auto overall_ratio = Zero(d);
-  auto bias = Set(d, kBias);
+  const auto bias = Set(d, kBias);
+  const auto half = Set(d, 0.5f);
   for (size_t dy = 0; dy < 8; ++dy) {
     const float* const JXL_RESTRICT row_in_x = rect.ConstRow(xyb_x, y + dy);
     const float* const JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy);
     for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
       const auto iny = Add(Load(d, row_in_y + x + dx), bias);
       const auto inx = Load(d, row_in_x + x + dx);
-
       const auto r = Sub(iny, inx);
       const auto ratio_r =
           RatioOfDerivativesOfCubicRootToSimpleGamma</*invert=*/true>(d, r);
-      overall_ratio = Add(overall_ratio, ratio_r);
-
       const auto g = Add(iny, inx);
       const auto ratio_g =
           RatioOfDerivativesOfCubicRootToSimpleGamma</*invert=*/true>(d, g);
-      overall_ratio = Add(overall_ratio, ratio_g);
+      overall_ratio = Add(overall_ratio, Mul(half, Add(ratio_r, ratio_g)));
     }
   }
-  overall_ratio = Mul(SumOfLanes(d, overall_ratio), Set(d, 0.5f / 64));
-  // ideally -1.0, but likely optimal correction adds some entropy, so slightly
-  // less than that.
-  const auto kGamma = Set(d, 0.1005613337192697f);
-  return MulAdd(kGamma, FastLog2f(d, overall_ratio), out_val);
+  overall_ratio = Mul(SumOfLanes(d, overall_ratio), Set(d, 1.0f / 64));
+  // Keep the 0.8.x gamma compensation curve.
+  const auto kGam = Set(d, -0.15526878023684174f * 0.693147180559945f);
+  return MulAdd(kGam, FastLog2f(d, overall_ratio), out_val);
 }
 
-// Change precision in 8x8 blocks that have significant amounts of blue
-// content (but are not close to solid blue).
-// This is based on the idea that M and L cone activations saturate the
-// S (blue) receptors, and the S reception becomes more important when
-// both M and L levels are low. In that case M and L receptors may be
-// observing S-spectra instead and viewing them with higher spatial
-// accuracy, justifying spending more bits here.
+// Change precision in 8x8 blocks containing red or blue content. This is the
+// 0.8.x two-colour modulation, retained with the modern group-local Rect API.
 template <class D, class V>
-V BlueModulation(const D d, const size_t x, const size_t y,
-                 const ImageF& planex, const ImageF& planey,
-                 const ImageF& planeb, const Rect& rect, const V out_val) {
-  auto sum = Zero(d);
-  static const float kLimit = 0.010474084867598155;
-  static const float kOffset = 0.0031994768654636393;
+V ColorModulation(const D d, const size_t x, const size_t y,
+                  const ImageF& xyb_x, const ImageF& xyb_y,
+                  const ImageF& xyb_b, const Rect& rect,
+                  const double butteraugli_target, V out_val) {
+  static const float kStrengthMul = 3.0f;
+  static const float kRedRampStart = 0.045f;
+  static const float kRedRampLength = 0.09f;
+  static const float kBlueRampLength = 0.086890611400405895f;
+  static const float kBlueRampStart = 0.26973418507870539f;
+  const float strength = kStrengthMul * (1.0f - 0.25f * butteraugli_target);
+  if (strength < 0.0f) return out_val;
+  const float red_strength = strength * 6.5f;
+  const float blue_strength = strength;
+  out_val = Add(out_val, Set(d, strength * -0.007f));
+  auto blue_coverage = Zero(d);
+  auto red_coverage = Zero(d);
+  const auto bias_y = Set(d, 0.15f);
   for (size_t dy = 0; dy < 8; ++dy) {
-    const float* JXL_RESTRICT row_in_x = rect.ConstRow(planex, y + dy) + x;
-    const float* JXL_RESTRICT row_in_y = rect.ConstRow(planey, y + dy) + x;
-    const float* JXL_RESTRICT row_in_b = rect.ConstRow(planeb, y + dy) + x;
+    const float* const JXL_RESTRICT row_in_x = rect.ConstRow(xyb_x, y + dy);
+    const float* const JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy);
+    const float* const JXL_RESTRICT row_in_b = rect.ConstRow(xyb_b, y + dy);
     for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
-      const auto p_x = Load(d, row_in_x + dx);
-      const auto p_b = Load(d, row_in_b + dx);
-      const auto p_y_raw = Add(Load(d, row_in_y + dx), Set(d, kOffset));
-      const auto p_y_effective = Add(p_y_raw, Abs(p_x));
-      sum = Add(sum,
-                IfThenElseZero(Gt(p_b, p_y_effective),
-                               Min(Sub(p_b, p_y_effective), Set(d, kLimit))));
+      const auto pixel_y = Load(d, row_in_y + x + dx);
+      const auto pixel_xpy = Div(Abs(Load(d, row_in_x + x + dx)),
+                                 Max(pixel_y, bias_y));
+      const auto pixel_x = Max(Set(d, 0.0f),
+                               Sub(pixel_xpy, Set(d, kRedRampStart)));
+      const auto pixel_b = Max(
+          Set(d, 0.0f),
+          Sub(Load(d, row_in_b + x + dx),
+              Add(pixel_y, Set(d, kBlueRampStart))));
+      red_coverage = Add(red_coverage,
+                         Min(pixel_x, Set(d, kRedRampLength)));
+      blue_coverage = Add(blue_coverage,
+                          Min(pixel_b, Set(d, kBlueRampLength)));
     }
   }
-  static const float kMul = 0.90590804735610064;
-  sum = SumOfLanes(d, sum);
-  float scalar_sum = GetLane(sum);
-  // If it is all blue, don't boost the quantization.
-  // All blue likely means low frequency blue. Let's not make the most
-  // perfect sky ever.
-  if (scalar_sum >= 32 * kLimit) {
-    scalar_sum = 64 * kLimit - scalar_sum;
-  }
-  static const float kMaxLimit = 15.463398341612438;
-  if (scalar_sum >= kMaxLimit * kLimit) {
-    scalar_sum = kMaxLimit * kLimit;
-  }
-  scalar_sum *= kMul;
-  return Add(Set(d, scalar_sum), out_val);
+  static const float ratio = 28.0f;
+  auto overall_red_coverage = SumOfLanes(d, red_coverage);
+  overall_red_coverage =
+      Min(overall_red_coverage, Set(d, ratio * kRedRampLength));
+  overall_red_coverage =
+      Mul(overall_red_coverage, Set(d, red_strength / ratio));
+  auto overall_blue_coverage = SumOfLanes(d, blue_coverage);
+  overall_blue_coverage =
+      Min(overall_blue_coverage, Set(d, ratio * kBlueRampLength));
+  overall_blue_coverage =
+      Mul(overall_blue_coverage, Set(d, blue_strength / ratio));
+  return Add(overall_red_coverage, Add(overall_blue_coverage, out_val));
 }
 
-// Change precision in 8x8 blocks that have high frequency content.
 template <class D, class V>
 V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
                const Rect& rect, const V out_val) {
-  // Zero out the invalid differences for the rightmost value per row.
   const Rebind<uint32_t, D> du;
   HWY_ALIGN constexpr uint32_t kMaskRight[kBlockDim] = {~0u, ~0u, ~0u, ~0u,
                                                         ~0u, ~0u, ~0u, 0};
-
-  // Sums of deltas of y and x components between (approximate)
-  // 4-connected pixels.
-  auto sum_y = Zero(d);
-  static const float valmin_y = 0.0206;
-  auto valminv_y = Set(d, valmin_y);
+  auto sum = Zero(d);
   for (size_t dy = 0; dy < 8; ++dy) {
-    const float* JXL_RESTRICT row_in_y = rect.ConstRow(xyb_y, y + dy) + x;
-    const float* JXL_RESTRICT row_in_y_next =
-        dy == 7 ? row_in_y : rect.ConstRow(xyb_y, y + dy + 1) + x;
-
-    // In SCALAR, there is no guarantee of having extra row padding.
-    // Hence, we need to ensure we don't access pixels outside the row itself.
-    // In SIMD modes, however, rows are padded, so it's safe to access one
-    // garbage value after the row. The vector then gets masked with kMaskRight
-    // to remove the influence of that value.
+    const float* JXL_RESTRICT row_in = rect.ConstRow(xyb_y, y + dy) + x;
+    const float* JXL_RESTRICT row_in_next =
+        dy == 7 ? row_in : rect.ConstRow(xyb_y, y + dy + 1) + x;
 #if HWY_TARGET != HWY_SCALAR
     for (size_t dx = 0; dx < 8; dx += Lanes(d)) {
 #else
     for (size_t dx = 0; dx < 7; dx += Lanes(d)) {
 #endif
+      const auto p = Load(d, row_in + dx);
+      const auto pr = LoadU(d, row_in + dx + 1);
       const auto mask = BitCast(d, Load(du, kMaskRight + dx));
-      {
-        const auto p_y = Load(d, row_in_y + dx);
-        const auto pr_y = LoadU(d, row_in_y + dx + 1);
-        sum_y = Add(sum_y, And(mask, Min(valminv_y, AbsDiff(p_y, pr_y))));
-        const auto pd_y = Load(d, row_in_y_next + dx);
-        sum_y = Add(sum_y, Min(valminv_y, AbsDiff(p_y, pd_y)));
-      }
+      sum = Add(sum, And(mask, AbsDiff(p, pr)));
+      const auto pd = Load(d, row_in_next + dx);
+      sum = Add(sum, AbsDiff(p, pd));
     }
 #if HWY_TARGET == HWY_SCALAR
-    const auto p_y = Load(d, row_in_y + 7);
-    const auto pd_y = Load(d, row_in_y_next + 7);
-    sum_y = Add(sum_y, Min(valminv_y, AbsDiff(p_y, pd_y)));
+    const auto p = Load(d, row_in + 7);
+    const auto pd = Load(d, row_in_next + 7);
+    sum = Add(sum, AbsDiff(p, pd));
 #endif
   }
-  static const float kMul_y = -0.38;
-  sum_y = SumOfLanes(d, sum_y);
-
-  float scalar_sum_y = GetLane(sum_y);
-  scalar_sum_y *= kMul_y;
-
-  // higher value -> more bpp
-  float kOffset = 0.42;
-  scalar_sum_y += kOffset;
-
-  return Add(Set(d, scalar_sum_y), out_val);
+  sum = SumOfLanes(d, sum);
+  return MulAdd(sum, Set(d, -2.0052193233688884f / 112), out_val);
 }
 
 void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                          const ImageF& xyb_y, const ImageF& xyb_b,
                          const Rect& rect_in, const float scale,
                          const Rect& rect_out, ImageF* out) {
-  float base_level = 0.48f * scale;
-  float kDampenRampStart = 2.0f;
-  float kDampenRampEnd = 14.0f;
+  const float base_level = 0.48f * scale;
+  const float kDampenRampStart = 2.0f;
+  const float kDampenRampEnd = 14.0f;
   float dampen = 1.0f;
   if (butteraugli_target >= kDampenRampStart) {
     dampen = 1.0f - ((butteraugli_target - kDampenRampStart) /
                      (kDampenRampEnd - kDampenRampStart));
-    if (dampen < 0) {
-      dampen = 0;
-    }
+    if (dampen < 0.0f) dampen = 0.0f;
   }
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
-  for (size_t iy = rect_out.y0(); iy < rect_out.y1(); iy++) {
+  for (size_t iy = rect_out.y0(); iy < rect_out.y1(); ++iy) {
     const size_t y = iy * 8;
     float* const JXL_RESTRICT row_out = out->Row(iy);
     const HWY_CAPPED(float, kBlockDim) df;
-    for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
-      size_t x = ix * 8;
-      auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
-      mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
-      auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
-      // We want multiplicative quantization field, so everything
-      // until this point has been modulating the exponent.
+    for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ++ix) {
+      const size_t x = ix * 8;
+      auto out_val = Set(df, row_out[ix]);
+      out_val = ComputeMask(df, out_val);
+      out_val = HfModulation(df, x, y, xyb_y, rect_in, out_val);
+      out_val = ColorModulation(df, x, y, xyb_x, xyb_y, xyb_b, rect_in,
+                                butteraugli_target, out_val);
+      out_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, out_val);
       row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
     }
   }
@@ -349,8 +329,8 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
 
 template <typename D, typename V>
 V MaskingSqrt(const D d, V v) {
-  static const float kLogOffset = 27.505837037000106f;
-  static const float kMul = 211.66567973503678f;
+  static const float kLogOffset = 28.0f;
+  static const float kMul = 211.50759899638012f;
   const auto mul_v = Set(d, kMul * 1e8);
   const auto offset_v = Set(d, kLogOffset);
   return Mul(Set(d, 0.25f), Sqrt(MulAdd(v, Sqrt(mul_v), offset_v)));
@@ -394,22 +374,8 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect,
   static_assert(kStep == 1, "Step must be 1");
   JXL_ENSURE(to_rect.xsize() * 2 == from_rect.xsize());
   JXL_ENSURE(to_rect.ysize() * 2 == from_rect.ysize());
-  static const float kMulBase[4] = { 0.125, 0.1, 0.09, 0.06 };
-  static const float kMulAdd[4] = { 0.0, -0.1, -0.09, -0.06 };
-  float mul = 0.0;
-  if (butteraugli_target < 2.0f) {
-    mul = (2.0f - butteraugli_target) * (1.0f / 2.0f);
-  }
-  float kMul[4] = { 0 };
-  float norm_sum = 0.0;
-  for (size_t ii = 0; ii < 4; ++ii) {
-    kMul[ii] = kMulBase[ii] + mul * kMulAdd[ii];
-    norm_sum += kMul[ii];
-  }
-  static const float kTotal = 0.29959705784054957;
-  for (size_t ii = 0; ii < 4; ++ii) {
-    kMul[ii] *= kTotal / norm_sum;
-  }
+  static_cast<void>(butteraugli_target);
+  static const float kMul[4] = {0.125f, 0.075f, 0.06f, 0.05f};
   for (size_t fy = 0; fy < from_rect.ysize(); ++fy) {
     size_t y = fy + from_rect.y0();
     size_t ym1 = y >= kStep ? y - kStep : y;
@@ -437,7 +403,8 @@ Status FuzzyErosion(const float butteraugli_target, const Rect& from_rect,
       StoreMin4(rowb[x], min[0], min[1], min[2], min[3]);
       StoreMin4(rowb[xp1], min[0], min[1], min[2], min[3]);
 
-      float v = kMul[0] * min[0] + kMul[1] * min[1] + kMul[2] * min[2] + kMul[3] * min[3];
+      const float v = kMul[0] * min[0] + kMul[1] * min[1] +
+                      kMul[2] * min[2] + kMul[3] * min[3];
       if (fx % 2 == 0 && fy % 2 == 0) {
         row_out[fx / 2] = v;
       } else {
@@ -832,9 +799,9 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
   return tile_distmap;
 }
 
-const float kDcQuantPow = 0.83f;
-const float kDcQuant = 1.095924047623553f;
-const float kAcQuant = 0.765f;
+constexpr float kDcQuantPow = 0.66f;
+static const float kDcQuant = 1.1f;
+static const float kAcQuant = 0.841f;
 
 // Computes the decoded image for a given set of compression parameters.
 StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
@@ -979,7 +946,7 @@ Status FindBestQuantization(const FrameHeader& frame_header,
 
   constexpr int kOriginalComparisonRound = 1;
   int iters = kDefaultButteraugliIters;
-  if (cparams.speed_tier <= SpeedTier::kTortoise) {
+  if (cparams.speed_tier == SpeedTier::kTortoise) {
     iters = kMaxButteraugliIters;
   }
   for (int i = 0; i < iters + 1; ++i) {
@@ -1197,48 +1164,26 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
 
 Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
                         float butteraugli_target, ImageF* quant_field) {
-  // Replace the whole quant_field in non-8x8 blocks with the maximum of each
-  // 8x8 block.
-  size_t stride = quant_field->PixelsPerRow();
-
-  // At low distances it is great to use max, but mean works better
-  // at high distances. We interpolate between them for a distance
-  // range.
-  float mean_max_mixer = 1.0f;
-  {
-    static const float kLimit = 1.54138f;
-    static const float kMul = 0.56391f;
-    static const float kMin = 0.0f;
-    if (butteraugli_target > kLimit) {
-      mean_max_mixer -= (butteraugli_target - kLimit) * kMul;
-      if (mean_max_mixer < kMin) {
-        mean_max_mixer = kMin;
-      }
-    }
-  }
+  static_cast<void>(butteraugli_target);
+  // Replace every block covered by a larger AC strategy with the maximum
+  // quantization value for that strategy, as in 0.8.x.
+  const size_t stride = quant_field->PixelsPerRow();
   for (size_t y = 0; y < rect.ysize(); ++y) {
     AcStrategyRow ac_strategy_row = ac_strategy.ConstRow(rect, y);
     float* JXL_RESTRICT quant_row = rect.Row(quant_field, y);
     for (size_t x = 0; x < rect.xsize(); ++x) {
-      AcStrategy acs = ac_strategy_row[x];
+      const AcStrategy acs = ac_strategy_row[x];
       if (!acs.IsFirstBlock()) continue;
       JXL_ENSURE(x + acs.covered_blocks_x() <= quant_field->xsize());
       JXL_ENSURE(y + acs.covered_blocks_y() <= quant_field->ysize());
       float max = quant_row[x];
-      float mean = 0.0;
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          mean += quant_row[x + ix + iy * stride];
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
           max = std::max(quant_row[x + ix + iy * stride], max);
         }
       }
-      mean /= acs.covered_blocks_y() * acs.covered_blocks_x();
-      if (acs.covered_blocks_y() * acs.covered_blocks_x() >= 4) {
-        max *= mean_max_mixer;
-        max += (1.0f - mean_max_mixer) * mean;
-      }
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
           quant_row[x + ix + iy * stride] = max;
         }
       }
@@ -1248,7 +1193,7 @@ Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
 }
 
 float InitialQuantDC(float butteraugli_target) {
-  const float kDcMul = 0.3;  // Butteraugli target where non-linearity kicks in.
+  const float kDcMul = 1.5f;  // Butteraugli target where non-linearity kicks in.
   const float butteraugli_target_dc = std::max<float>(
       0.5f * butteraugli_target,
       std::min<float>(butteraugli_target,

@@ -9,6 +9,7 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,10 @@
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/dct_util.h"
+#include "lib/jxl/dec_cache.h"
+#include "lib/jxl/dec_group.h"
+#include "lib/jxl/dec_noise.h"
+#include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/enc_ac_strategy.h"
 #include "lib/jxl/enc_adaptive_quantization.h"
 #include "lib/jxl/enc_cache.h"
@@ -55,6 +60,7 @@
 #include "lib/jxl/memory_manager_internal.h"
 #include "lib/jxl/passes_state.h"
 #include "lib/jxl/quant_weights.h"
+#include "lib/jxl/render_pipeline/render_pipeline.h"
 
 namespace jxl {
 
@@ -769,6 +775,292 @@ Status DownsampleImage2_Iterative(Image3F* opsin) {
   return true;
 }
 
+StatusOr<Image3F> ReconstructImage(
+    const FrameHeader& orig_frame_header, const PassesSharedState& shared,
+    const std::vector<std::unique_ptr<ACImage>>& coeffs, ThreadPool* pool) {
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  JxlMemoryManager* memory_manager = shared.memory_manager;
+
+  FrameHeader frame_header = orig_frame_header;
+  frame_header.UpdateFlag(shared.image_features.patches.HasAny(),
+                          FrameHeader::kPatches);
+  frame_header.UpdateFlag(shared.image_features.splines.HasAny(),
+                          FrameHeader::kSplines);
+  frame_header.color_transform = ColorTransform::kNone;
+
+  auto metadata = jxl::make_unique<CodecMetadata>();
+  *metadata = *frame_header.nonserialized_metadata;
+  metadata->m.extra_channel_info.clear();
+  metadata->m.num_extra_channels = metadata->m.extra_channel_info.size();
+  frame_header.nonserialized_metadata = metadata.get();
+  frame_header.extra_channel_upsampling.clear();
+
+  const bool is_gray = shared.metadata->m.color_encoding.IsGray();
+  auto dec_state = jxl::make_unique<PassesDecoderState>(memory_manager);
+  JXL_RETURN_IF_ERROR(
+      dec_state->output_encoding_info.SetFromMetadata(*shared.metadata));
+  JXL_RETURN_IF_ERROR(dec_state->output_encoding_info.MaybeSetColorEncoding(
+      ColorEncoding::LinearSRGB(is_gray)));
+  dec_state->shared = &shared;
+  JXL_RETURN_IF_ERROR(dec_state->Init(frame_header));
+
+  ImageBundle decoded(memory_manager, &shared.metadata->m);
+  decoded.origin = frame_header.frame_origin;
+  JXL_ASSIGN_OR_RETURN(
+      Image3F tmp,
+      Image3F::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
+  JXL_RETURN_IF_ERROR(decoded.SetFromImage(
+      std::move(tmp), dec_state->output_encoding_info.color_encoding));
+
+  PassesDecoderState::PipelineOptions options;
+  options.use_slow_render_pipeline = false;
+  options.coalescing = false;
+  options.render_spotcolors = false;
+  options.render_noise = true;
+
+  JXL_RETURN_IF_ERROR(dec_state->PreparePipeline(
+      frame_header, &shared.metadata->m, &decoded, options));
+
+  AlignedArray<GroupDecCache> group_dec_caches;
+  const auto allocate_storage = [&](const size_t num_threads) -> Status {
+    JXL_RETURN_IF_ERROR(
+        dec_state->render_pipeline->PrepareForThreads(num_threads,
+                                                      /*use_group_ids=*/false));
+    JXL_ASSIGN_OR_RETURN(group_dec_caches, AlignedArray<GroupDecCache>::Create(
+                                               memory_manager, num_threads));
+    return true;
+  };
+  const auto process_group = [&](const uint32_t group_index,
+                                 const size_t thread) -> Status {
+    if (frame_header.loop_filter.epf_iters > 0) {
+      JXL_RETURN_IF_ERROR(ComputeSigma(frame_header.loop_filter,
+                                       frame_dim.BlockGroupRect(group_index),
+                                       dec_state.get()));
+    }
+    RenderPipelineInput input =
+        dec_state->render_pipeline->GetInputBuffers(group_index, thread);
+    JXL_RETURN_IF_ERROR(DecodeGroupForRoundtrip(
+        frame_header, coeffs, group_index, dec_state.get(),
+        &group_dec_caches[thread], thread, input, nullptr, nullptr));
+    if ((frame_header.flags & FrameHeader::kNoise) != 0) {
+      PrepareNoiseInput(*dec_state, shared.frame_dim, frame_header, group_index,
+                        thread);
+    }
+    JXL_RETURN_IF_ERROR(input.Done());
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, allocate_storage,
+                                process_group, "ReconstructImage"));
+  return std::move(*decoded.color());
+}
+
+float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
+                             const ImageF& mask1x1, size_t by, size_t bx) {
+  Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
+            a.ysize());
+  float err2[3] = {0.0f};
+  for (size_t y = 0; y < rect.ysize(); ++y) {
+    const float* row_a[3] = {
+        rect.ConstPlaneRow(a, 0, y),
+        rect.ConstPlaneRow(a, 1, y),
+        rect.ConstPlaneRow(a, 2, y),
+    };
+    const float* row_b[3] = {
+        rect.ConstPlaneRow(b, 0, y),
+        rect.ConstPlaneRow(b, 1, y),
+        rect.ConstPlaneRow(b, 2, y),
+    };
+    const float* row_mask = rect.ConstRow(mask1x1, y);
+    for (size_t x = 0; x < rect.xsize(); ++x) {
+      float mask = row_mask[x];
+      float mask2 = mask * mask;
+      for (int i = 0; i < 3; ++i) {
+        float diff = row_a[i][x] - row_b[i][x];
+        err2[i] += mask2 * diff * diff;
+      }
+    }
+  }
+  static const double kW[] = {
+      12.339445295782363,
+      1.0,
+      0.2,
+  };
+  float retval = kW[0] * err2[0] + kW[1] * err2[1] + kW[2] * err2[2];
+  return retval;
+}
+
+Status ComputeARHeuristics(const FrameHeader& frame_header,
+                           PassesEncoderState* enc_state,
+                           const Image3F& orig_opsin, const Rect& rect,
+                           ThreadPool* pool) {
+  static_cast<void>(rect);
+  static_cast<void>(pool);
+  const CompressParams& cparams = enc_state->cparams;
+  PassesSharedState& shared = enc_state->shared;
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  ImageB& epf_sharpness = shared.epf_sharpness;
+
+  // The 0.8.x encoder used a local Laplacian-based estimate instead of
+  // decoding the complete frame repeatedly for candidate EPF values. Keeping
+  // this estimate makes EPF selection inexpensive and avoids the stronger
+  // smoothing that can result from the newer round-trip search.
+  if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
+      cparams.speed_tier > SpeedTier::kWombat ||
+      frame_header.loop_filter.epf_iters == 0 || orig_opsin.xsize() == 0 ||
+      orig_opsin.ysize() == 0) {
+    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
+    return true;
+  }
+
+  const size_t width = orig_opsin.xsize();
+  const size_t height = orig_opsin.ysize();
+  const size_t blocks_x =
+      std::min(frame_dim.xsize_blocks, epf_sharpness.xsize());
+  const size_t blocks_y =
+      std::min(frame_dim.ysize_blocks, epf_sharpness.ysize());
+  if (blocks_x == 0 || blocks_y == 0) {
+    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
+    return true;
+  }
+
+  // Squared 3x3 Laplacian, using the weights in the original 0.8.x control
+  // field heuristic.
+  const float channel_weights[3] = {4.35f, 4.35f, 0.287f};
+  std::vector<float> laplacian_sqrsum(width * height, 0.0f);
+  const auto pixel = [&](size_t c, size_t x, size_t y) {
+    return orig_opsin.ConstPlaneRow(c, y)[x];
+  };
+  for (size_t y = 0; y < height; ++y) {
+    const size_t py = y > 0 ? y - 1 : y;
+    const size_t ny = y + 1 < height ? y + 1 : y;
+    for (size_t x = 0; x < width; ++x) {
+      const size_t px = x > 0 ? x - 1 : x;
+      const size_t nx = x + 1 < width ? x + 1 : x;
+      float sum = 0.0f;
+      for (size_t c = 0; c < 3; ++c) {
+        const float w = channel_weights[c];
+        const float center = pixel(c, x, y);
+        const float neighbors =
+            pixel(c, px, py) + pixel(c, x, py) + pixel(c, nx, py) +
+            pixel(c, px, y) + pixel(c, nx, y) + pixel(c, px, ny) +
+            pixel(c, x, ny) + pixel(c, nx, ny);
+        const float lap = w * center - (w * 0.125f) * neighbors;
+        sum += lap * lap;
+      }
+      laplacian_sqrsum[y * width + x] = sum;
+    }
+  }
+
+  const size_t grid_x = 2 * blocks_x;
+  const size_t grid_y = 2 * blocks_y;
+  std::vector<float> sq00(grid_x * grid_y, 0.0f);
+  std::vector<float> sq22((grid_x + 1) * (grid_y + 1), 0.0f);
+
+  const auto rms_cell = [&](int x0, int y0) {
+    const size_t sx = static_cast<size_t>(std::max(0, x0));
+    const size_t sy = static_cast<size_t>(std::max(0, y0));
+    const size_t ex =
+        std::min(width, static_cast<size_t>(std::max(0, x0 + 4)));
+    const size_t ey =
+        std::min(height, static_cast<size_t>(std::max(0, y0 + 4)));
+    if (sx >= ex || sy >= ey) return 0.0f;
+    float sum = 0.0f;
+    for (size_t y = sy; y < ey; ++y) {
+      for (size_t x = sx; x < ex; ++x) {
+        sum += laplacian_sqrsum[y * width + x];
+      }
+    }
+    return std::sqrt(sum / static_cast<float>((ex - sx) * (ey - sy)));
+  };
+
+  for (size_t gy = 0; gy < grid_y; ++gy) {
+    for (size_t gx = 0; gx < grid_x; ++gx) {
+      sq00[gy * grid_x + gx] =
+          rms_cell(static_cast<int>(gx * 4), static_cast<int>(gy * 4));
+    }
+  }
+  const size_t grid22_x = grid_x + 1;
+  for (size_t gy = 0; gy <= grid_y; ++gy) {
+    for (size_t gx = 0; gx <= grid_x; ++gx) {
+      sq22[gy * grid22_x + gx] =
+          rms_cell(static_cast<int>(gx * 4) - 2,
+                   static_cast<int>(gy * 4) - 2);
+    }
+  }
+
+  const auto s00 = [&](size_t by, size_t bx) {
+    return sq00[by * grid_x + bx];
+  };
+  const auto s22 = [&](size_t by, size_t bx) {
+    return sq22[by * grid22_x + bx];
+  };
+  // The post-0.8 interface exposes the quant field as integer values plus
+  // the global scale; use this to keep the old heuristic group-local.
+  const ImageI& raw_quant_field = shared.raw_quant_field;
+  const float quant_scale = shared.quantizer.Scale();
+  const float kDeltaLimit = 3.2f;
+  const float kSmoothLimit = 0.085f;
+
+  for (size_t by = 0; by < blocks_y; ++by) {
+    AcStrategyRow acs_row = shared.ac_strategy.ConstRow(by);
+    const int32_t* const quant_row = raw_quant_field.Row(by);
+    for (size_t bx = 0; bx < blocks_x; ++bx) {
+      const AcStrategy acs = acs_row[bx];
+      if (!acs.IsFirstBlock()) continue;
+
+      const float q = std::max(1.0e-6f,
+                                static_cast<float>(quant_row[bx]) * quant_scale);
+      const float quant_val = 1.0f / q;
+      float integral_transform = 0.0f;
+      for (size_t iy = 0; iy < acs.covered_blocks_y() * 2; ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x() * 2; ++ix) {
+          const float v = s00(2 * by + iy, 2 * bx + ix);
+          integral_transform += v * v;
+        }
+      }
+      integral_transform /= static_cast<float>(
+          4 * acs.covered_blocks_x() * acs.covered_blocks_y());
+      integral_transform = std::sqrt(integral_transform);
+
+      for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
+        for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
+          const size_t gx = 2 * (bx + ix);
+          const size_t gy = 2 * (by + iy);
+          const float min00 = std::min(
+              std::min(s00(gy, gx), s00(gy, gx + 1)),
+              std::min(s00(gy + 1, gx), s00(gy + 1, gx + 1)));
+          const float minval = std::min(min00, s22(gy + 1, gx + 1));
+          const float minval2 = std::min(
+              std::min(std::min(s22(gy, gx), s22(gy, gx + 1)),
+                       std::min(s22(gy, gx + 2), s22(gy + 1, gx))),
+              std::min(std::min(s22(gy + 1, gx + 1), s22(gy + 1, gx + 2)),
+                       std::min(std::min(s22(gy + 2, gx), s22(gy + 2, gx + 1)),
+                                s22(gy + 2, gx + 2))));
+          const float minval3 = std::min(minval, minval2);
+          const float blended_min =
+              0.125f * minval + 0.625f * minval3 +
+              0.125f * std::min(1.5f * minval3, s22(gy + 1, gx + 1)) +
+              0.125f * minval2;
+
+          const float bias = 0.0625f * quant_val;
+          const float delta =
+              (integral_transform + (kDeltaLimit + 0.05f) * bias) /
+              (blended_min + bias);
+          int out = delta > kDeltaLimit ? 4 : 0;
+          const float threshold = 0.0625f * quant_val;
+          const float smooth =
+              0.20f * (s00(gy, gx) + s00(gy, gx + 1) + s00(gy + 1, gx) +
+                       s00(gy + 1, gx + 1) + blended_min);
+          if (smooth < kSmoothLimit * threshold) out = 4;
+          epf_sharpness.Row(by + iy)[bx + ix] = static_cast<uint8_t>(out);
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
 Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             PassesEncoderState* enc_state,
                             ModularFrameEncoder* modular_frame_encoder,
@@ -783,22 +1075,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
+  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
-
-  // The DC CfL multipliers are serialized once in frame-global DC metadata.
-  // Reuse the first chunk's values for all subsequent chunks; fitting new
-  // values from each local chunk would encode DC coefficients with a transform
-  // different from the one the decoder has received.
-  if (streaming_mode && !initialize_global_state &&
-      cparams.speed_tier <= SpeedTier::kHare &&
-      enc_state->cfl_dc_multipliers_initialized) {
-    cmap.SetYToXDC(enc_state->cfl_ytox_dc);
-    cmap.SetYToBDC(enc_state->cfl_ytob_dc);
-  }
 
   // Find and subtract splines.
   bool override_splines = cparams.custom_splines.HasAny();
@@ -825,8 +1107,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   }
 
   const float quant_dc = InitialQuantDC(cparams.butteraugli_distance);
-  const float initial_q = 0.79f / cparams.butteraugli_distance;
-  quantizer.ComputeGlobalScaleAndQuant(quant_dc, initial_q, 0);
 
   // TODO(veluca): we can now run all the code from here to FindBestQuantizer
   // (excluded) one rect at a time. Do that.
@@ -849,7 +1129,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   AcStrategyHeuristics acs_heuristics(memory_manager, cparams);
   CfLHeuristics cfl_heuristics(memory_manager);
-  std::vector<ARControlFieldTempImages> ar_control_field_temp_images;
   ImageF initial_quant_field;
   ImageF initial_quant_masking;
 
@@ -865,10 +1144,17 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(initial_quant_masking,
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
-    const float q = initial_q;
+    float q = 0.841f / cparams.butteraugli_distance;
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
+    if (cparams.disable_perceptual_optimizations) {
+      JXL_ASSIGN_OR_RETURN(
+          initial_quant_masking1x1,
+          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
+      FillImage(masking, &initial_quant_masking1x1);
+    }
+    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   } else {
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
@@ -878,18 +1164,24 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking));
-    JXL_RETURN_IF_ERROR(
-        quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
+                          1.0f, &initial_quant_masking,
+                          &initial_quant_masking1x1));
+    float q = 0.39 / cparams.butteraugli_distance;
+    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
 
   // TODO(veluca): do something about animations.
 
   // Apply inverse-gaborish.
   if (frame_header.loop_filter.gab) {
-    // Slightly tune inverse-gaborish per channel to reduce ringing.
-    // Match the Main inverse-Gaborish kernel in enc_gaborish.cc.
-    float weight[3] = {1.0f, 1.0f, 1.0f};
+    // Changing the weight here to 0.99f would help to reduce ringing in
+    // generation loss.
+    const float kInverseGaborishWeight = 0.9908511000000001f;
+    float weight[3] = {
+        kInverseGaborishWeight,
+        kInverseGaborishWeight,
+        kInverseGaborishWeight,
+    };
     JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
   }
 
@@ -900,7 +1192,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking, &matrices));
+                                          initial_quant_masking,
+                                          initial_quant_masking1x1, &matrices));
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
@@ -928,12 +1221,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(
         acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
 
-    // Select EPF sharpness from the local Laplacian and quantization field.
-    // This is much cheaper than reconstructing the image for each EPF setting.
-    JXL_RETURN_IF_ERROR(ComputeARControlFieldTile(
-        frame_header, *opsin, initial_quant_field, enc_state, r, rect,
-        &ar_control_field_temp_images[thread]));
-
     // Always set the initial quant field, so we can compute the CfL map with
     // more accuracy. The initial quant field might change in slower modes, but
     // adjusting the quant field with butteraugli when all the other encoding
@@ -955,10 +1242,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
-    ar_control_field_temp_images.resize(num_threads);
-    for (auto& temp : ar_control_field_temp_images) {
-      JXL_RETURN_IF_ERROR(temp.InitOnce(memory_manager));
-    }
     return true;
   };
   JXL_RETURN_IF_ERROR(
@@ -966,22 +1249,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // Fit the DC CfL multipliers once, using the first chunk in streaming mode
-  // (or the full frame in one-shot mode). These values are written in the
-  // frame-global DC metadata and must remain identical for every DC group.
-  if (cparams.speed_tier <= SpeedTier::kHare &&
-      (!streaming_mode || initialize_global_state)) {
-    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
-        /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, &cmap));
-    if (streaming_mode) {
-      enc_state->cfl_ytox_dc = cmap.base().GetYToXDC();
-      enc_state->cfl_ytob_dc = cmap.base().GetYToBDC();
-      enc_state->cfl_dc_multipliers_initialized = true;
-    }
-  }
-
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
+    ImageB& epf_sharpness = shared.epf_sharpness;
+    FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     JXL_RETURN_IF_ERROR(FindBestQuantizer(frame_header, linear, *opsin,
                                           initial_quant_field, enc_state, cms,
                                           pool, aux_out));

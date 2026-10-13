@@ -42,13 +42,6 @@ struct PassesEncoderState {
   bool initialize_global_state = true;
   size_t dc_group_index = 0;
 
-  // DC chroma-from-luma multipliers are signaled once in the frame-global DC
-  // information. Preserve the values selected for the first chunk so later
-  // chunks encode their DC coefficients with the same transform.
-  bool cfl_dc_multipliers_initialized = false;
-  int32_t cfl_ytox_dc = 0;
-  int32_t cfl_ytob_dc = 0;
-
   // Per-pass DCT coefficients for the image. One row per group.
   std::vector<std::unique_ptr<ACImage>> coeffs;
 
@@ -78,6 +71,7 @@ struct PassesEncoderState {
   float x_qm_multiplier = 1.0f;
   float b_qm_multiplier = 1.0f;
 
+  ImageF initial_quant_masking1x1;
 
   JxlMemoryManager* memory_manager() const { return shared.memory_manager; }
 };

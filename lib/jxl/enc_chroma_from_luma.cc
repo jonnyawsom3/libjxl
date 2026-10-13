@@ -159,9 +159,9 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     for (size_t i = 0; i < 20; i++) {
       float dfpeps;
       float dfmeps;
-      float df = fn.Compute(x, eps, &dfpeps, &dfmeps);
+      float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
       float ddf = (dfpeps - dfmeps) / (2 * eps);
-      float step = df / ddf;
+      float step = d_f / ddf;
       x -= std::min(kClamp, std::max(-kClamp, step));
       if (std::abs(step) < 3e-3) break;
     }

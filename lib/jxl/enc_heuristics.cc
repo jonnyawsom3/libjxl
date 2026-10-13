@@ -994,8 +994,10 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   const auto s22 = [&](size_t by, size_t bx) {
     return sq22[by * grid22_x + bx];
   };
-  // The post-0.8 interface exposes the quant field as integer values plus
-  // the global scale; use this to keep the old heuristic group-local.
+  // This function is called once for the current encoding rect (the entire
+  // frame in buffered mode, one DC group in streaming mode). Use the current
+  // rect's quant field and scale; do not attempt to accumulate the old
+  // whole-frame statistics separately for each streamed group.
   const ImageI& raw_quant_field = shared.raw_quant_field;
   const float quant_scale = shared.quantizer.Scale();
   const float kDeltaLimit = 3.2f;

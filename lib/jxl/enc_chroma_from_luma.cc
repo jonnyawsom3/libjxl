@@ -57,31 +57,50 @@ using hwy::HWY_NAMESPACE::Zero;
 
 static HWY_FULL(float) df;
 
-// A simple radial contrast-sensitivity profile: retain more influence for
-// low-frequency AC, where chroma prediction errors are more visible.
-struct WeightProfile {
-  float w[64];
-  WeightProfile() {
-    constexpr float kMaxRadius = 9.8994949366f;  // sqrt(7^2 + 7^2)
+// Channel-tailored Contrast Sensitivity Profiles (CSF).
+// Human color vision has steep low-pass filtering for blue-yellow (B channel)
+// and exhibits the Oblique Effect (higher sensitivity to horizontal/vertical
+// transitions than diagonal ones) on red-green (X channel).
+struct WeightProfiles {
+  float wx[64];
+  float wb[64];
+  WeightProfiles() {
     for (int y = 0; y < 8; ++y) {
       for (int x = 0; x < 8; ++x) {
-        const float radius = std::sqrt(static_cast<float>(x * x + y * y));
-        w[y * 8 + x] = (x == 0 && y == 0)
-                           ? 0.0f
-                           : 1.0f + 2.0f * (1.0f - radius / kMaxRadius);
+        if (x == 0 && y == 0) {
+          wx[0] = 0.0f;
+          wb[0] = 0.0f;
+          continue;
+        }
+        const float r = std::sqrt(static_cast<float>(x * x + y * y));
+        // Oblique effect: diagonal frequencies are less sensitive than cardinal (H/V)
+        const float angle = std::abs(
+            std::atan2(static_cast<float>(y), static_cast<float>(x)) -
+            0.785398163f);
+        const float cardinal_boost =
+            1.0f + 0.35f * (0.785398163f - angle) / 0.785398163f;
+
+        // X channel (fine chrominance, red-green): sensitive to edge ringing in low & mid AC
+        const float base_wx = 1.0f + 3.0f * std::max(0.0f, 1.0f - r / 6.0f);
+        wx[y * 8 + x] = base_wx * cardinal_boost;
+
+        // B channel (coarse chrominance, blue-yellow): steep low-pass dropoff.
+        // Frequencies above r = 4.5 have near-zero perceptual weight.
+        const float base_wb = 4.0f * std::max(0.0f, 1.0f - (r * r) / 25.0f);
+        wb[y * 8 + x] = base_wb;
       }
     }
   }
 };
-static const WeightProfile kWeightProfile;
+static const WeightProfiles kWeightProfiles;
 
-// Chooses a CfL multiplier by minimizing the frequency-weighted L1 residual
-// and rate proxy. The predictor is read from already-finalized map neighbours;
-// LossyFrameHeuristics processes the final-map pass in dependency-safe diagonals.
+// Chooses a CfL multiplier by minimizing the channel-tailored frequency-weighted
+// post-quantization residual and modular entropy rate proxy.
 int32_t FindBestMultiplierWeighted(
     const float* values_m, const float* values_s, const float* weights,
     size_t num, float weight_sum, float base, float tile_q, float dc_avg,
-    int pred, const CompressParams& cparams, bool fast, float* scratch_space) {
+    int pred, const CompressParams& cparams, bool fast, bool is_blue,
+    float* scratch_space) {
   // Without AC evidence, carrying a neighbouring multiplier can inject a
   // colour residual into a flat tile and create visible tile-boundary tint.
   if (num == 0 || weight_sum <= 0.0f) return 0;
@@ -110,11 +129,6 @@ int32_t FindBestMultiplierWeighted(
   const float dot_rr = GetLane(SumOfLanes(df, dot_rr_v));
   const float sum_abs_r_unweighted =
       GetLane(SumOfLanes(df, abs_r_unweighted_v));
-  // The coefficient buffers include q = Scale() * raw_quant_field. Normalize
-  // this confidence-only statistic by the local quantization scale so the
-  // deadzone thresholds do not change merely because AQ changes q. Keep the
-  // objective itself unnormalized: the rate penalties are calibrated against
-  // the friend's native weighted-L1 cost and must stay in the same units.
   const float energy =
       sum_abs_r_unweighted /
       (static_cast<float>(num) * std::max(tile_q, 1e-6f));
@@ -127,8 +141,6 @@ int32_t FindBestMultiplierWeighted(
   const int target = static_cast<int>(
       std::max(-128.0f, std::min(127.0f, target_float)));
 
-  // Retain the friend's low-energy suppression, but calculate both the
-  // correlation and energy relative to the actual no-CfL residual above.
   float deadzone_penalty = 1.0f;
   const float dc_neutral_threshold = (base == 0.0f) ? 0.10f : 0.35f;
   if (correlation < 0.20f && energy < 0.10f &&
@@ -139,15 +151,19 @@ int32_t FindBestMultiplierWeighted(
     deadzone_penalty = 1.8f;
   }
 
-  // The friend's native objective is weighted L1 residual in its own
-  // coefficient scale (q = Scale() * raw_quant_field). Do not divide this by
-  // weight_sum or reapply the restored 0.8.x 400x scale: either operation
-  // changes the relative strength of the friend's rate terms.
-  constexpr float kOversatPenalty = 1.2f;
+  const float dist = std::max(0.2f, cparams.butteraugli_distance);
+  const float lambda_bits = 0.004f * tile_q * dist;
+  const float multiplier_bit_cost = 0.035f * tile_q * dist;
+  const float ac_token_cost = 0.08f * dist;
+
+  const float oversat_penalty = is_blue ? 1.2f : 1.35f;
+  const auto oversat_v = Set(df, oversat_penalty);
+  const auto inv_color_factor = Set(df, 1.0f / kDefaultColorFactor);
+  const auto deadzone_v = Set(df, is_blue ? 0.75f : 0.65f);
+  const auto ac_token_cost_v = Set(df, ac_token_cost);
+
   auto evaluate = [&](const float* candidates, float* costs,
                       size_t candidate_count) {
-    const auto oversat_v = Set(df, kOversatPenalty);
-    const auto inv_color_factor = Set(df, 1.0f / kDefaultColorFactor);
     for (size_t c = 0; c < candidate_count; c += lanes) {
       const auto candidate_v = LoadU(df, candidates + c);
       const auto factor_v = Add(base_v, Mul(candidate_v, inv_color_factor));
@@ -158,8 +174,16 @@ int32_t FindBestMultiplierWeighted(
         const auto w = Set(df, weights[i]);
         const auto baseline = Sub(chroma, Mul(base_v, m));
         const auto residual = Sub(chroma, Mul(factor_v, m));
-        auto cost = Mul(w, Abs(residual));
-        const auto worsens_residual = Lt(Abs(baseline), Abs(residual));
+        const auto abs_res = Abs(residual);
+
+        // True RDO: evaluate post-quantization residual distortion + token cost
+        const auto is_zero = Lt(abs_res, deadzone_v);
+        const auto zero_cost = Mul(w, abs_res);
+        const auto nonzero_cost =
+            Add(Mul(w, Abs(Sub(abs_res, Round(abs_res)))), ac_token_cost_v);
+        auto cost = IfThenElse(is_zero, zero_cost, nonzero_cost);
+
+        const auto worsens_residual = Lt(Abs(baseline), abs_res);
         cost = IfThenElse(worsens_residual, Mul(cost, oversat_v), cost);
         sum_v = Add(sum_v, cost);
       }
@@ -167,17 +191,13 @@ int32_t FindBestMultiplierWeighted(
     }
   };
 
-  // Approximate map coding cost from candidate - predictor. During the final
-  // pass the map is updated in dependency-safe diagonals, so left/top/top-left
-  // values are already final and no worker reads another worker's write.
   auto estimate_bits = [](int candidate, int predictor) {
     const int residual = std::abs(candidate - predictor);
-    if (residual == 0) return 0.8f;
-    if (residual == 1) return 2.0f;
-    return 2.5f + std::log2(static_cast<float>(residual));
+    if (residual == 0) return 0.5f;
+    if (residual == 1) return 1.8f;
+    if (residual <= 3) return 2.6f;
+    return 3.0f + std::log2(static_cast<float>(residual));
   };
-  const float lambda_bits = 0.005f * tile_q;
-  const float multiplier_bit_cost = 0.05f * tile_q;
   auto score = [&](int candidate, float distortion_sum) {
     return distortion_sum + lambda_bits * estimate_bits(candidate, pred) +
            std::abs(candidate) * multiplier_bit_cost * deadzone_penalty;
@@ -271,6 +291,41 @@ int32_t FindBestMultiplierWeighted(
   }
   return best_candidate;
 }
+int32_t FindBestDCMultiplier(const float* values_m, const float* values_s,
+                             size_t num, float base) {
+  if (num == 0) return 0;
+  static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
+  constexpr float kDistanceMultiplierDC = 1e-5f;
+  auto ca = Zero(df);
+  auto cb = Zero(df);
+  const auto inv_color_factor = Set(df, kInvColorFactor);
+  const auto base_v = Set(df, base);
+  for (size_t i = 0; i < num; i += Lanes(df)) {
+    const auto m = Load(df, values_m + i);
+    const auto s = Load(df, values_s + i);
+    const auto a = Mul(inv_color_factor, m);
+    const auto b = Sub(Mul(base_v, m), s);
+    ca = MulAdd(a, a, ca);
+    cb = MulAdd(a, b, cb);
+  }
+  const float dot_aa = GetLane(SumOfLanes(df, ca));
+  const float dot_ab = GetLane(SumOfLanes(df, cb));
+  const float x = -dot_ab / (dot_aa + num * kDistanceMultiplierDC * 0.5f);
+  return jxl::Clamp1(static_cast<int32_t>(std::round(x)), -128, 127);
+}
+
+void ComputeDC(const ImageF& dc_values, bool fast, int32_t* dc_x,
+               int32_t* dc_b) {
+  (void)fast;
+  const float* JXL_RESTRICT dc_values_yx = dc_values.Row(0);
+  const float* JXL_RESTRICT dc_values_x = dc_values.Row(1);
+  const float* JXL_RESTRICT dc_values_yb = dc_values.Row(2);
+  const float* JXL_RESTRICT dc_values_b = dc_values.Row(3);
+  *dc_x = FindBestDCMultiplier(dc_values_yx, dc_values_x, dc_values.xsize(), 0.0f);
+  *dc_b = FindBestDCMultiplier(dc_values_yb, dc_values_b, dc_values.xsize(),
+                               jxl::cms::kYToBRatio);
+}
+
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
                      ImageF* dc_values) {
   // First row: Y channel
@@ -302,7 +357,7 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const ImageSB* predictor_map_b, ImageF* dc_values,
                    Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
-                "Invalid color tile dim");
+                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
@@ -332,8 +387,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float* HWY_RESTRICT coeffs_x = coeffs_yx + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_yb = coeffs_x + kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_b = coeffs_yb + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_w = coeffs_b + kColorTileDim * kColorTileDim;
-  JXL_ENSURE(mem.remove_prefix(5 * kColorTileDim * kColorTileDim));
+  float* HWY_RESTRICT coeffs_wx = coeffs_b + kColorTileDim * kColorTileDim;
+  float* HWY_RESTRICT coeffs_wb = coeffs_wx + kColorTileDim * kColorTileDim;
+  JXL_ENSURE(mem.remove_prefix(6 * kColorTileDim * kColorTileDim));
   constexpr size_t dc_size =
       AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
   float* HWY_RESTRICT dc_y = mem.begin();
@@ -346,7 +402,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   size_t num_ac = 0;
   float tile_q_sum = 0.0f;
   size_t tile_q_blocks = 0;
-  float coeff_weight_sum = 0.0f;
+  float coeff_weight_sum_x = 0.0f;
+  float coeff_weight_sum_b = 0.0f;
 
   for (size_t y = y0; y < y1; ++y) {
     const float* JXL_RESTRICT row_y =
@@ -451,9 +508,12 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
         const size_t iy_norm = iy >> shift_y;
         for (size_t ix = 0; ix < sx; ++ix) {
           const size_t ix_norm = ix >> shift_x;
-          const float w = kWeightProfile.w[iy_norm * 8 + ix_norm];
-          coeffs_w[num_ac + iy * sx + ix] = w;
-          coeff_weight_sum += w;
+          const float wx = kWeightProfiles.wx[iy_norm * 8 + ix_norm];
+          const float wb = kWeightProfiles.wb[iy_norm * 8 + ix_norm];
+          coeffs_wx[num_ac + iy * sx + ix] = wx;
+          coeffs_wb[num_ac + iy * sx + ix] = wb;
+          coeff_weight_sum_x += wx;
+          coeff_weight_sum_b += wb;
         }
       }
 
@@ -504,12 +564,12 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   const int pred_x = get_pred(predictor_map_x, tx, ty);
   const int pred_b = get_pred(predictor_map_b, tx, ty);
   row_out_x[tx] = FindBestMultiplierWeighted(
-      coeffs_yx, coeffs_x, coeffs_w, num_ac, coeff_weight_sum, 0.0f, tile_q,
-      dc_avg_x, pred_x, cparams, fast, scratch_space);
+      coeffs_yx, coeffs_x, coeffs_wx, num_ac, coeff_weight_sum_x, 0.0f, tile_q,
+      dc_avg_x, pred_x, cparams, fast, /*is_blue=*/false, scratch_space);
   row_out_b[tx] = FindBestMultiplierWeighted(
-      coeffs_yb, coeffs_b, coeffs_w, num_ac, coeff_weight_sum,
+      coeffs_yb, coeffs_b, coeffs_wb, num_ac, coeff_weight_sum_b,
       jxl::cms::kYToBRatio, tile_q, dc_avg_b, pred_b, cparams, fast,
-      scratch_space);
+      /*is_blue=*/true, scratch_space);
   return true;
 }
 
@@ -523,12 +583,22 @@ namespace jxl {
 
 HWY_EXPORT(InitDCStorage);
 HWY_EXPORT(ComputeTile);
+HWY_EXPORT(ComputeDC);
 
 Status CfLHeuristics::Init(const Rect& rect) {
   size_t xsize_blocks = rect.xsize() / kBlockDim;
   size_t ysize_blocks = rect.ysize() / kBlockDim;
   return HWY_DYNAMIC_DISPATCH(InitDCStorage)(
       memory_manager, xsize_blocks * ysize_blocks, &dc_values);
+}
+
+Status CfLHeuristics::ComputeDC(bool fast, ColorCorrelationMap* cmap) {
+  int32_t ytob_dc = 0;
+  int32_t ytox_dc = 0;
+  HWY_DYNAMIC_DISPATCH(ComputeDC)(dc_values, fast, &ytox_dc, &ytob_dc);
+  cmap->SetYToBDC(ytob_dc);
+  cmap->SetYToXDC(ytox_dc);
+  return true;
 }
 
 Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,

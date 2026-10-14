@@ -1257,41 +1257,41 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                 process_ac_strategy,
                                 "Enc Heuristics AC strategy"));
 
-  // Phase 3: snapshot the pre-final map and compute final CfL values using
-  // that immutable predictor. Reading the live output map here would be a
-  // data race and make results depend on thread scheduling.
+  // Phase 3: refine CfL in dependency-safe diagonals. The multiplier-rate
+  // proxy predicts from the final left/top/top-left map entries. Processing
+  // all tiles in parallel against a snapshot of the initial map biases the
+  // final map toward stale values and can create visible tile discontinuities.
+  // Tiles on the same anti-diagonal do not read each other's output, so they
+  // remain safe to process in parallel while all predictor neighbours have
+  // already been finalized by earlier diagonals.
   if (cparams.speed_tier <= SpeedTier::kHare) {
-    ImageSB predictor_map_x;
-    ImageSB predictor_map_b;
-    JXL_ASSIGN_OR_RETURN(
-        predictor_map_x,
-        ImageSB::Create(memory_manager, cmap.ytox_map.xsize(),
-                        cmap.ytox_map.ysize()));
-    JXL_ASSIGN_OR_RETURN(
-        predictor_map_b,
-        ImageSB::Create(memory_manager, cmap.ytob_map.xsize(),
-                        cmap.ytob_map.ysize()));
-    for (size_t y = 0; y < cmap.ytox_map.ysize(); ++y) {
-      std::copy(cmap.ytox_map.Row(y),
-                cmap.ytox_map.Row(y) + cmap.ytox_map.xsize(),
-                predictor_map_x.Row(y));
-      std::copy(cmap.ytob_map.Row(y),
-                cmap.ytob_map.Row(y) + cmap.ytob_map.xsize(),
-                predictor_map_b.Row(y));
+    const size_t num_tile_cols =
+        DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
+    const size_t num_tile_rows =
+        DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
+    for (size_t diagonal = 0;
+         diagonal < num_tile_cols + num_tile_rows - 1; ++diagonal) {
+      const size_t tx_begin =
+          diagonal >= num_tile_rows ? diagonal - (num_tile_rows - 1) : 0;
+      const size_t tx_end = std::min(diagonal, num_tile_cols - 1);
+      const uint32_t diagonal_size =
+          static_cast<uint32_t>(tx_end - tx_begin + 1);
+      auto process_final_cfl = [&](const uint32_t offset,
+                                   const size_t thread) -> Status {
+        const size_t tx = tx_begin + offset;
+        const size_t ty = diagonal - tx;
+        const size_t tid = ty * num_tile_cols + tx;
+        const Rect r = tile_rect(static_cast<uint32_t>(tid));
+        return cfl_heuristics.ComputeTile(
+            r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+            &quantizer, cparams,
+            /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap,
+            &cmap.ytox_map, &cmap.ytob_map);
+      };
+      JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, diagonal_size, prepare,
+                                    process_final_cfl,
+                                    "Enc Heuristics CfL2"));
     }
-
-    auto process_final_cfl = [&](const uint32_t tid,
-                                 const size_t thread) -> Status {
-      const Rect r = tile_rect(tid);
-      return cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
-          &quantizer, cparams,
-          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap,
-          &predictor_map_x, &predictor_map_b);
-    };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
-                                  process_final_cfl,
-                                  "Enc Heuristics CfL2"));
   }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));

@@ -75,16 +75,16 @@ struct WeightProfile {
 };
 static const WeightProfile kWeightProfile;
 
-// Chooses a CfL multiplier by minimizing the friend's frequency-weighted L1
-// residual and rate proxy. The map predictor must come from an immutable map
-// snapshot: ComputeTile runs concurrently, so reading the live map would race.
+// Chooses a CfL multiplier by minimizing the frequency-weighted L1 residual
+// and rate proxy. The predictor is read from already-finalized map neighbours;
+// LossyFrameHeuristics processes the final-map pass in dependency-safe diagonals.
 int32_t FindBestMultiplierWeighted(
     const float* values_m, const float* values_s, const float* weights,
     size_t num, float weight_sum, float base, float tile_q, float dc_avg,
     int pred, const CompressParams& cparams, bool fast, float* scratch_space) {
-  if (num == 0 || weight_sum <= 0.0f) {
-    return (std::abs(pred) <= 4) ? pred : 0;
-  }
+  // Without AC evidence, carrying a neighbouring multiplier can inject a
+  // colour residual into a flat tile and create visible tile-boundary tint.
+  if (num == 0 || weight_sum <= 0.0f) return 0;
 
   const size_t lanes = Lanes(df);
   const auto base_v = Set(df, base);
@@ -110,15 +110,22 @@ int32_t FindBestMultiplierWeighted(
   const float dot_rr = GetLane(SumOfLanes(df, dot_rr_v));
   const float sum_abs_r_unweighted =
       GetLane(SumOfLanes(df, abs_r_unweighted_v));
-  const float energy = sum_abs_r_unweighted / static_cast<float>(num);
+  // The coefficient buffers include q = Scale() * raw_quant_field. Normalize
+  // this confidence-only statistic by the local quantization scale so the
+  // deadzone thresholds do not change merely because AQ changes q. Keep the
+  // objective itself unnormalized: the rate penalties are calibrated against
+  // the friend's native weighted-L1 cost and must stay in the same units.
+  const float energy =
+      sum_abs_r_unweighted /
+      (static_cast<float>(num) * std::max(tile_q, 1e-6f));
   const float correlation =
       (dot_mm > 1e-8f && dot_rr > 1e-8f)
           ? std::abs(dot_mr) / std::sqrt(dot_mm * dot_rr)
           : 0.0f;
   const float target_delta = dot_mm > 1e-8f ? dot_mr / dot_mm : 0.0f;
-  const int target = jxl::Clamp1(
-      static_cast<int>(std::round(target_delta * kDefaultColorFactor)),
-      -128, 127);
+  const float target_float = std::round(target_delta * kDefaultColorFactor);
+  const int target = static_cast<int>(
+      std::max(-128.0f, std::min(127.0f, target_float)));
 
   // Retain the friend's low-energy suppression, but calculate both the
   // correlation and energy relative to the actual no-CfL residual above.
@@ -160,8 +167,9 @@ int32_t FindBestMultiplierWeighted(
     }
   };
 
-  // Approximate map coding cost from candidate - predictor. The predictor is
-  // read from an immutable snapshot prepared between parallel encoder phases.
+  // Approximate map coding cost from candidate - predictor. During the final
+  // pass the map is updated in dependency-safe diagonals, so left/top/top-left
+  // values are already final and no worker reads another worker's write.
   auto estimate_bits = [](int candidate, int predictor) {
     const int residual = std::abs(candidate - predictor);
     if (residual == 0) return 0.8f;

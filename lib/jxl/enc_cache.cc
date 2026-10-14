@@ -229,9 +229,10 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
         JXL_ENSURE(group_index == 0);
         modular_group_index = enc_state->dc_group_index;
       }
+      const bool nl_dc = frame_header.chroma_subsampling.Is444() &&
+                         enc_state->cparams.speed_tier < SpeedTier::kFalcon;
       JXL_RETURN_IF_ERROR(modular_frame_encoder->AddVarDCTDC(
-          frame_header, dc, r, modular_group_index,
-          enc_state->cparams.speed_tier < SpeedTier::kFalcon, enc_state,
+          frame_header, dc, r, modular_group_index, nl_dc, enc_state,
           /*jpeg_transcode=*/false));
       return true;
     };

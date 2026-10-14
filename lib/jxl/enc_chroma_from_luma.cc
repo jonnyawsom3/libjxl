@@ -84,9 +84,9 @@ struct WeightProfiles {
         const float base_wx = 1.0f + 3.0f * std::max(0.0f, 1.0f - r / 6.0f);
         wx[y * 8 + x] = base_wx * cardinal_boost;
 
-        // B channel (coarse chrominance, blue-yellow): steep low-pass dropoff.
-        // Frequencies above r = 4.5 have near-zero perceptual weight.
-        const float base_wb = 4.0f * std::max(0.0f, 1.0f - (r * r) / 25.0f);
+        // B channel (coarse chrominance, blue-yellow): steep low-pass dropoff
+        // with baseline floor so high AC residuals don't explode unpredicted.
+        const float base_wb = 1.0f + 3.0f * std::max(0.0f, 1.0f - (r * r) / 36.0f);
         wb[y * 8 + x] = base_wb;
       }
     }
@@ -151,16 +151,12 @@ int32_t FindBestMultiplierWeighted(
     deadzone_penalty = 1.8f;
   }
 
-  const float dist = std::max(0.2f, cparams.butteraugli_distance);
-  const float lambda_bits = 0.004f * tile_q * dist;
-  const float multiplier_bit_cost = 0.035f * tile_q * dist;
-  const float ac_token_cost = 0.08f * dist;
+  const float lambda_bits = 0.005f * tile_q;
+  const float multiplier_bit_cost = 0.05f * tile_q;
 
   const float oversat_penalty = is_blue ? 1.2f : 1.35f;
   const auto oversat_v = Set(df, oversat_penalty);
   const auto inv_color_factor = Set(df, 1.0f / kDefaultColorFactor);
-  const auto deadzone_v = Set(df, is_blue ? 0.75f : 0.65f);
-  const auto ac_token_cost_v = Set(df, ac_token_cost);
 
   auto evaluate = [&](const float* candidates, float* costs,
                       size_t candidate_count) {
@@ -175,13 +171,7 @@ int32_t FindBestMultiplierWeighted(
         const auto baseline = Sub(chroma, Mul(base_v, m));
         const auto residual = Sub(chroma, Mul(factor_v, m));
         const auto abs_res = Abs(residual);
-
-        // True RDO: evaluate post-quantization residual distortion + token cost
-        const auto is_zero = Lt(abs_res, deadzone_v);
-        const auto zero_cost = Mul(w, abs_res);
-        const auto nonzero_cost =
-            Add(Mul(w, Abs(Sub(abs_res, Round(abs_res)))), ac_token_cost_v);
-        auto cost = IfThenElse(is_zero, zero_cost, nonzero_cost);
+        auto cost = Mul(w, abs_res);
 
         const auto worsens_residual = Lt(Abs(baseline), abs_res);
         cost = IfThenElse(worsens_residual, Mul(cost, oversat_v), cost);

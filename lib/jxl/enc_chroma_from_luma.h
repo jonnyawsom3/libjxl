@@ -52,7 +52,9 @@ struct CfLHeuristics {
                      const AcStrategyImage* ac_strategy,
                      const ImageI* raw_quant_field, const Quantizer* quantizer,
                      const CompressParams& cparams, bool fast, size_t thread,
-                     ColorCorrelationMap* cmap);
+                     ColorCorrelationMap* cmap,
+                     const ImageSB* predictor_map_x = nullptr,
+                     const ImageSB* predictor_map_b = nullptr);
 
   JxlMemoryManager* memory_manager;
   ImageF dc_values;
@@ -65,7 +67,7 @@ struct CfLHeuristics {
     const size_t dc_scratch_size =
         3 * AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
     return AcStrategy::kMaxCoeffArea * 3        // Blocks
-           + kColorTileDim * kColorTileDim * 5  // AC coeff + weights
+           + kColorTileDim * kColorTileDim * 5  // AC coeff storage
            + AcStrategy::kMaxCoeffArea * 2      // Scratch space
            + dct_scratch_size + dc_scratch_size;
   }

@@ -75,26 +75,26 @@ struct WeightProfile {
 };
 static const WeightProfile kWeightProfile;
 
-// Chooses a CfL multiplier by minimizing a frequency-weighted residual plus a
-// small rate proxy. This function must not read neighboring map entries:
-// ComputeTile is run concurrently for independent tiles, so those entries may
-// not have been written yet (and reading them would be a data race).
+// Chooses a CfL multiplier by minimizing the friend's frequency-weighted L1
+// residual and rate proxy. The map predictor must come from an immutable map
+// snapshot: ComputeTile runs concurrently, so reading the live map would race.
 int32_t FindBestMultiplierWeighted(
     const float* values_m, const float* values_s, const float* weights,
-    size_t num, float weight_sum, float fit_scale, float base, float tile_q,
-    float dc_avg, const CompressParams& cparams, bool fast,
-    float* scratch_space) {
-  if (num == 0 || weight_sum <= 0.0f) return 0;
+    size_t num, float weight_sum, float base, float tile_q, float dc_avg,
+    int pred, const CompressParams& cparams, bool fast, float* scratch_space) {
+  if (num == 0 || weight_sum <= 0.0f) {
+    return (std::abs(pred) <= 4) ? pred : 0;
+  }
 
   const size_t lanes = Lanes(df);
   const auto base_v = Set(df, base);
   auto dot_mr_v = Zero(df);
   auto dot_mm_v = Zero(df);
   auto dot_rr_v = Zero(df);
-  auto abs_s_v = Zero(df);
+  auto abs_r_unweighted_v = Zero(df);
 
-  // Weighted least-squares gives a good initial candidate and the correlation
-  // measures whether applying CfL is likely to be useful at all.
+  // Fit the adjustment to the existing base correlation. For B, this is
+  // essential: the regression must model (S - base * M), not S itself.
   for (size_t i = 0; i < num; i += lanes) {
     const auto m = LoadU(df, values_m + i);
     const auto s = LoadU(df, values_s + i);
@@ -103,13 +103,14 @@ int32_t FindBestMultiplierWeighted(
     dot_mr_v = MulAdd(w, Mul(m, residual0), dot_mr_v);
     dot_mm_v = MulAdd(w, Mul(m, m), dot_mm_v);
     dot_rr_v = MulAdd(w, Mul(residual0, residual0), dot_rr_v);
-    abs_s_v = Add(abs_s_v, Mul(w, Abs(s)));
+    abs_r_unweighted_v = Add(abs_r_unweighted_v, Abs(residual0));
   }
   const float dot_mr = GetLane(SumOfLanes(df, dot_mr_v));
   const float dot_mm = GetLane(SumOfLanes(df, dot_mm_v));
   const float dot_rr = GetLane(SumOfLanes(df, dot_rr_v));
-  const float sum_abs_s = GetLane(SumOfLanes(df, abs_s_v));
-  const float energy = sum_abs_s / (weight_sum * fit_scale);
+  const float sum_abs_r_unweighted =
+      GetLane(SumOfLanes(df, abs_r_unweighted_v));
+  const float energy = sum_abs_r_unweighted / static_cast<float>(num);
   const float correlation =
       (dot_mm > 1e-8f && dot_rr > 1e-8f)
           ? std::abs(dot_mr) / std::sqrt(dot_mm * dot_rr)
@@ -119,8 +120,8 @@ int32_t FindBestMultiplierWeighted(
       static_cast<int>(std::round(target_delta * kDefaultColorFactor)),
       -128, 127);
 
-  // Suppress weak, low-energy predictions more aggressively to reduce chroma
-  // speckle and red/green oscillation. DC values are local to this tile.
+  // Retain the friend's low-energy suppression, but calculate both the
+  // correlation and energy relative to the actual no-CfL residual above.
   float deadzone_penalty = 1.0f;
   const float dc_neutral_threshold = (base == 0.0f) ? 0.10f : 0.35f;
   if (correlation < 0.20f && energy < 0.10f &&
@@ -131,9 +132,10 @@ int32_t FindBestMultiplierWeighted(
     deadzone_penalty = 1.8f;
   }
 
-  // Evaluate several multipliers in parallel. Each SIMD lane represents a
-  // candidate, while coefficients are accumulated one at a time. Candidate
-  // residuals worse than the no-CfL baseline receive a small extra penalty.
+  // The friend's native objective is weighted L1 residual in its own
+  // coefficient scale (q = Scale() * raw_quant_field). Do not divide this by
+  // weight_sum or reapply the restored 0.8.x 400x scale: either operation
+  // changes the relative strength of the friend's rate terms.
   constexpr float kOversatPenalty = 1.2f;
   auto evaluate = [&](const float* candidates, float* costs,
                       size_t candidate_count) {
@@ -158,34 +160,33 @@ int32_t FindBestMultiplierWeighted(
     }
   };
 
-  auto estimate_bits = [](int candidate) {
-    const int magnitude = std::abs(candidate);
-    if (magnitude == 0) return 0.8f;
-    if (magnitude == 1) return 2.0f;
-    return 2.5f + std::log2(static_cast<float>(magnitude));
+  // Approximate map coding cost from candidate - predictor. The predictor is
+  // read from an immutable snapshot prepared between parallel encoder phases.
+  auto estimate_bits = [](int candidate, int predictor) {
+    const int residual = std::abs(candidate - predictor);
+    if (residual == 0) return 0.8f;
+    if (residual == 1) return 2.0f;
+    return 2.5f + std::log2(static_cast<float>(residual));
   };
-  const float q_weight = std::max(0.25f, std::min(4.0f, tile_q));
-  const float lambda_bits = 0.02f * q_weight;
-  const float multiplier_cost = 0.0025f * q_weight;
+  const float lambda_bits = 0.005f * tile_q;
+  const float multiplier_bit_cost = 0.05f * tile_q;
   auto score = [&](int candidate, float distortion_sum) {
-    const float mean_distortion = distortion_sum / (weight_sum * fit_scale);
-    return mean_distortion + lambda_bits * estimate_bits(candidate) +
-           multiplier_cost * std::abs(candidate) * deadzone_penalty;
+    return distortion_sum + lambda_bits * estimate_bits(candidate, pred) +
+           std::abs(candidate) * multiplier_bit_cost * deadzone_penalty;
   };
 
-  int coarse_step = 8;
+  int coarse_step = 1;
   if (fast || cparams.speed_tier >= SpeedTier::kCheetah) {
-    coarse_step = 16;
-  } else if (cparams.speed_tier >= SpeedTier::kSquirrel) {
     coarse_step = 8;
-  } else if (cparams.speed_tier >= SpeedTier::kKitten) {
+  } else if (cparams.speed_tier >= SpeedTier::kHare) {
     coarse_step = 4;
-  } else {
+  } else if (cparams.speed_tier >= SpeedTier::kSquirrel) {
     coarse_step = 2;
   }
 
-  // The final working set is carved from existing per-thread transform scratch.
-  // The largest list is far below the 384-float stride.
+  // Reuse the transform scratch after coefficient extraction. Each SIMD lane
+  // represents a candidate multiplier, not an encoder thread or neighbouring
+  // tile, so the optimizer remains safe under RunOnPool.
   constexpr size_t kCandidateStride = 384;
   float* candidates = scratch_space;
   float* costs = candidates + kCandidateStride;
@@ -205,13 +206,16 @@ int32_t FindBestMultiplierWeighted(
   }
   add_candidate(127);
   add_candidate(0);
+  add_candidate(pred);
   add_candidate(target);
-  for (int d = -4; d <= 4; ++d) add_candidate(target + d);
+  for (int d = -4; d <= 4; ++d) {
+    add_candidate(target + d);
+    add_candidate(pred + d);
+  }
 
   size_t padded_candidates = num_candidates;
   while (padded_candidates % lanes != 0) {
-    candidates[padded_candidates] = candidates[0];
-    ++padded_candidates;
+    candidates[padded_candidates++] = candidates[0];
   }
   evaluate(candidates, costs, padded_candidates);
 
@@ -226,39 +230,39 @@ int32_t FindBestMultiplierWeighted(
     }
   }
 
-  // Refine both the coarse winner and the regression target on integer steps.
-  const int fine_radius = std::max(2, coarse_step / 2);
-  size_t num_fine = 0;
-  auto add_fine_candidate = [&](int candidate) {
-    if (candidate < -128 || candidate > 127) return;
-    for (size_t i = 0; i < num_fine; ++i) {
-      if (static_cast<int>(fine_candidates[i]) == candidate) return;
+  // Refine around the best candidate and least-squares target. Match the
+  // friend's search radius (one coarse step in either direction).
+  if (coarse_step > 1) {
+    size_t num_fine = 0;
+    auto add_fine_candidate = [&](int candidate) {
+      if (candidate < -128 || candidate > 127) return;
+      for (size_t i = 0; i < num_fine; ++i) {
+        if (static_cast<int>(fine_candidates[i]) == candidate) return;
+      }
+      fine_candidates[num_fine++] = static_cast<float>(candidate);
+    };
+    for (int d = -coarse_step; d <= coarse_step; ++d) {
+      add_fine_candidate(best_candidate + d);
+      add_fine_candidate(target + d);
     }
-    fine_candidates[num_fine++] = static_cast<float>(candidate);
-  };
-  for (int d = -fine_radius; d <= fine_radius; ++d) {
-    add_fine_candidate(best_candidate + d);
-    add_fine_candidate(target + d);
-  }
-  if (num_fine != 0) {
     size_t padded_fine = num_fine;
     while (padded_fine % lanes != 0) {
-      fine_candidates[padded_fine] = fine_candidates[0];
-      ++padded_fine;
+      fine_candidates[padded_fine++] = fine_candidates[0];
     }
-    evaluate(fine_candidates, fine_costs, padded_fine);
-    for (size_t i = 0; i < num_fine; ++i) {
-      const int candidate = static_cast<int>(fine_candidates[i]);
-      const float cost = score(candidate, fine_costs[i]);
-      if (cost < best_cost) {
-        best_cost = cost;
-        best_candidate = candidate;
+    if (num_fine != 0) {
+      evaluate(fine_candidates, fine_costs, padded_fine);
+      for (size_t i = 0; i < num_fine; ++i) {
+        const int candidate = static_cast<int>(fine_candidates[i]);
+        const float cost = score(candidate, fine_costs[i]);
+        if (cost < best_cost) {
+          best_cost = cost;
+          best_candidate = candidate;
+        }
       }
     }
   }
   return best_candidate;
 }
-
 Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
                      ImageF* dc_values) {
   // First row: Y channel
@@ -286,7 +290,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const CompressParams& cparams, const Rect& rect, bool fast,
                    bool use_dct8, ImageSB* map_x, ImageSB* map_b,
-                   ImageF* dc_values, Span<float> mem) {
+                   const ImageSB* predictor_map_x,
+                   const ImageSB* predictor_map_b, ImageF* dc_values,
+                   Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
@@ -402,16 +408,25 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       }
       const float qq =
           (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->Row(y)[x];
-      // Account for the local quantization field, while retaining the 0.8.x
-      // coefficient scale used by the already validated replacement. The
-      // residual objective is divided by fit_scale below, so its rate penalty
-      // stays in the same units at both CfL passes.
-      const float q_rate = use_dct8 ? 1.0f : quantizer->Scale() * qq;
-      const float fit_scale = use_dct8 ? 1.0f : 400.0f;
-      const float q = q_rate * fit_scale;
+      // This candidate uses the friend's native objective and scale. The
+      // old 0.8.x *400 scale belongs to the quadratic-like loss and must not
+      // be mixed into this weighted-L1 objective.
+      const float q = use_dct8 ? 1.0f : quantizer->Scale() * qq;
       const size_t block_count =
           acs.covered_blocks_x() * acs.covered_blocks_y();
-      tile_q_sum += q_rate * block_count;
+      float q_sum = 0.0f;
+      for (size_t qy = 0; qy < acs.covered_blocks_y(); ++qy) {
+        for (size_t qx = 0; qx < acs.covered_blocks_x(); ++qx) {
+          q_sum += (raw_quant_field == nullptr)
+                       ? 1.0f
+                       : raw_quant_field->Row(y + qy)[x + qx];
+        }
+      }
+      const float area_q = use_dct8
+                               ? 1.0f
+                               : quantizer->Scale() * q_sum /
+                                     static_cast<float>(block_count);
+      tile_q_sum += area_q * block_count;
       tile_q_blocks += block_count;
       const auto qv = Set(df, q);
 
@@ -457,8 +472,10 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   size_t dc_count = 0;
   for (size_t y = y0; y < y1; ++y) {
     for (size_t x = x0; x < x1; ++x) {
-      dc_sum_x += std::abs(dc_values_x[y * xsize_blocks + x]);
-      dc_sum_b += std::abs(dc_values_b[y * xsize_blocks + x]);
+      const size_t idx = y * xsize_blocks + x;
+      dc_sum_x += std::abs(dc_values_x[idx]);
+      dc_sum_b += std::abs(dc_values_b[idx] -
+                           jxl::cms::kYToBRatio * dc_values_yb[idx]);
       ++dc_count;
     }
   }
@@ -466,14 +483,25 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       dc_count == 0 ? 0.0f : dc_sum_x / static_cast<float>(dc_count);
   const float dc_avg_b =
       dc_count == 0 ? 0.0f : dc_sum_b / static_cast<float>(dc_count);
+  auto get_pred = [](const ImageSB* map, int tx, int ty) {
+    if (map == nullptr || (tx == 0 && ty == 0)) return 0;
+    if (tx == 0) return static_cast<int>(map->Row(ty - 1)[tx]);
+    if (ty == 0) return static_cast<int>(map->Row(ty)[tx - 1]);
+    const int left = map->Row(ty)[tx - 1];
+    const int top = map->Row(ty - 1)[tx];
+    const int top_left = map->Row(ty - 1)[tx - 1];
+    const int gradient = left + top - top_left;
+    return jxl::Clamp1(gradient, std::min(left, top), std::max(left, top));
+  };
+  const int pred_x = get_pred(predictor_map_x, tx, ty);
+  const int pred_b = get_pred(predictor_map_b, tx, ty);
   row_out_x[tx] = FindBestMultiplierWeighted(
-      coeffs_yx, coeffs_x, coeffs_w, num_ac, coeff_weight_sum,
-      use_dct8 ? 1.0f : 400.0f, 0.0f, tile_q, dc_avg_x, cparams, fast,
-      scratch_space);
+      coeffs_yx, coeffs_x, coeffs_w, num_ac, coeff_weight_sum, 0.0f, tile_q,
+      dc_avg_x, pred_x, cparams, fast, scratch_space);
   row_out_b[tx] = FindBestMultiplierWeighted(
       coeffs_yb, coeffs_b, coeffs_w, num_ac, coeff_weight_sum,
-      use_dct8 ? 1.0f : 400.0f, jxl::cms::kYToBRatio, tile_q, dc_avg_b,
-      cparams, fast, scratch_space);
+      jxl::cms::kYToBRatio, tile_q, dc_avg_b, pred_b, cparams, fast,
+      scratch_space);
   return true;
 }
 
@@ -502,14 +530,16 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const ImageI* raw_quant_field,
                                   const Quantizer* quantizer,
                                   const CompressParams& cparams, bool fast,
-                                  size_t thread, ColorCorrelationMap* cmap) {
+                                  size_t thread, ColorCorrelationMap* cmap,
+                                  const ImageSB* predictor_map_x,
+                                  const ImageSB* predictor_map_b) {
   bool use_dct8 = ac_strategy == nullptr;
   Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer,
-      cparams, r, fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values,
-      scratch);
+      cparams, r, fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map,
+      predictor_map_x, predictor_map_b, &dc_values, scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,

@@ -1197,7 +1197,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));
 
-  auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
+  auto tile_rect = [&](const uint32_t tid) {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
     size_t tx = tid % n_enc_tiles;
     size_t ty = tid / n_enc_tiles;
@@ -1207,48 +1207,92 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     size_t bx0 = tx * kEncTileDimInBlocks;
     size_t bx1 =
         std::min((tx + 1) * kEncTileDimInBlocks, frame_dim.xsize_blocks);
-    Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+    return Rect(bx0, by0, bx1 - bx0, by1 - by0);
+  };
 
-    // For speeds up to Wombat, we only compute the color correlation map
-    // once we know the transform type and the quantization map.
-    if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices,
-          /*ac_strategy=*/nullptr,
-          /*raw_quant_field=*/nullptr,
-          /*quantizer=*/nullptr, cparams, /*fast=*/false, thread, &cmap));
-    }
-
-    // Choose block sizes.
-    JXL_RETURN_IF_ERROR(
-        acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
-
-    // Always set the initial quant field, so we can compute the CfL map with
-    // more accuracy. The initial quant field might change in slower modes, but
-    // adjusting the quant field with butteraugli when all the other encoding
-    // parameters are fixed is likely a more reliable choice anyway.
-    JXL_RETURN_IF_ERROR(AdjustQuantField(
-        ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
-    quantizer.SetQuantFieldRect(initial_quant_field, r, &raw_quant_field);
-
-    // Compute a non-default CfL map if we are at Hare speed, or slower.
-    if (cparams.speed_tier <= SpeedTier::kHare) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field, &quantizer,
-          cparams, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread,
-          &cmap));
-    }
+  bool heuristics_prepared = false;
+  const auto prepare = [&](const size_t num_threads) -> Status {
+    if (heuristics_prepared) return true;
+    JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
+    JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
+    heuristics_prepared = true;
     return true;
+  };
+
+  // Phase 1: compute the initial CfL map completely before any tile consumes
+  // it. This both preserves the ACS dependency and avoids reads from map
+  // entries another worker has not written yet.
+  auto process_initial_cfl = [&](const uint32_t tid,
+                                 const size_t thread) -> Status {
+    if (cparams.speed_tier > SpeedTier::kSquirrel) return true;
+    const Rect r = tile_rect(tid);
+    return cfl_heuristics.ComputeTile(
+        r, *opsin, rect, matrices,
+        /*ac_strategy=*/nullptr,
+        /*raw_quant_field=*/nullptr,
+        /*quantizer=*/nullptr, cparams, /*fast=*/false, thread, &cmap);
   };
   size_t num_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks) *
                      DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
-  const auto prepare = [&](const size_t num_threads) -> Status {
-    JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
-    JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
+  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
+                                  process_initial_cfl,
+                                  "Enc Heuristics CfL1"));
+  }
+
+  // Phase 2: AC-strategy selection and quant-field preparation. All initial
+  // CfL values are now stable, and every raw-quant-field tile is ready before
+  // the final CfL pass begins.
+  auto process_ac_strategy = [&](const uint32_t tid,
+                                 const size_t thread) -> Status {
+    const Rect r = tile_rect(tid);
+    JXL_RETURN_IF_ERROR(
+        acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
+    JXL_RETURN_IF_ERROR(AdjustQuantField(
+        ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
+    quantizer.SetQuantFieldRect(initial_quant_field, r, &raw_quant_field);
     return true;
   };
-  JXL_RETURN_IF_ERROR(
-      RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
+                                process_ac_strategy,
+                                "Enc Heuristics AC strategy"));
+
+  // Phase 3: snapshot the pre-final map and compute final CfL values using
+  // that immutable predictor. Reading the live output map here would be a
+  // data race and make results depend on thread scheduling.
+  if (cparams.speed_tier <= SpeedTier::kHare) {
+    ImageSB predictor_map_x;
+    ImageSB predictor_map_b;
+    JXL_ASSIGN_OR_RETURN(
+        predictor_map_x,
+        ImageSB::Create(memory_manager, cmap.ytox_map.xsize(),
+                        cmap.ytox_map.ysize()));
+    JXL_ASSIGN_OR_RETURN(
+        predictor_map_b,
+        ImageSB::Create(memory_manager, cmap.ytob_map.xsize(),
+                        cmap.ytob_map.ysize()));
+    for (size_t y = 0; y < cmap.ytox_map.ysize(); ++y) {
+      std::copy(cmap.ytox_map.Row(y),
+                cmap.ytox_map.Row(y) + cmap.ytox_map.xsize(),
+                predictor_map_x.Row(y));
+      std::copy(cmap.ytob_map.Row(y),
+                cmap.ytob_map.Row(y) + cmap.ytob_map.xsize(),
+                predictor_map_b.Row(y));
+    }
+
+    auto process_final_cfl = [&](const uint32_t tid,
+                                 const size_t thread) -> Status {
+      const Rect r = tile_rect(tid);
+      return cfl_heuristics.ComputeTile(
+          r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+          &quantizer, cparams,
+          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap,
+          &predictor_map_x, &predictor_map_b);
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
+                                  process_final_cfl,
+                                  "Enc Heuristics CfL2"));
+  }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 

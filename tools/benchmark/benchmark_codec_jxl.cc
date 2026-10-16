@@ -389,9 +389,11 @@ class JxlCodec : public ImageCodec {
   Status SetDebugImageCallback(const std::string& filename, DebugTicket* ticket,
                                JXLCompressParams* cparams) {
     if (jxlargs->debug_image_dir.empty()) return true;
+    std::string safe_params = params_;
+    std::replace(safe_params.begin(), safe_params.end(), ':', '_');
     ticket->debug_prefix =
         JoinPath(jxlargs->debug_image_dir, FileBaseName(filename)) +
-        ".jxl-" + params_ + ".dbg";
+        ".jxl-" + safe_params + ".dbg";
     JXL_RETURN_IF_ERROR(MakeDir(ticket->debug_prefix));
     cparams->debug_image_opaque = ticket;
     cparams->debug_image = &DebugCallback;

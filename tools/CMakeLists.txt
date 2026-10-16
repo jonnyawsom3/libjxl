@@ -289,14 +289,17 @@ if(JPEGXL_ENABLE_BENCHMARK AND JPEGXL_ENABLE_TOOLS)
     endif()  # NOT WebP_STATIC_LINK_LIBRARY
   endif()
 
-  pkg_check_modules(AVIF IMPORTED_TARGET libavif)
-  if(AVIF_FOUND)
-    target_sources(benchmark_xl PRIVATE
-      "${CMAKE_CURRENT_LIST_DIR}/benchmark/benchmark_codec_avif.cc"
-      "${CMAKE_CURRENT_LIST_DIR}/benchmark/benchmark_codec_avif.h"
-    )
-    target_compile_definitions(benchmark_xl PRIVATE -DBENCHMARK_AVIF)
-    target_link_libraries(benchmark_xl PkgConfig::AVIF)
+  option(JPEGXL_ENABLE_BENCHMARK_AVIF "Enable AVIF support in benchmark_xl" OFF)
+  if(JPEGXL_ENABLE_BENCHMARK_AVIF)
+    pkg_check_modules(AVIF IMPORTED_TARGET libavif)
+    if(AVIF_FOUND)
+      target_sources(benchmark_xl PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/benchmark/benchmark_codec_avif.cc"
+        "${CMAKE_CURRENT_LIST_DIR}/benchmark/benchmark_codec_avif.h"
+      )
+      target_compile_definitions(benchmark_xl PRIVATE -DBENCHMARK_AVIF)
+      target_link_libraries(benchmark_xl PkgConfig::AVIF)
+    endif()
   endif()
 endif()  # JPEGXL_ENABLE_BENCHMARK
 

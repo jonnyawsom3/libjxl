@@ -77,7 +77,7 @@ bool IsDirectory(const std::string& fname) {
 Status MakeDir(const std::string& dirname) {
   size_t pos = 0;
   for (pos = dirname.size(); pos > 0; pos--) {
-    if (pos == dirname.size() || dirname[pos] == kPathSeparator) {
+    if (pos == dirname.size() || dirname[pos] == '/' || dirname[pos] == '\\') {
       // Found existing dir or regular file, break and then start creating
       // from here (in the latter case we'll get error below).
       if (PathExists(dirname.substr(0, pos + 1))) {
@@ -87,7 +87,7 @@ Status MakeDir(const std::string& dirname) {
     }
   }
   for (; pos <= dirname.size(); pos++) {
-    if (pos == dirname.size() || dirname[pos] == kPathSeparator) {
+    if (pos == dirname.size() || dirname[pos] == '/' || dirname[pos] == '\\') {
       std::string subdir = dirname.substr(0, pos + 1);
       if (mkdir(subdir.c_str(), 0777) && errno != EEXIST) {
         return JXL_FAILURE("Failed to create directory");
@@ -107,13 +107,13 @@ Status DeleteFile(const std::string& fname) {
 }
 
 std::string FileBaseName(const std::string& fname) {
-  size_t pos = fname.rfind('/');
+  size_t pos = fname.find_last_of("/\\");
   if (pos == std::string::npos) return fname;
   return fname.substr(pos + 1);
 }
 
 std::string FileDirName(const std::string& fname) {
-  size_t pos = fname.rfind('/');
+  size_t pos = fname.find_last_of("/\\");
   if (pos == std::string::npos) return ".";
   return fname.substr(0, pos);
 }
@@ -125,16 +125,16 @@ std::string FileExtension(const std::string& fname) {
 }
 
 std::string JoinPath(const std::string& first, const std::string& second) {
-  bool first_has_separator = !first.empty() && (first.back() == kPathSeparator);
-  bool second_has_separator = !second.empty() && (second[0] == kPathSeparator);
+  bool first_has_separator =
+      !first.empty() && (first.back() == '/' || first.back() == '\\');
+  bool second_has_separator =
+      !second.empty() && (second[0] == '/' || second[0] == '\\');
   if (!first_has_separator && !second_has_separator) {
     return first + kPathSeparator + second;
   }
   if (first_has_separator != second_has_separator) {
     return first + second;
   }
-  JXL_DEBUG_ABORT("Internal logic error");
-  // Alas, both have separator.
   return first + second.substr(1);
 }
 

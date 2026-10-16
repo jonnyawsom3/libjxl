@@ -2134,6 +2134,14 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       }
       frame_settings->values.strip_alpha = static_cast<int>(value);
       break;
+    case JXL_ENC_FRAME_SETTING_ADAPTIVE_QUANTIZATION:
+      if (value < -1 || value > 1) {
+        return JXL_API_ERROR(
+            frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
+            "Adaptive quantization option has to be in [-1..1]");
+      }
+      frame_settings->values.cparams.disable_aq = (value == 0);
+      break;
 
     default:
       return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
@@ -2231,6 +2239,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
     case JXL_ENC_FRAME_SETTING_JPEG_KEEP_JUMBF:
     case JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS:
     case JXL_ENC_FRAME_SETTING_STRIP_ALPHA:
+    case JXL_ENC_FRAME_SETTING_ADAPTIVE_QUANTIZATION:
       return JXL_API_ERROR(frame_settings->enc, JXL_ENC_ERR_NOT_SUPPORTED,
                            "Int option, try setting it with "
                            "JxlEncoderFrameSettingsSetOption");

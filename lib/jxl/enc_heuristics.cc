@@ -1139,7 +1139,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // on simple heuristics in FindBestAcStrategy, or set a constant for Falcon
   // mode.
   if (cparams.speed_tier > SpeedTier::kHare ||
-      cparams.disable_perceptual_optimizations) {
+      cparams.disable_perceptual_optimizations ||
+      cparams.disable_aq) {
     JXL_ASSIGN_OR_RETURN(initial_quant_field,
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
@@ -1150,7 +1151,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
-    if (cparams.disable_perceptual_optimizations) {
+    if (cparams.disable_perceptual_optimizations || cparams.disable_aq) {
       JXL_ASSIGN_OR_RETURN(
           initial_quant_masking1x1,
           ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
@@ -1303,7 +1304,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   }
 
   // Refine quantization levels.
-  if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
+  if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
+      !cparams.disable_aq) {
     ImageB& epf_sharpness = shared.epf_sharpness;
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     JXL_RETURN_IF_ERROR(FindBestQuantizer(frame_header, linear, *opsin,

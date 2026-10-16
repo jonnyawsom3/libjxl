@@ -428,6 +428,16 @@ struct CompressArgs {
                            &disable_perceptual_optimizations, &SetBooleanTrue,
                            4);
 
+    cmdline->AddOptionFlag(
+        '\0', "disable_aq",
+        "Disable adaptive quantization entirely (uses flat quantization).",
+        &disable_aq, &SetBooleanTrue, 3);
+
+    cmdline->AddOptionValue(
+        '\0', "aq", "0|1",
+        "0 = disable adaptive quantization (flat quant). 1 = enable AQ. Default = 1.",
+        &aq, &ParseOverride, 3);
+
     cmdline->AddHelpText("\nModular mode options:", 4);
 
     // modular mode options
@@ -557,6 +567,8 @@ struct CompressArgs {
 
   bool allow_expert_options = false;
   bool disable_perceptual_optimizations = false;
+  bool disable_aq = false;
+  jxl::Override aq = jxl::Override::kDefault;
 
   size_t faster_decoding = 0;
   int64_t resampling = -1;
@@ -743,6 +755,11 @@ void ProcessFlags(const jxl::extras::Codec codec,
   params->strip_alpha = static_cast<int32_t>(args->strip_alpha);
   if (args->disable_perceptual_optimizations) {
     params->AddOption(JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS, 1);
+  }
+  if (args->disable_aq || args->aq == jxl::Override::kOff) {
+    params->AddOption(JXL_ENC_FRAME_SETTING_ADAPTIVE_QUANTIZATION, 0);
+  } else if (args->aq == jxl::Override::kOn) {
+    params->AddOption(JXL_ENC_FRAME_SETTING_ADAPTIVE_QUANTIZATION, 1);
   }
 
   if (!args->frame_indexing.empty()) {

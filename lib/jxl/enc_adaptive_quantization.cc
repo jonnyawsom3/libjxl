@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -927,24 +928,77 @@ Status FindBestQuantization(const FrameHeader& frame_header,
                                        Rect(quant_field), original_butteraugli,
                                        &quant_field));
   ImageF tile_distmap;
+  ImageF diffmap;
   JXL_ASSIGN_OR_RETURN(
       ImageF initial_quant_field,
       ImageF::Create(memory_manager, quant_field.xsize(), quant_field.ysize()));
   JXL_RETURN_IF_ERROR(CopyImageTo(quant_field, &initial_quant_field));
+  JXL_ASSIGN_OR_RETURN(
+      ImageF initial_tile_distmap,
+      ImageF::Create(memory_manager,
+                     DivCeil(quant_field.xsize(), cparams.resampling),
+                     DivCeil(quant_field.ysize(), cparams.resampling)));
+  JXL_ASSIGN_OR_RETURN(
+      ImageF best_quant_field,
+      ImageF::Create(memory_manager, quant_field.xsize(), quant_field.ysize()));
+  JXL_RETURN_IF_ERROR(CopyImageTo(initial_quant_field, &best_quant_field));
+
+  // RoundtripImage is expensive. If the exact raw quantization map and the
+  // global quantizer parameters repeat, the encoded coefficients and decoded
+  // image are identical, so reuse the previous distortion map.
+  JXL_ASSIGN_OR_RETURN(
+      ImageI previous_raw_quant_field,
+      ImageI::Create(memory_manager, raw_quant_field.xsize(),
+                     raw_quant_field.ysize()));
+  QuantizerParams previous_quantizer_params{};
+  float previous_score = 0.0f;
+  bool have_previous_evaluation = false;
+  bool have_initial_tile_distmap = false;
+  bool have_acceptable_candidate = false;
+  double best_rate_proxy = std::numeric_limits<double>::infinity();
+
+  auto raw_quant_fields_equal = [](const ImageI& a, const ImageI& b) {
+    if (a.xsize() != b.xsize() || a.ysize() != b.ysize()) return false;
+    for (size_t y = 0; y < a.ysize(); ++y) {
+      const int32_t* const JXL_RESTRICT row_a = a.ConstRow(y);
+      const int32_t* const JXL_RESTRICT row_b = b.ConstRow(y);
+      for (size_t x = 0; x < a.xsize(); ++x) {
+        if (row_a[x] != row_b[x]) return false;
+      }
+    }
+    return true;
+  };
+
+  // Lower qf means coarser AC quantization and is generally cheaper. This is
+  // only a ranking proxy; feasibility is determined by the actual roundtrip
+  // Butteraugli score and its per-transform distortion map.
+  auto quantization_rate_proxy = [&]() {
+    double proxy = 0.0;
+    for (size_t y = 0; y < raw_quant_field.ysize(); ++y) {
+      const int32_t* const JXL_RESTRICT row = raw_quant_field.ConstRow(y);
+      for (size_t x = 0; x < raw_quant_field.xsize(); ++x) {
+        const float effective_qf =
+            quantizer.Scale() * static_cast<float>(row[x]);
+        proxy += std::log(std::max(1.0e-6f, effective_qf));
+      }
+    }
+    return proxy;
+  };
 
   float initial_qf_min;
   float initial_qf_max;
   ImageMinMax(initial_quant_field, &initial_qf_min, &initial_qf_max);
-  float initial_qf_ratio = initial_qf_max / initial_qf_min;
+  const float initial_qf_ratio = initial_qf_max / initial_qf_min;
   float qf_max_deviation_low = std::sqrt(250 / initial_qf_ratio);
-  float asymmetry = 2;
+  float asymmetry = 2.0f;
   if (qf_max_deviation_low < asymmetry) asymmetry = qf_max_deviation_low;
-  float qf_lower = initial_qf_min / (asymmetry * qf_max_deviation_low);
-  float qf_higher = initial_qf_max * (qf_max_deviation_low / asymmetry);
+  const float qf_lower =
+      initial_qf_min / (asymmetry * qf_max_deviation_low);
+  const float qf_higher =
+      initial_qf_max * (qf_max_deviation_low / asymmetry);
 
   JXL_ENSURE(qf_higher / qf_lower < 253);
 
-  constexpr int kOriginalComparisonRound = 1;
   int iters = kDefaultButteraugliIters;
   if (cparams.speed_tier == SpeedTier::kTortoise) {
     iters = kMaxButteraugliIters;
@@ -959,28 +1013,58 @@ Status FindBestQuantization(const FrameHeader& frame_header,
         printf("\n");
       }
     }
+
     JXL_RETURN_IF_ERROR(quantizer.SetQuantField(initial_quant_dc, quant_field,
                                                 &raw_quant_field));
-    JXL_ASSIGN_OR_RETURN(
-        ImageBundle dec_linear,
-        RoundtripImage(frame_header, opsin, enc_state, cms, pool));
+    const QuantizerParams current_params = quantizer.GetParams();
+    bool same_as_previous =
+        have_previous_evaluation &&
+        current_params.global_scale ==
+            previous_quantizer_params.global_scale &&
+        current_params.quant_dc == previous_quantizer_params.quant_dc &&
+        raw_quant_fields_equal(raw_quant_field, previous_raw_quant_field);
+    // Debug mode must perform every roundtrip so that each dumped iteration
+    // corresponds to the actual candidate under inspection.
+    if (JXL_DEBUG_ADAPTIVE_QUANTIZATION) same_as_previous = false;
+
     float score;
-    ImageF diffmap;
-    JXL_RETURN_IF_ERROR(comparator.CompareWith(dec_linear, &diffmap, &score));
-    if (!lower_is_better) {
-      score = -score;
-      ScaleImage(-1.0f, &diffmap);
+    if (same_as_previous) {
+      score = previous_score;
+    } else {
+      JXL_ASSIGN_OR_RETURN(
+          ImageBundle dec_linear,
+          RoundtripImage(frame_header, opsin, enc_state, cms, pool));
+      JXL_RETURN_IF_ERROR(comparator.CompareWith(dec_linear, &diffmap, &score));
+      if (!lower_is_better) {
+        score = -score;
+        ScaleImage(-1.0f, &diffmap);
+      }
+      JXL_ASSIGN_OR_RETURN(tile_distmap,
+                           TileDistMap(diffmap, 8 * cparams.resampling, 0,
+                                       enc_state->shared.ac_strategy));
+      if (JXL_DEBUG_ADAPTIVE_QUANTIZATION && WantDebugOutput(cparams)) {
+        JXL_RETURN_IF_ERROR(DumpImage(cparams, ("dec" + ToString(i)).c_str(),
+                                      *dec_linear.color()));
+        JXL_RETURN_IF_ERROR(DumpHeatmaps(cparams, aux_out, butteraugli_target,
+                                         quant_field, tile_distmap, diffmap));
+      }
+      if (aux_out != nullptr) ++aux_out->num_butteraugli_iters;
+      JXL_RETURN_IF_ERROR(
+          CopyImageTo(raw_quant_field, &previous_raw_quant_field));
+      previous_quantizer_params = current_params;
+      previous_score = score;
+      have_previous_evaluation = true;
     }
-    JXL_ASSIGN_OR_RETURN(tile_distmap,
-                         TileDistMap(diffmap, 8 * cparams.resampling, 0,
-                                     enc_state->shared.ac_strategy));
-    if (JXL_DEBUG_ADAPTIVE_QUANTIZATION && WantDebugOutput(cparams)) {
-      JXL_RETURN_IF_ERROR(DumpImage(cparams, ("dec" + ToString(i)).c_str(),
-                                    *dec_linear.color()));
-      JXL_RETURN_IF_ERROR(DumpHeatmaps(cparams, aux_out, butteraugli_target,
-                                       quant_field, tile_distmap, diffmap));
+
+    if (!have_initial_tile_distmap) {
+      JXL_ASSIGN_OR_RETURN(
+          initial_tile_distmap,
+          ImageF::Create(memory_manager, tile_distmap.xsize(),
+                         tile_distmap.ysize()));
+      JXL_RETURN_IF_ERROR(CopyImageTo(tile_distmap, &initial_tile_distmap));
+      have_initial_tile_distmap = true;
     }
-    if (aux_out != nullptr) ++aux_out->num_butteraugli_iters;
+
     if (JXL_DEBUG_ADAPTIVE_QUANTIZATION) {
       float minval;
       float maxval;
@@ -995,86 +1079,86 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       }
     }
 
+    // A useful AQ candidate must stay within the requested global distance and
+    // must not make any transform worse than both its baseline distortion and
+    // the target. This deliberately permits using quality headroom: unlike a
+    // score-vs-baseline guard, it can accept a coarser field whose score is a
+    // little worse than the fast field but still meets the requested target.
+    const float global_tolerance =
+        std::max(1.0e-4f, 0.01f * original_butteraugli);
+    bool acceptable = score <= original_butteraugli + global_tolerance;
+    for (size_t y = 0; acceptable && y < tile_distmap.ysize(); ++y) {
+      const float* const JXL_RESTRICT row_candidate = tile_distmap.ConstRow(y);
+      const float* const JXL_RESTRICT row_initial =
+          initial_tile_distmap.ConstRow(y);
+      for (size_t x = 0; x < tile_distmap.xsize(); ++x) {
+        const float allowed = std::max(row_initial[x], original_butteraugli);
+        const float tolerance = std::max(1.0e-4f, 0.02f * allowed);
+        if (row_candidate[x] > allowed + tolerance) {
+          acceptable = false;
+          break;
+        }
+      }
+    }
+
+    if (acceptable) {
+      const double proxy = quantization_rate_proxy();
+      if (!have_acceptable_candidate || proxy < best_rate_proxy) {
+        JXL_RETURN_IF_ERROR(CopyImageTo(quant_field, &best_quant_field));
+        best_rate_proxy = proxy;
+        have_acceptable_candidate = true;
+      }
+    }
+
     if (i == iters) break;
 
-    double kPow[8] = {
-        0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    };
-    double kPowMod[8] = {
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    };
-    if (i == kOriginalComparisonRound) {
-      // Don't allow optimization to make the quant field a lot worse than
-      // what the initial guess was. This allows the AC field to have enough
-      // precision to reduce the oscillations due to the dc reconstruction.
-      double kInitMul = 0.6;
-      const double kOneMinusInitMul = 1.0 - kInitMul;
-      for (size_t y = 0; y < quant_field.ysize(); ++y) {
-        float* const JXL_RESTRICT row_q = quant_field.Row(y);
-        const float* const JXL_RESTRICT row_init = initial_quant_field.Row(y);
-        for (size_t x = 0; x < quant_field.xsize(); ++x) {
-          double clamp = kOneMinusInitMul * row_q[x] + kInitMul * row_init[x];
-          if (row_q[x] < clamp) {
-            row_q[x] = clamp;
-            if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-            if (row_q[x] < qf_lower) row_q[x] = qf_lower;
-          }
-        }
-      }
-    }
+    // The previous controller treated over-target tiles with a full linear
+    // update but under-target tiles with only a 0.2 power, then additionally
+    // clamped coarsening toward the initial field. Together these choices
+    // strongly favored spending bits over recovering them. Use a damped,
+    // symmetric multiplicative controller instead: qf is the AC quantization
+    // multiplier, so larger qf refines an over-target tile and smaller qf
+    // coarsens an under-target tile. Limit each update to avoid oscillation.
+    constexpr float kFeedbackExponent = 0.5f;
+    constexpr float kMinStep = 0.5f;
+    constexpr float kMaxStep = 2.0f;
+    for (size_t y = 0; y < quant_field.ysize(); ++y) {
+      const float* const JXL_RESTRICT row_dist = tile_distmap.ConstRow(y);
+      float* const JXL_RESTRICT row_q = quant_field.Row(y);
+      for (size_t x = 0; x < quant_field.xsize(); ++x) {
+        const float diff = std::max(0.0f, row_dist[x] / original_butteraugli);
+        const float step = std::min(
+            kMaxStep, std::max(kMinStep, std::pow(diff, kFeedbackExponent)));
+        const float old = row_q[x];
+        float updated = old * step;
 
-    double cur_pow = 0.0;
-    if (i < 7) {
-      cur_pow = kPow[i] + (original_butteraugli - 1.0) * kPowMod[i];
-      if (cur_pow < 0) {
-        cur_pow = 0;
+        // If the proposed change rounds to the same serialized raw quant
+        // field value, take one step in the intended direction. Previously
+        // this was done only for refinement, not for coarsening, making the
+        // loop biased against removing needless bits in under-target tiles.
+        const int qf_old = static_cast<int>(
+            std::lround(old * quantizer.InvGlobalScale()));
+        const int qf_new = static_cast<int>(
+            std::lround(updated * quantizer.InvGlobalScale()));
+        constexpr float kDistDeadband = 0.02f;
+        if (qf_old == qf_new &&
+            (diff > 1.0f + kDistDeadband ||
+             diff < 1.0f - kDistDeadband)) {
+          updated = old + (diff > 1.0f ? quantizer.Scale()
+                                       : -quantizer.Scale());
+        }
+        row_q[x] = std::min(qf_higher, std::max(qf_lower, updated));
       }
     }
-    if (cur_pow == 0.0) {
-      for (size_t y = 0; y < quant_field.ysize(); ++y) {
-        const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
-        float* const JXL_RESTRICT row_q = quant_field.Row(y);
-        for (size_t x = 0; x < quant_field.xsize(); ++x) {
-          const float diff = row_dist[x] / original_butteraugli;
-          if (diff > 1.0f) {
-            float old = row_q[x];
-            row_q[x] *= diff;
-            int qf_old =
-                static_cast<int>(std::lround(old * quantizer.InvGlobalScale()));
-            int qf_new = static_cast<int>(
-                std::lround(row_q[x] * quantizer.InvGlobalScale()));
-            if (qf_old == qf_new) {
-              row_q[x] = old + quantizer.Scale();
-            }
-          }
-          if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-          if (row_q[x] < qf_lower) row_q[x] = qf_lower;
-        }
-      }
-    } else {
-      for (size_t y = 0; y < quant_field.ysize(); ++y) {
-        const float* const JXL_RESTRICT row_dist = tile_distmap.Row(y);
-        float* const JXL_RESTRICT row_q = quant_field.Row(y);
-        for (size_t x = 0; x < quant_field.xsize(); ++x) {
-          const float diff = row_dist[x] / original_butteraugli;
-          if (diff <= 1.0f) {
-            row_q[x] *= std::pow(diff, cur_pow);
-          } else {
-            float old = row_q[x];
-            row_q[x] *= diff;
-            int qf_old =
-                static_cast<int>(std::lround(old * quantizer.InvGlobalScale()));
-            int qf_new = static_cast<int>(
-                std::lround(row_q[x] * quantizer.InvGlobalScale()));
-            if (qf_old == qf_new) {
-              row_q[x] = old + quantizer.Scale();
-            }
-          }
-          if (row_q[x] > qf_higher) row_q[x] = qf_higher;
-          if (row_q[x] < qf_lower) row_q[x] = qf_lower;
-        }
-      }
-    }
+  }
+
+  // If no refined field met both the requested global target and per-transform
+  // no-regression check, keep the fast AQ field instead of returning an
+  // unverified last iteration.
+  if (have_acceptable_candidate) {
+    JXL_RETURN_IF_ERROR(CopyImageTo(best_quant_field, &quant_field));
+  } else {
+    JXL_RETURN_IF_ERROR(CopyImageTo(initial_quant_field, &quant_field));
   }
   JXL_RETURN_IF_ERROR(
       quantizer.SetQuantField(initial_quant_dc, quant_field, &raw_quant_field));

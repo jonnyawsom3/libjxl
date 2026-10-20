@@ -385,7 +385,7 @@ Status InvSqueeze(Image &input, const std::vector<SqueezeParams> &parameters,
 }
 
 void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
-                              const Image &image) {
+                              const Image &image, bool include_chroma) {
   int nb_channels = image.channel.size() - image.nb_meta_channels;
 
   parameters->clear();
@@ -397,7 +397,8 @@ void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
   // do horizontal first on wide images; vertical first on tall images
   bool wide = (w > h);
 
-  if (nb_channels > 2 && image.channel[image.nb_meta_channels + 1].w == w &&
+  if (include_chroma && nb_channels > 2 &&
+      image.channel[image.nb_meta_channels + 1].w == w &&
       image.channel[image.nb_meta_channels + 1].h == h) {
     // assume channels 1 and 2 are chroma, and can be squeezed first for 4:2:0
     // previews

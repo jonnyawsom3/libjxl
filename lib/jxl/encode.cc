@@ -1868,6 +1868,12 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       break;
   }
 
+  if (option == JXL_ENC_FRAME_SETTING_SQUEEZE && value < -2) {
+    return JXL_API_ERROR(
+        frame_settings->enc, JXL_ENC_ERR_API_USAGE,
+        "Squeeze value has to be -2, -1, 0, or a positive step count");
+  }
+
   switch (option) {
     case JXL_ENC_FRAME_SETTING_EFFORT:
       if (frame_settings->enc->allow_expert_options) {
@@ -1974,6 +1980,11 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
       break;
     case JXL_ENC_FRAME_SETTING_RESPONSIVE:
       frame_settings->values.cparams.responsive = value;
+      break;
+    case JXL_ENC_FRAME_SETTING_SQUEEZE:
+      frame_settings->values.cparams.squeeze_mode = value;
+      frame_settings->values.cparams.responsive =
+          value == 0 ? 0 : (value > 0 ? 1 : -1);
       break;
     case JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC:
       frame_settings->values.cparams.progressive_mode =
@@ -2210,6 +2221,7 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetFloatOption(
     case JXL_ENC_FRAME_SETTING_GROUP_ORDER_CENTER_X:
     case JXL_ENC_FRAME_SETTING_GROUP_ORDER_CENTER_Y:
     case JXL_ENC_FRAME_SETTING_RESPONSIVE:
+    case JXL_ENC_FRAME_SETTING_SQUEEZE:
     case JXL_ENC_FRAME_SETTING_PROGRESSIVE_AC:
     case JXL_ENC_FRAME_SETTING_QPROGRESSIVE_AC:
     case JXL_ENC_FRAME_SETTING_PROGRESSIVE_DC:

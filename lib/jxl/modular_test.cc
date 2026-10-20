@@ -52,6 +52,7 @@
 #include "lib/jxl/modular/encoding/encoding.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
+#include "lib/jxl/modular/transform/squeeze.h"
 #include "lib/jxl/modular/transform/squeeze_params.h"
 #include "lib/jxl/modular/transform/transform.h"
 #include "lib/jxl/padded_bytes.h"
@@ -287,6 +288,26 @@ TEST(ModularTest, RoundtripLossy16) {
                           *JxlGetDefaultCms(),
                           /*distmap=*/nullptr),
       1.8);
+}
+
+TEST(ModularTest, DefaultSqueezeParametersChromaOption) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  JXL_TEST_ASSIGN_OR_DIE(Image image,
+                         Image::Create(memory_manager, 64, 32,
+                                       /*bitdepth=*/8, /*nb_channels=*/3));
+  std::vector<SqueezeParams> with_chroma;
+  std::vector<SqueezeParams> without_chroma;
+  DefaultSqueezeParameters(&with_chroma, image);
+  DefaultSqueezeParameters(&without_chroma, image, /*include_chroma=*/false);
+
+  ASSERT_EQ(with_chroma.size(), without_chroma.size() + 2);
+  ASSERT_GE(without_chroma.size(), 2u);
+  EXPECT_FALSE(with_chroma[0].in_place);
+  EXPECT_EQ(with_chroma[0].begin_c, 1u);
+  EXPECT_TRUE(without_chroma[0].in_place);
+  EXPECT_EQ(without_chroma[0].begin_c, 0u);
+  EXPECT_TRUE(without_chroma[0].horizontal);
+  EXPECT_FALSE(without_chroma[1].horizontal);
 }
 
 TEST(ModularTest, RoundtripExtraProperties) {

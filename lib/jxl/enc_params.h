@@ -11,6 +11,7 @@
 #include <jxl/cms_interface.h>
 #include <jxl/encode.h>
 #include <stddef.h>
+#include <cstdint>
 
 #include <vector>
 
@@ -114,6 +115,8 @@ struct CompressParams {
 
   // TODO(eustas): use Override?
   int responsive = -1;
+  // -3 uses the default squeeze sequence; -2/-1 select its automatic variants.
+  int64_t squeeze_mode = -3;
   int colorspace = -1;
   int move_to_front_from_channel = -1;
 

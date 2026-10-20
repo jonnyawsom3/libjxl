@@ -438,6 +438,14 @@ typedef enum {
    */
   JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS = 42,
 
+  /** Controls the Squeeze transform for modular encoding. Use -2 to let the
+   * encoder decide whether to squeeze and use the default sequence down to 8px
+   * (including the chroma pre-squeeze), -1 for the same automatic decision
+   * without the chroma pre-squeeze, 0 to disable Squeeze, or a positive value
+   * for the number of squeeze steps without the chroma pre-squeeze.
+   */
+  JXL_ENC_FRAME_SETTING_SQUEEZE = 43,
+
   /** Enum value not to be used as an option. This value is added to force the
    * C compiler to have the enum to take a known size.
    */

@@ -58,6 +58,9 @@ inline bool ParsePhotonNoiseParameter(const char* arg, float* out) {
 inline bool ParseIntensityTarget(const char* arg, float* out) {
   return ParseFloat(arg, out) && *out > 0;
 }
+inline bool ParseResponsive(const char* arg, int64_t* out) {
+  return ParseInt64(arg, out) && *out >= -2;
+}
 }  // namespace
 
 enum CjxlRetCode : int {
@@ -496,10 +499,17 @@ struct CompressArgs {
         &modular_channel_colors_group_percent, &ParseFloat, 4);
 
     opt_responsive_id = cmdline->AddOptionValue(
-        'R', "responsive", "0|1",
-        "0 = don't apply the Squeeze transform. Default for lossless output.\n"
-        "    1 = apply the Squeeze transform. Default for lossy output.",
-        &responsive, &ParseInt64, 4);
+        'R', "responsive", "-2|-1|0|N",
+        "Squeeze transform mode for modular encoding:\n"
+        "   -2 = encoder decides whether to squeeze; use the default sequence\n"
+        "        down to 8px, including the chroma pre-squeeze (default).\n"
+        "   -1 = encoder decides whether to squeeze; use the default sequence\n"
+        "        down to 8px, without the chroma pre-squeeze.\n"
+        "    0 = don't apply the Squeeze transform.\n"
+        "    N = apply N squeeze steps, without the chroma pre-squeeze.\n"
+        "        Each step halves width or height, rounding up. If both\n"
+        "        dimensions exceed 8px, 2 steps halve both dimensions.",
+        &responsive, &ParseResponsive, 4);
   }
 
   // Common flags.
@@ -575,7 +585,7 @@ struct CompressArgs {
   float photon_noise_iso = 0;
   int64_t codestream_level = -1;
   int64_t buffering = -1;
-  int64_t responsive = -1;
+  int64_t responsive = -2;
   float distance = 1.0;
   float alpha_distance = 1.0;
   size_t effort = 7;
@@ -813,6 +823,7 @@ void ProcessFlags(const jxl::extras::Codec codec,
   SetDistanceFromFlags(cmdline, args, params, codec);
 
   bool responsive_set = cmdline->GetOption(args->opt_responsive_id)->matched();
+  bool progressive_responsive_override = false;
 
   // Set progressive options before processing flags
   if (args->progressive) {
@@ -828,9 +839,11 @@ void ProcessFlags(const jxl::extras::Codec codec,
     if (args->patches == jxl::Override::kDefault) {
       args->patches = jxl::Override::kOff;
     }
-    if (args->responsive == -1) {
+    if (!responsive_set) {
+      // Force the full default squeeze sequence unless -R was explicitly set.
       args->responsive = 1;
       responsive_set = true;
+      progressive_responsive_override = true;
     }
   }
 
@@ -860,7 +873,10 @@ void ProcessFlags(const jxl::extras::Codec codec,
 
   if (responsive_set) {
     ProcessFlag("responsive", args->responsive,
-                JXL_ENC_FRAME_SETTING_RESPONSIVE, params);
+                progressive_responsive_override
+                    ? JXL_ENC_FRAME_SETTING_RESPONSIVE
+                    : JXL_ENC_FRAME_SETTING_SQUEEZE,
+                params);
   }
   if (args->qprogressive_ac) {
     ProcessFlag("qprogressive_ac", static_cast<int64_t>(1),

@@ -77,7 +77,7 @@ inline pixel_type_w SmoothTendency(pixel_type_w B, pixel_type_w a,
 }
 
 void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
-                              const Image &image);
+                              const Image &image, bool include_chroma = true);
 
 Status CheckMetaSqueezeParams(const SqueezeParams &parameter, int num_channels);
 

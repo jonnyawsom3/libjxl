@@ -464,6 +464,10 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   frame_dim_ = frame_header.ToFrameDimensions();
   cparams_ = cparams_orig;
 
+  squeeze_steps_ = cparams_.squeeze_mode >= 0 ? cparams_.squeeze_mode : -1;
+  // -2/-3 retain the legacy chroma pre-squeeze; -1 and nonnegative counts omit it.
+  squeeze_chroma_ = cparams_.squeeze_mode < -1;
+
   size_t num_streams =
       ModularStreamId::Num(frame_dim_, frame_header.passes.num_passes);
 
@@ -947,7 +951,11 @@ Status ModularFrameEncoder::ComputeEncodingData(
     Transform t(TransformId::kSqueeze);
     // Check if default squeeze parameters are ok.
     std::vector<SqueezeParams> params;
-    DefaultSqueezeParameters(&params, gi);
+    DefaultSqueezeParameters(&params, gi, squeeze_chroma_);
+    if (squeeze_steps_ >= 0 &&
+        static_cast<uint64_t>(squeeze_steps_) < params.size()) {
+      params.resize(static_cast<size_t>(squeeze_steps_));
+    }
     // If image is smaller than group_dim, then default squeeze parameters
     // are not going too far. Else, channel size don't turn zero. Thus we only
     // check if tile does not go to zero-dim.
@@ -964,12 +972,19 @@ Status ModularFrameEncoder::ComputeEncodingData(
       // In case we squeeze too much, truncate squeeze script.
       if (std::max(hshift, vshift) > shift_cap + dc_boost) {
         params.resize(i - 1);
-        t.squeezes = params;
         break;
       }
     }
-    do_transform(gi, t, weighted::Header(), pool);
-    max_bitdepth += 2;
+    // An empty custom list means that the requested sequence has no steps.
+    // Keep legacy behavior for the default chroma sequence, where an empty
+    // list also requests automatic squeeze parameters.
+    if (!params.empty() || (squeeze_chroma_ && squeeze_steps_ < 0)) {
+      // Pass the selected script explicitly; an empty script would make the
+      // transform regenerate the default (possibly chroma-subsampled) script.
+      t.squeezes = params;
+      do_transform(gi, t, weighted::Header(), pool);
+      max_bitdepth += 2;
+    }
   }
 
   if (max_bitdepth + 1 > level_max_bitdepth) {

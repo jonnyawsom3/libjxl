@@ -15,7 +15,13 @@
 
 namespace jxl {
 
-StatusOr<float> EstimateCost(const Image& img);
+// Estimates the modular residual cost for the inclusive channel range
+// [begin_c, end_c]. By default all channels and the clamped-gradient
+// predictor are used. `use_zero_predictor` models streams whose residual
+// channels are encoded with Predictor::Zero.
+StatusOr<float> EstimateCost(
+    const Image& img, size_t begin_c = 0,
+    size_t end_c = static_cast<size_t>(-1), bool use_zero_predictor = false);
 
 namespace estimate_cost_detail {
 constexpr size_t kLastThreshold = 501;

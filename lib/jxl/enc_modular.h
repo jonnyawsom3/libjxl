@@ -119,6 +119,8 @@ class ModularFrameEncoder {
   CompressParams cparams_;
   int64_t squeeze_levels_ = -1;
   bool squeeze_chroma_ = true;
+  // Number of channels present before Squeeze adds AC residual channels.
+  size_t squeeze_base_channel_count_ = 0;
   std::vector<size_t> tree_splits_;
   std::vector<std::vector<uint32_t>> gi_channel_;
   std::vector<size_t> image_widths_;

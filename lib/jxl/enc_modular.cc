@@ -330,6 +330,247 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
   return did_it;
 }
 
+// True for images where adjacent identical RGB pixels are uncommon. In this
+// case, applying a color transform before Squeeze tends to preserve channel
+// correlation better than squeezing the original RGB channels independently.
+bool IsContinuousToneRGB(const Image& image, size_t begin_c,
+                         size_t flat_mult = 8) {
+  if (begin_c + 2 >= image.channel.size()) return false;
+  const Channel& r = image.channel[begin_c + 0];
+  const Channel& g = image.channel[begin_c + 1];
+  const Channel& b = image.channel[begin_c + 2];
+  if (r.w != g.w || r.w != b.w || r.h != g.h || r.h != b.h ||
+      r.hshift != g.hshift || r.hshift != b.hshift ||
+      r.vshift != g.vshift || r.vshift != b.vshift || r.w < 2) {
+    return false;
+  }
+  uint64_t flat_pairs = 0;
+  uint64_t total_pairs = 0;
+  for (size_t y = 0; y < r.h; ++y) {
+    const pixel_type* rr = r.Row(y);
+    const pixel_type* gg = g.Row(y);
+    const pixel_type* bb = b.Row(y);
+    total_pairs += r.w - 1;
+    for (size_t x = 1; x < r.w; ++x) {
+      if (rr[x] == rr[x - 1] && gg[x] == gg[x - 1] &&
+          bb[x] == bb[x - 1]) {
+        ++flat_pairs;
+      }
+    }
+  }
+  return total_pairs != 0 && flat_pairs * flat_mult < total_pairs;
+}
+
+std::vector<int> RctCandidatesForSpeed(SpeedTier speed_tier) {
+  // Order these so the cheaper effort tiers examine the transforms that most
+  // often help first. The no-op is always included as the baseline.
+  static constexpr int kCandidates[] = {
+      0, 6, 5, 10, 26, 40, 12, 19, 8, 4, 9, 15, 16, 17, 32, 33, 2, 1, 3};
+  size_t count = 3;
+  if (speed_tier <= SpeedTier::kHare) {
+    switch (speed_tier) {
+      case SpeedTier::kTectonicPlate:
+      case SpeedTier::kGlacier:
+      case SpeedTier::kTortoise:
+        count = 19;
+        break;
+      case SpeedTier::kKitten:
+        count = 9;
+        break;
+      case SpeedTier::kSquirrel:
+        count = 7;
+        break;
+      case SpeedTier::kWombat:
+        count = 5;
+        break;
+      case SpeedTier::kHare:
+        count = 4;
+        break;
+      default:
+        count = 3;
+        break;
+    }
+  }
+  return std::vector<int>(kCandidates, kCandidates + count);
+}
+
+struct RctChoice {
+  int rct_type = 0;
+  float cost = 0.0f;
+};
+
+// Finds the lowest estimated cost for a set of same-sized RGB triplets within
+// a channel chunk. Input channel values are restored before returning.
+StatusOr<RctChoice> FindBestRctForChunk(
+    Image& image, const std::vector<size_t>& rgb_starts, size_t chunk_begin,
+    size_t chunk_end, bool use_zero_predictor, SpeedTier speed_tier,
+    ThreadPool* pool) {
+  JXL_ASSIGN_OR_RETURN(float original_cost,
+                       EstimateCost(image, chunk_begin, chunk_end,
+                                    use_zero_predictor));
+  RctChoice best{0, original_cost};
+  if (rgb_starts.empty()) return best;
+
+  std::vector<size_t> saved_indices;
+  std::vector<Channel> saved_channels;
+  for (size_t start : rgb_starts) {
+    for (size_t c = 0; c < 3; ++c) {
+      const size_t index = start + c;
+      const Channel& source = image.channel[index];
+      JXL_ASSIGN_OR_RETURN(
+          Channel copy,
+          Channel::Create(source.memory_manager(), source.w, source.h,
+                          source.hshift, source.vshift));
+      copy.component = source.component;
+      JXL_RETURN_IF_ERROR(CopyImageTo(source.plane, &copy.plane));
+      saved_indices.push_back(index);
+      saved_channels.emplace_back(std::move(copy));
+    }
+  }
+
+  for (int rct_type : RctCandidatesForSpeed(speed_tier)) {
+    for (size_t i = 0; i < saved_indices.size(); ++i) {
+      JXL_RETURN_IF_ERROR(CopyImageTo(
+          saved_channels[i].plane, &image.channel[saved_indices[i]].plane));
+    }
+    if (rct_type != 0) {
+      for (size_t start : rgb_starts) {
+        JXL_RETURN_IF_ERROR(FwdRct(image, start, rct_type, pool));
+      }
+    }
+    JXL_ASSIGN_OR_RETURN(float cost,
+                         EstimateCost(image, chunk_begin, chunk_end,
+                                      use_zero_predictor));
+    if (cost < best.cost) best = {rct_type, cost};
+  }
+
+  for (size_t i = 0; i < saved_indices.size(); ++i) {
+    JXL_RETURN_IF_ERROR(CopyImageTo(
+        saved_channels[i].plane, &image.channel[saved_indices[i]].plane));
+  }
+  return best;
+}
+
+// Tries a multi-channel palette against the best RCT estimate. The palette
+// metachannel is estimated with ClampedGradient; the indexed/residual channels
+// use the predictor appropriate for this squeeze chunk.
+StatusOr<bool> TryChunkPalette(Image& image, size_t chunk_begin,
+                               size_t chunk_end, float best_rct_cost,
+                               bool use_zero_predictor,
+                               const CompressParams& cparams,
+                               ThreadPool* pool) {
+  const size_t num_channels = chunk_end - chunk_begin + 1;
+  // Palette's serialized num_c field supports 1, 3, 4, and values >= 5,
+  // but not 2. Two-channel chunks can still use per-channel compaction below.
+  if (num_channels < 3 || cparams.palette_colors == 0 ||
+      cparams.lossy_palette) {
+    return false;
+  }
+  const float num_pixels = image.channel[chunk_begin].w *
+                           image.channel[chunk_begin].h;
+  const int max_colors = std::min(
+      static_cast<int>(best_rct_cost * 0.0005f + num_pixels / 128 + 128),
+      std::abs(cparams.palette_colors));
+  if (max_colors < 2) return false;
+
+  const auto try_palette = [&](size_t palette_channels) -> StatusOr<bool> {
+    Transform palette(TransformId::kPalette);
+    palette.begin_c = chunk_begin;
+    palette.num_c = palette_channels;
+    palette.nb_colors = max_colors;
+    palette.ordered_palette = cparams.palette_colors >= 0;
+    bool did_transform = do_transform(image, palette, weighted::Header(), pool,
+                                      cparams.options.zero_tokens);
+    if (!did_transform) return false;
+
+    float cost_after = 0.0f;
+    JXL_ASSIGN_OR_RETURN(cost_after, EstimateCost(image, 0, 0, false));
+    JXL_ASSIGN_OR_RETURN(
+        float index_cost,
+        EstimateCost(image, chunk_begin + 1, chunk_begin + 1,
+                     use_zero_predictor));
+    cost_after += index_cost;
+    if (palette_channels < num_channels) {
+      JXL_ASSIGN_OR_RETURN(
+          float remaining_cost,
+          EstimateCost(image, chunk_begin + 2, chunk_begin + 2,
+                       use_zero_predictor));
+      cost_after += remaining_cost;
+    }
+    if (cost_after < best_rct_cost) return true;
+
+    Transform applied = image.transform.back();
+    JXL_RETURN_IF_ERROR(applied.Inverse(image, weighted::Header(), pool));
+    image.transform.pop_back();
+    return false;
+  };
+
+  JXL_ASSIGN_OR_RETURN(bool did_palette, try_palette(num_channels));
+  if (did_palette) return true;
+  // As in the standard palette path, also try leaving the final channel
+  // separate (commonly alpha) when at least four channels are present.
+  if (num_channels > 3) {
+    JXL_ASSIGN_OR_RETURN(did_palette, try_palette(num_channels - 1));
+    if (did_palette) return true;
+  }
+  return false;
+}
+
+// Applies single-channel compaction to a chunk after RCT selection, evaluating
+// each result with the same predictor model used for the chunk's residuals.
+StatusOr<size_t> TryChannelPalettesForChunk(Image& image, size_t chunk_begin,
+                                            size_t chunk_end,
+                                            bool use_zero_predictor,
+                                            float channel_colors_percent,
+                                            ThreadPool* pool) {
+  if (channel_colors_percent <= 0) return size_t{0};
+  const size_t original_channels = chunk_end - chunk_begin + 1;
+  const float num_pixels = image.channel[chunk_begin].w *
+                           image.channel[chunk_begin].h;
+  size_t added_metachannels = 0;
+  for (size_t c = 0; c < original_channels; ++c) {
+    const size_t index = chunk_begin + c + added_metachannels;
+    int32_t min_value;
+    int32_t max_value;
+    compute_minmax(image.channel[index], &min_value, &max_value);
+    const int64_t range = static_cast<int64_t>(max_value) - min_value + 1;
+    const int max_colors = std::min(
+        static_cast<int>(num_pixels / 16),
+        static_cast<int>(channel_colors_percent / 100.0f * range));
+    if (max_colors < 2) continue;
+
+    JXL_ASSIGN_OR_RETURN(float cost_before,
+                         EstimateCost(image, index, index,
+                                      use_zero_predictor));
+    Transform palette(TransformId::kPalette);
+    palette.begin_c = index;
+    palette.num_c = 1;
+    palette.nb_colors = max_colors;
+    bool did_transform = do_transform(image, palette, weighted::Header(), pool);
+    if (!did_transform) continue;
+
+    JXL_ASSIGN_OR_RETURN(float meta_cost, EstimateCost(image, 0, 0, false));
+    JXL_ASSIGN_OR_RETURN(float index_cost,
+                         EstimateCost(image, index + 1, index + 1,
+                                      use_zero_predictor));
+    if (meta_cost + index_cost < cost_before) {
+      ++added_metachannels;
+    } else {
+      Transform applied = image.transform.back();
+      JXL_RETURN_IF_ERROR(applied.Inverse(image, weighted::Header(), pool));
+      image.transform.pop_back();
+    }
+  }
+  return added_metachannels;
+}
+
+struct SqueezeChannelChunk {
+  size_t begin;
+  size_t end;
+  bool is_residual;
+  std::vector<size_t> rgb_starts;
+};
+
 Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
                     const CompressParams& cparams_,
                     float channel_colors_percent,
@@ -478,13 +719,6 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
       cparams_.decoding_speed_tier == 1) {
     cparams_.decoding_speed_tier = 2;
   }
-  if (cparams_.responsive == 1 && cparams_.IsLossless()) {
-    // RCT selection seems bugged with Squeeze, YCoCg works well.
-    if (cparams_.colorspace < 0) {
-      cparams_.colorspace = 6;
-    }
-  }
-
   if (cparams_.ModularPartIsLossless()) {
     const auto disable_wp = [this] () {
         cparams_.options.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
@@ -905,23 +1139,44 @@ Status ModularFrameEncoder::ComputeEncodingData(
                                      channel_colors_percent, pool));
   }
 
-  // don't do an RCT if we're short on bits
+  // In progressive lossless modular mode, select a global RCT before
+  // Squeeze only for continuous-tone RGB. Squeeze's nonlinear tendency
+  // rounding otherwise adds independent rounding noise to the three channels.
+  const bool progressive_lossless =
+      cparams_.responsive && cparams_.ModularPartIsLossless();
   if (cparams_.color_transform == ColorTransform::kNone && do_color &&
       gi.channel.size() - gi.nb_meta_channels >= 3 &&
       max_bitdepth + 1 < level_max_bitdepth) {
-    if (cparams_.colorspace < 0 && (!cparams_.ModularPartIsLossless() ||
-                                    cparams_.speed_tier > SpeedTier::kHare)) {
+    if (progressive_lossless && cparams_.colorspace < 0) {
+      const size_t rgb_begin = gi.nb_meta_channels;
+      if (IsContinuousToneRGB(gi, rgb_begin)) {
+        JXL_ASSIGN_OR_RETURN(
+            RctChoice best_rct,
+            FindBestRctForChunk(gi, {rgb_begin}, rgb_begin, rgb_begin + 2,
+                                /*use_zero_predictor=*/false,
+                                cparams_.speed_tier, pool));
+        if (best_rct.rct_type != 0) {
+          Transform rct(TransformId::kRCT);
+          rct.begin_c = rgb_begin;
+          rct.rct_type = best_rct.rct_type;
+          do_transform(gi, rct, weighted::Header(), pool);
+          ++max_bitdepth;
+        }
+      }
+    } else if (cparams_.colorspace < 0 &&
+               (!cparams_.ModularPartIsLossless() ||
+                cparams_.speed_tier > SpeedTier::kHare)) {
       Transform ycocg{TransformId::kRCT};
       ycocg.rct_type = 6;
       ycocg.begin_c = gi.nb_meta_channels;
       do_transform(gi, ycocg, weighted::Header(), pool);
-      max_bitdepth++;
+      ++max_bitdepth;
     } else if (cparams_.colorspace > 0) {
       Transform sg(TransformId::kRCT);
       sg.begin_c = gi.nb_meta_channels;
       sg.rct_type = cparams_.colorspace;
       do_transform(gi, sg, weighted::Header(), pool);
-      max_bitdepth++;
+      ++max_bitdepth;
     }
   }
 
@@ -945,13 +1200,21 @@ Status ModularFrameEncoder::ComputeEncodingData(
     }
   }
 
+  // Remember the channels that exist before Squeeze appends its AC residuals.
+  // This lets the stream parameter pass distinguish DC and AC chunks later.
+  squeeze_base_channel_count_ = gi.channel.size();
+
   // don't do squeeze if we don't have some spare bits
   if (!groupwise && cparams_.responsive && !gi.channel.empty() &&
       max_bitdepth + 2 < level_max_bitdepth) {
     Transform t(TransformId::kSqueeze);
     // Check if default squeeze parameters are ok.
     std::vector<SqueezeParams> params;
-    DefaultSqueezeParameters(&params, gi, squeeze_chroma_);
+    // Lossless modular channels must keep identical dimensions. The chroma
+    // pre-squeeze is retained for the legacy lossy/default responsive path.
+    DefaultSqueezeParameters(&params, gi,
+                             squeeze_chroma_ &&
+                                 !cparams_.ModularPartIsLossless());
     if (squeeze_levels_ >= 0) {
       // Each user-visible resolution level allows one horizontal and one
       // vertical squeeze across all active channels, not one single-axis step.
@@ -1430,6 +1693,7 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
           Channel gc, Channel::Create(memory_manager, r.xsize(), r.ysize()));
       gc.hshift = fc.hshift;
       gc.vshift = fc.vshift;
+      gc.component = fc.component;
       for (size_t y = 0; y < r.ysize(); ++y) {
         memcpy(gc.Row(y), r.ConstRow(fc.plane, y),
                r.xsize() * sizeof(pixel_type));
@@ -1440,16 +1704,112 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
     if (gi.channel.empty()) return true;
     // Do some per-group transforms
 
-    // Local palette transforms
-    // TODO(veluca): make this work with quantize-after-prediction in lossy
-    // mode.
+    // Local palette transforms for the legacy non-progressive lossless path.
     if (cparams_.ModularPartIsLossless() && !cparams.responsive &&
         !cparams.lossy_palette && cparams.speed_tier < SpeedTier::kCheetah) {
       int max_bitdepth = 0, maxval = 0;  // don't care about that here
-      float channel_color_percent = 0;
-        channel_color_percent = cparams.channel_colors_percent;
       JXL_RETURN_IF_ERROR(try_palettes(gi, max_bitdepth, maxval, cparams,
-                                       channel_color_percent));
+                                       cparams.channel_colors_percent));
+    }
+  }
+
+  // Progressive lossless streams contain differently-sized DC and AC squeeze
+  // channels. Compare RCTs and palettes independently for each equal-size
+  // chunk, processing chunks from the end so palette metachannel insertions
+  // cannot invalidate the indices of chunks still to be visited.
+  const bool progressive_lossless =
+      cparams_.responsive && cparams_.ModularPartIsLossless();
+  if (progressive_lossless && !groupwise && !cparams.lossy_palette &&
+      !cparams.options.zero_tokens &&
+      cparams.color_transform == ColorTransform::kNone &&
+      cparams.colorspace < 0 && do_color &&
+      cparams.speed_tier < SpeedTier::kCheetah) {
+    std::vector<SqueezeChannelChunk> chunks;
+    for (size_t begin = gi.nb_meta_channels; begin < gi.channel.size();) {
+      const size_t source_index =
+          stream_id == 0
+              ? begin
+              : gi_channel_[stream_id][begin - gi.nb_meta_channels];
+      const bool is_residual =
+          squeeze_base_channel_count_ != 0 &&
+          source_index >= squeeze_base_channel_count_;
+      size_t end = begin;
+      while (end + 1 < gi.channel.size()) {
+        const Channel& previous = gi.channel[end];
+        const Channel& next = gi.channel[end + 1];
+        const size_t next_source_index =
+            stream_id == 0
+                ? end + 1
+                : gi_channel_[stream_id][end + 1 - gi.nb_meta_channels];
+        const bool next_is_residual =
+            squeeze_base_channel_count_ != 0 &&
+            next_source_index >= squeeze_base_channel_count_;
+        if (previous.w != next.w || previous.h != next.h ||
+            next_is_residual != is_residual) {
+          break;
+        }
+        ++end;
+      }
+      SqueezeChannelChunk chunk{begin, end, is_residual, {}};
+      for (size_t c = begin; c + 2 <= end; ++c) {
+        const Channel& r = gi.channel[c];
+        const Channel& g = gi.channel[c + 1];
+        const Channel& b = gi.channel[c + 2];
+        if (r.component == 0 && g.component == 1 && b.component == 2 &&
+            r.w == g.w && r.w == b.w && r.h == g.h && r.h == b.h &&
+            r.hshift == g.hshift && r.hshift == b.hshift &&
+            r.vshift == g.vshift && r.vshift == b.vshift) {
+          chunk.rgb_starts.push_back(c);
+        }
+      }
+      chunks.emplace_back(std::move(chunk));
+      begin = end + 1;
+    }
+
+    size_t inserted_metachannels = 0;
+    for (auto chunk_it = chunks.rbegin(); chunk_it != chunks.rend();
+         ++chunk_it) {
+      const SqueezeChannelChunk& chunk = *chunk_it;
+      const size_t chunk_begin = chunk.begin + inserted_metachannels;
+      const size_t chunk_end = chunk.end + inserted_metachannels;
+      const bool use_zero_predictor = chunk.is_residual;
+      std::vector<size_t> rgb_starts;
+      rgb_starts.reserve(chunk.rgb_starts.size());
+      for (size_t start : chunk.rgb_starts) {
+        rgb_starts.push_back(start + inserted_metachannels);
+      }
+
+      JXL_ASSIGN_OR_RETURN(
+          RctChoice best_rct,
+          FindBestRctForChunk(gi, rgb_starts, chunk_begin, chunk_end,
+                              use_zero_predictor, cparams.speed_tier,
+                              /*pool=*/nullptr));
+      JXL_ASSIGN_OR_RETURN(
+          bool did_multi_palette,
+          TryChunkPalette(gi, chunk_begin, chunk_end, best_rct.cost,
+                          use_zero_predictor, cparams, /*pool=*/nullptr));
+      if (did_multi_palette) {
+        ++inserted_metachannels;
+        continue;
+      }
+
+      if (best_rct.rct_type != 0) {
+        for (size_t start : rgb_starts) {
+          Transform rct(TransformId::kRCT);
+          rct.begin_c = start;
+          rct.rct_type = best_rct.rct_type;
+          do_transform(gi, rct, weighted::Header());
+        }
+      }
+
+      const size_t meta_channels_before = gi.nb_meta_channels;
+      JXL_ASSIGN_OR_RETURN(
+          size_t added,
+          TryChannelPalettesForChunk(
+              gi, chunk_begin, chunk_end, use_zero_predictor,
+              cparams.channel_colors_percent, /*pool=*/nullptr));
+      inserted_metachannels += added;
+      JXL_ENSURE(gi.nb_meta_channels == meta_channels_before + added);
     }
   }
 

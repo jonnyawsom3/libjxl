@@ -59,7 +59,11 @@ using hwy::HWY_NAMESPACE::Sub;
 using hwy::HWY_NAMESPACE::Xor;
 using hwy::HWY_NAMESPACE::Zero;
 
-StatusOr<float> EstimateCost(const Image& img) {
+StatusOr<float> EstimateCost(const Image& img, size_t begin_c,
+                            size_t end_c, bool use_zero_predictor) {
+  if (img.channel.empty() || begin_c >= img.channel.size()) return 0.0f;
+  end_c = std::min(end_c, img.channel.size() - 1);
+  if (end_c < begin_c) return 0.0f;
   size_t histo_cost = 0;
   float histo_cost_frac = 0.0f;
   size_t extra_bits = 0;
@@ -70,7 +74,9 @@ StatusOr<float> EstimateCost(const Image& img) {
                         47, 63, 95, 127, 191, 255, 392, 500};
   constexpr size_t nc = sizeof(cutoffs) / sizeof(*cutoffs) + 1;
   Histogram histo[nc] = {};
-  for (const Channel& ch : img.channel) {
+  for (size_t channel_index = begin_c; channel_index <= end_c;
+       ++channel_index) {
+    const Channel& ch = img.channel[channel_index];
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     for (size_t y = 0; y < ch.h; y++) {
       const pixel_type* JXL_RESTRICT r = ch.Row(y);
@@ -84,7 +90,9 @@ StatusOr<float> EstimateCost(const Image& img) {
         for (uint32_t c : cutoffs) {
           ctx += (max_diff < c) ? 1 : 0;
         }
-        pixel_type res = r[x] - ClampedGradient(top, left, topleft);
+        pixel_type res = use_zero_predictor
+                             ? r[x]
+                             : r[x] - ClampedGradient(top, left, topleft);
         uint32_t token;
         uint32_t nbits;
         uint32_t bits;
@@ -121,7 +129,9 @@ StatusOr<float> EstimateCost(const Image& img) {
   const auto kLargeShift = Set(du, kLargeShiftVal);
 
   size_t max_w = 0;
-  for (const Channel& ch : img.channel) {
+  for (size_t channel_index = begin_c; channel_index <= end_c;
+       ++channel_index) {
+    const Channel& ch = img.channel[channel_index];
     if (ch.h == 0) continue;
     max_w = std::max(max_w, ch.w);
   }
@@ -140,7 +150,9 @@ StatusOr<float> EstimateCost(const Image& img) {
 
   Histogram histo[estimate_cost_detail::kLastCtx + 1] = {};
   auto extra_bits_lanes = Zero(du);
-  for (const Channel& ch : img.channel) {
+  for (size_t channel_index = begin_c; channel_index <= end_c;
+       ++channel_index) {
+    const Channel& ch = img.channel[channel_index];
     if (ch.h == 0 || ch.w == 0) continue;
     for (auto& h : histo) {
       h.EnsureCapacity(32 * 4);
@@ -154,7 +166,8 @@ StatusOr<float> EstimateCost(const Image& img) {
     for (size_t x = 0; x < ch.w; x += Lanes(di)) {
       const auto left = LoadU(di, last);
       const auto central = Load(di, r + x);
-      const auto ures = BitCast(du, Sub(central, left));
+      const auto prediction = use_zero_predictor ? Zero(di) : left;
+      const auto ures = BitCast(du, Sub(central, prediction));
       const auto packed =
           Xor(ShiftLeft<1>(ures), Sub(ShiftRight<31>(Not(ures)), kOne));
       const auto is_large = Gt(packed, kLargeThreshold);
@@ -206,7 +219,9 @@ StatusOr<float> EstimateCost(const Image& img) {
             BitCast(di, Sub(Add(BitCast(du, top), BitCast(du, left)),
                             BitCast(du, topleft)));
         const auto prediction =
-            IfThenElse(undershoot, m, IfThenElse(overshoot, M, grad));
+            use_zero_predictor
+                ? Zero(di)
+                : IfThenElse(undershoot, m, IfThenElse(overshoot, M, grad));
         const auto ures = BitCast(du, Sub(central, prediction));
         const auto packed =
             Xor(ShiftLeft<1>(ures), Sub(ShiftRight<31>(Not(ures)), kOne));
@@ -260,8 +275,13 @@ namespace jxl {
 
 HWY_EXPORT(EstimateCost);
 
-StatusOr<float> EstimateCost(const Image& img) {
-  return HWY_DYNAMIC_DISPATCH(EstimateCost)(img);
+StatusOr<float> EstimateCost(const Image& img, size_t begin_c,
+                            size_t end_c, bool use_zero_predictor) {
+  if (img.channel.empty() || begin_c >= img.channel.size()) return 0.0f;
+  end_c = std::min(end_c, img.channel.size() - 1);
+  if (end_c < begin_c) return 0.0f;
+  return HWY_DYNAMIC_DISPATCH(EstimateCost)(img, begin_c, end_c,
+                                            use_zero_predictor);
 }
 
 namespace estimate_cost_detail {

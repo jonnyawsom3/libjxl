@@ -506,9 +506,10 @@ struct CompressArgs {
         "   -1 = encoder decides whether to squeeze; use the default sequence\n"
         "        down to 8px, without the chroma pre-squeeze.\n"
         "    0 = don't apply the Squeeze transform.\n"
-        "    N = apply N squeeze steps, without the chroma pre-squeeze.\n"
-        "        Each step halves width or height, rounding up. If both\n"
-        "        dimensions exceed 8px, 2 steps halve both dimensions.",
+        "    N = apply N squeeze levels, without the chroma pre-squeeze.\n"
+        "        Each level applies horizontal and vertical squeeze steps\n"
+        "        across all channels, halving both dimensions where possible.\n"
+        "        The generated sequence stops reducing dimensions at 8px.",
         &responsive, &ParseResponsive, 4);
   }
 

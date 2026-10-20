@@ -444,6 +444,21 @@ void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
   JXL_DEBUG_V(7, "that's it");
 }
 
+void LimitSqueezeParametersToResolutionLevels(
+    std::vector<SqueezeParams> *parameters, size_t levels) {
+  std::vector<SqueezeParams> limited;
+  limited.reserve(parameters->size());
+  size_t horizontal_steps = 0;
+  size_t vertical_steps = 0;
+  for (const SqueezeParams &param : *parameters) {
+    size_t &steps = param.horizontal ? horizontal_steps : vertical_steps;
+    if (steps >= levels) continue;
+    ++steps;
+    limited.push_back(param);
+  }
+  parameters->swap(limited);
+}
+
 Status CheckMetaSqueezeParams(const SqueezeParams &parameter,
                               int num_channels) {
   int c1 = parameter.begin_c;

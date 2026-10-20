@@ -1871,7 +1871,8 @@ JxlEncoderStatus JxlEncoderFrameSettingsSetOption(
   if (option == JXL_ENC_FRAME_SETTING_SQUEEZE && value < -2) {
     return JXL_API_ERROR(
         frame_settings->enc, JXL_ENC_ERR_API_USAGE,
-        "Squeeze value has to be -2, -1, 0, or a positive step count");
+        "Squeeze value has to be -2, -1, 0, or a positive "
+        "resolution-level count");
   }
 
   switch (option) {

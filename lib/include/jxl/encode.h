@@ -442,7 +442,9 @@ typedef enum {
    * encoder decide whether to squeeze and use the default sequence down to 8px
    * (including the chroma pre-squeeze), -1 for the same automatic decision
    * without the chroma pre-squeeze, 0 to disable Squeeze, or a positive value
-   * for the number of squeeze steps without the chroma pre-squeeze.
+   * for the number of squeeze resolution levels without the chroma pre-squeeze.
+   * Each level applies a horizontal and vertical squeeze across all active
+   * channels, halving both dimensions where possible.
    */
   JXL_ENC_FRAME_SETTING_SQUEEZE = 43,
 

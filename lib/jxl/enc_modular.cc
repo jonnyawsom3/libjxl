@@ -464,8 +464,8 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
   frame_dim_ = frame_header.ToFrameDimensions();
   cparams_ = cparams_orig;
 
-  squeeze_steps_ = cparams_.squeeze_mode >= 0 ? cparams_.squeeze_mode : -1;
-  // -2/-3 retain the legacy chroma pre-squeeze; -1 and nonnegative counts omit it.
+  squeeze_levels_ = cparams_.squeeze_mode >= 0 ? cparams_.squeeze_mode : -1;
+  // -2/-3 retain the legacy chroma pre-squeeze; -1 and positive levels omit it.
   squeeze_chroma_ = cparams_.squeeze_mode < -1;
 
   size_t num_streams =
@@ -952,9 +952,11 @@ Status ModularFrameEncoder::ComputeEncodingData(
     // Check if default squeeze parameters are ok.
     std::vector<SqueezeParams> params;
     DefaultSqueezeParameters(&params, gi, squeeze_chroma_);
-    if (squeeze_steps_ >= 0 &&
-        static_cast<uint64_t>(squeeze_steps_) < params.size()) {
-      params.resize(static_cast<size_t>(squeeze_steps_));
+    if (squeeze_levels_ >= 0) {
+      // Each user-visible resolution level allows one horizontal and one
+      // vertical squeeze across all active channels, not one single-axis step.
+      LimitSqueezeParametersToResolutionLevels(
+          &params, static_cast<size_t>(squeeze_levels_));
     }
     // If image is smaller than group_dim, then default squeeze parameters
     // are not going too far. Else, channel size don't turn zero. Thus we only
@@ -978,7 +980,7 @@ Status ModularFrameEncoder::ComputeEncodingData(
     // An empty custom list means that the requested sequence has no steps.
     // Keep legacy behavior for the default chroma sequence, where an empty
     // list also requests automatic squeeze parameters.
-    if (!params.empty() || (squeeze_chroma_ && squeeze_steps_ < 0)) {
+    if (!params.empty() || (squeeze_chroma_ && squeeze_levels_ < 0)) {
       // Pass the selected script explicitly; an empty script would make the
       // transform regenerate the default (possibly chroma-subsampled) script.
       t.squeezes = params;

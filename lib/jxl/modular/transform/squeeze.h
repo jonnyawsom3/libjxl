@@ -79,6 +79,12 @@ inline pixel_type_w SmoothTendency(pixel_type_w B, pixel_type_w a,
 void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
                               const Image &image, bool include_chroma = true);
 
+// Limits the generated squeeze script to the requested number of resolution
+// levels. Each level allows one horizontal and one vertical squeeze step,
+// retaining the original order and discarding excess steps in either direction.
+void LimitSqueezeParametersToResolutionLevels(
+    std::vector<SqueezeParams> *parameters, size_t levels);
+
 Status CheckMetaSqueezeParams(const SqueezeParams &parameter, int num_channels);
 
 Status MetaSqueeze(Image &image, std::vector<SqueezeParams> *parameters);

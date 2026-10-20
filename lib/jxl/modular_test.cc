@@ -310,6 +310,31 @@ TEST(ModularTest, DefaultSqueezeParametersChromaOption) {
   EXPECT_FALSE(without_chroma[1].horizontal);
 }
 
+TEST(ModularTest, SqueezeResolutionLevels) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  for (size_t levels = 1; levels <= 2; ++levels) {
+    JXL_TEST_ASSIGN_OR_DIE(
+        Image image, Image::Create(memory_manager, 64, 32,
+                                   /*bitdepth=*/8, /*nb_channels=*/4));
+    std::vector<SqueezeParams> params;
+    DefaultSqueezeParameters(&params, image, /*include_chroma=*/false);
+    LimitSqueezeParametersToResolutionLevels(&params, levels);
+
+    ASSERT_EQ(2 * levels, params.size());
+    for (const SqueezeParams& param : params) {
+      EXPECT_TRUE(param.in_place);
+      EXPECT_EQ(0u, param.begin_c);
+      EXPECT_EQ(4u, param.num_c);
+    }
+    EXPECT_TRUE(params[0].horizontal);
+    EXPECT_FALSE(params[1].horizontal);
+
+    ASSERT_TRUE(MetaSqueeze(image, &params));
+    EXPECT_EQ(64u >> levels, image.channel[0].w);
+    EXPECT_EQ(32u >> levels, image.channel[0].h);
+  }
+}
+
 TEST(ModularTest, RoundtripExtraProperties) {
   JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   constexpr size_t kSize = 250;

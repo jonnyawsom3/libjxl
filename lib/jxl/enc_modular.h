@@ -117,7 +117,7 @@ class ModularFrameEncoder {
   std::vector<uint8_t> context_map_;
   FrameDimensions frame_dim_;
   CompressParams cparams_;
-  int64_t squeeze_steps_ = -1;
+  int64_t squeeze_levels_ = -1;
   bool squeeze_chroma_ = true;
   std::vector<size_t> tree_splits_;
   std::vector<std::vector<uint32_t>> gi_channel_;

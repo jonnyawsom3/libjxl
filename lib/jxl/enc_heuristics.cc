@@ -1197,57 +1197,82 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                           initial_quant_masking,
                                           initial_quant_masking1x1, &matrices));
 
-  auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
-    size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
-    size_t tx = tid % n_enc_tiles;
-    size_t ty = tid / n_enc_tiles;
-    size_t by0 = ty * kEncTileDimInBlocks;
-    size_t by1 =
-        std::min((ty + 1) * kEncTileDimInBlocks, frame_dim.ysize_blocks);
-    size_t bx0 = tx * kEncTileDimInBlocks;
-    size_t bx1 =
-        std::min((tx + 1) * kEncTileDimInBlocks, frame_dim.xsize_blocks);
-    Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+  // Transform selection is group-scoped: a VarDCT AC group is 256x256
+  // pixels, exactly the largest supported transform. CfL remains tile-scoped
+  // (64x64 pixels) because its correlation map has one entry per color tile.
+  // Quant-field adjustment is group-scoped too, so every 8x8 block covered by
+  // a large transform receives the same adjusted quantization value.
+  auto process_group = [&](const uint32_t group_index,
+                           const size_t thread) -> Status {
+    const Rect group = frame_dim.BlockGroupRect(group_index);
 
-    // For speeds up to Wombat, we only compute the color correlation map
-    // once we know the transform type and the quantization map.
+    // For speeds up to Squirrel, compute all CfL entries in this group before
+    // choosing transform sizes; a large transform can span multiple tiles.
     if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices,
-          /*ac_strategy=*/nullptr,
-          /*raw_quant_field=*/nullptr,
-          /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+      for (size_t tile_y = group.y0(); tile_y < group.y0() + group.ysize();
+           tile_y += kEncTileDimInBlocks) {
+        const size_t tile_y1 =
+            std::min(tile_y + kEncTileDimInBlocks, group.y0() + group.ysize());
+        for (size_t tile_x = group.x0();
+             tile_x < group.x0() + group.xsize();
+             tile_x += kEncTileDimInBlocks) {
+          const size_t tile_x1 =
+              std::min(tile_x + kEncTileDimInBlocks,
+                       group.x0() + group.xsize());
+          const Rect tile(tile_x, tile_y, tile_x1 - tile_x,
+                          tile_y1 - tile_y);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              tile, *opsin, rect, matrices,
+              /*ac_strategy=*/nullptr,
+              /*raw_quant_field=*/nullptr,
+              /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+        }
+      }
     }
 
-    // Choose block sizes.
     JXL_RETURN_IF_ERROR(
-        acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
+        acs_heuristics.ProcessRect(group, cmap, &ac_strategy, thread));
 
-    // Always set the initial quant field, so we can compute the CfL map with
-    // more accuracy. The initial quant field might change in slower modes, but
-    // adjusting the quant field with butteraugli when all the other encoding
-    // parameters are fixed is likely a more reliable choice anyway.
+    // This must cover the entire AC group: a 128x128 or 256x256 transform can
+    // cross several color-correlation tiles, and tile-local adjustment would
+    // miss the transform's first block when visiting its other tiles.
     JXL_RETURN_IF_ERROR(AdjustQuantField(
-        ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
-    quantizer.SetQuantFieldRect(initial_quant_field, r, &raw_quant_field);
+        ac_strategy, group, cparams.butteraugli_distance,
+        &initial_quant_field));
+    quantizer.SetQuantFieldRect(initial_quant_field, group, &raw_quant_field);
 
-    // Compute a non-default CfL map if we are at Hare speed, or slower.
+    // Final CfL fitting still runs on the 64x64-pixel color tiles, using the
+    // group-wide transform strategy and the now-adjusted quantization field.
     if (cparams.speed_tier <= SpeedTier::kHare) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field, &quantizer,
-          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap));
+      for (size_t tile_y = group.y0(); tile_y < group.y0() + group.ysize();
+           tile_y += kEncTileDimInBlocks) {
+        const size_t tile_y1 =
+            std::min(tile_y + kEncTileDimInBlocks, group.y0() + group.ysize());
+        for (size_t tile_x = group.x0();
+             tile_x < group.x0() + group.xsize();
+             tile_x += kEncTileDimInBlocks) {
+          const size_t tile_x1 =
+              std::min(tile_x + kEncTileDimInBlocks,
+                       group.x0() + group.xsize());
+          const Rect tile(tile_x, tile_y, tile_x1 - tile_x,
+                          tile_y1 - tile_y);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              tile, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+              &quantizer,
+              /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread,
+              &cmap));
+        }
+      }
     }
     return true;
   };
-  size_t num_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks) *
-                     DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
     return true;
   };
-  JXL_RETURN_IF_ERROR(
-      RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, prepare,
+                                process_group, "Enc Heuristics"));
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 

@@ -305,9 +305,9 @@ bool MultiBlockTransformCrossesHorizontalBoundary(
   if (start_x >= ac_strategy.xsize() || y >= ac_strategy.ysize()) {
     return false;
   }
-  if (y % 8 == 0) {
-    // Nothing crosses 64x64 boundaries, and the memory on the other side
-    // of the 64x64 block may still uninitialized.
+  if (y % kGroupDimInBlocks == 0) {
+    // Transforms never cross AC-group boundaries. Another group may still be
+    // selecting its transforms, so do not inspect its blocks here.
     return false;
   }
   end_x = std::min(end_x, ac_strategy.xsize());
@@ -335,9 +335,9 @@ bool MultiBlockTransformCrossesVerticalBoundary(
   if (x >= ac_strategy.xsize() || start_y >= ac_strategy.ysize()) {
     return false;
   }
-  if (x % 8 == 0) {
-    // Nothing crosses 64x64 boundaries, and the memory on the other side
-    // of the 64x64 block may still uninitialized.
+  if (x % kGroupDimInBlocks == 0) {
+    // Transforms never cross AC-group boundaries. Another group may still be
+    // selecting its transforms, so do not inspect its blocks here.
     return false;
   }
   end_y = std::min(end_y, ac_strategy.ysize());
@@ -493,9 +493,47 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   return true;
 }
 
+// A 256x256 transform can cover multiple color-correlation tiles. Use the
+// average correlation factors over the transform's footprint, while retaining
+// the existing single-tile factors for transforms contained in one tile.
+void GetCmapFactors(const ColorCorrelationMap& cmap, size_t bx, size_t by,
+                    const AcStrategy& acs, float factors[3]) {
+  const size_t tx0 = bx / kColorTileDimInBlocks;
+  const size_t ty0 = by / kColorTileDimInBlocks;
+  const size_t tx1 = DivCeil(bx + acs.covered_blocks_x(),
+                             kColorTileDimInBlocks);
+  const size_t ty1 = DivCeil(by + acs.covered_blocks_y(),
+                             kColorTileDimInBlocks);
+  float sum_x = 0.0f;
+  float sum_b = 0.0f;
+  size_t count = 0;
+  for (size_t ty = ty0; ty < ty1; ++ty) {
+    for (size_t tx = tx0; tx < tx1; ++tx) {
+      sum_x += cmap.base().YtoXRatio(cmap.ytox_map.ConstRow(ty)[tx]);
+      sum_b += cmap.base().YtoBRatio(cmap.ytob_map.ConstRow(ty)[tx]);
+      ++count;
+    }
+  }
+  JXL_DASSERT(count != 0);
+  factors[0] = sum_x / count;
+  factors[1] = 0.0f;
+  factors[2] = sum_b / count;
+}
+
+Status EstimateEntropyForTransform(
+    const AcStrategy& acs, float entropy_mul, size_t bx, size_t by,
+    const ACSConfig& config, const ColorCorrelationMap& cmap, float* block,
+    float* scratch_space, uint32_t* quantized, float& entropy) {
+  float cmap_factors[3];
+  GetCmapFactors(cmap, bx, by, acs, cmap_factors);
+  return EstimateEntropy(acs, entropy_mul, bx * kBlockDim, by * kBlockDim,
+                         config, cmap_factors, block, scratch_space, quantized,
+                         entropy);
+}
+
 Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
                             const ACSConfig& config,
-                            const float* JXL_RESTRICT cmap_factors,
+                            const ColorCorrelationMap& cmap,
                             AcStrategyImage* JXL_RESTRICT ac_strategy,
                             float* block, float* scratch_space,
                             uint32_t* quantized, float* entropy_out,
@@ -526,9 +564,9 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
     }
     const AcStrategy acs = AcStrategy::FromRawStrategy(tx.type);
     float base_entropy = 0.0f;
-    JXL_RETURN_IF_ERROR(EstimateEntropy(
-        acs, 1.0f, x, y, config, cmap_factors, block, scratch_space,
-        quantized, base_entropy));
+    JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+        acs, 1.0f, x / kBlockDim, y / kBlockDim, config, cmap, block,
+        scratch_space, quantized, base_entropy));
     const float candidate_entropy =
         tx.entropy_add + tx.entropy_mul * base_entropy;
     if (candidate_entropy < best) {
@@ -544,8 +582,8 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
 // cx, cy addresses the left, upper 8x8 block position of the candidate
 // transform.
 Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
-                   size_t cy, const ACSConfig& config,
-                   const float* JXL_RESTRICT cmap_factors,
+                   size_t cy, size_t stride, const ACSConfig& config,
+                   const ColorCorrelationMap& cmap,
                    AcStrategyImage* JXL_RESTRICT ac_strategy,
                    const float entropy_mul, const uint8_t candidate_priority,
                    uint8_t* priority, float* JXL_RESTRICT entropy_estimate,
@@ -554,42 +592,42 @@ Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
   float entropy_current = 0;
   for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
     for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
-      if (priority[(cy + iy) * 8 + (cx + ix)] >= candidate_priority) {
+      if (priority[(cy + iy) * stride + (cx + ix)] >= candidate_priority) {
         // Transform would reuse already allocated blocks and
         // lead to invalid overlaps, for example DCT64X32 vs.
         // DCT32X64.
         return true;
       }
-      entropy_current += entropy_estimate[(cy + iy) * 8 + (cx + ix)];
+      entropy_current += entropy_estimate[(cy + iy) * stride + (cx + ix)];
     }
   }
   float entropy_candidate;
-  JXL_RETURN_IF_ERROR(EstimateEntropy(
-      acs, entropy_mul, (bx + cx) * 8, (by + cy) * 8, config, cmap_factors,
-      block, scratch_space, quantized, entropy_candidate));
+  JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+      acs, entropy_mul, bx + cx, by + cy, config, cmap, block, scratch_space,
+      quantized, entropy_candidate));
   if (entropy_candidate >= entropy_current) return true;
   // Accept the candidate.
   for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
     for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-      entropy_estimate[(cy + iy) * 8 + cx + ix] = 0;
-      priority[(cy + iy) * 8 + cx + ix] = candidate_priority;
+      entropy_estimate[(cy + iy) * stride + cx + ix] = 0;
+      priority[(cy + iy) * stride + cx + ix] = candidate_priority;
     }
   }
   JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_raw));
-  entropy_estimate[cy * 8 + cx] = entropy_candidate;
+  entropy_estimate[cy * stride + cx] = entropy_candidate;
   return true;
 }
 
-static void SetEntropyForTransform(size_t cx, size_t cy,
+static void SetEntropyForTransform(size_t cx, size_t cy, size_t stride,
                                    const AcStrategyType acs_raw, float entropy,
                                    float* JXL_RESTRICT entropy_estimate) {
   const AcStrategy acs = AcStrategy::FromRawStrategy(acs_raw);
   for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
     for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
-      entropy_estimate[(cy + dy) * 8 + cx + dx] = 0.0;
+      entropy_estimate[(cy + dy) * stride + cx + dx] = 0.0;
     }
   }
-  entropy_estimate[cy * 8 + cx] = entropy;
+  entropy_estimate[cy * stride + cx] = entropy;
 }
 
 AcStrategyType AcsSquare(size_t blocks) {
@@ -597,9 +635,13 @@ AcStrategyType AcsSquare(size_t blocks) {
     return AcStrategyType::DCT16X16;
   } else if (blocks == 4) {
     return AcStrategyType::DCT32X32;
-  } else {
+  } else if (blocks == 8) {
     return AcStrategyType::DCT64X64;
+  } else if (blocks == 16) {
+    return AcStrategyType::DCT128X128;
   }
+  JXL_DASSERT(blocks == 32);
+  return AcStrategyType::DCT256X256;
 }
 
 AcStrategyType AcsVerticalSplit(size_t blocks) {
@@ -607,9 +649,13 @@ AcStrategyType AcsVerticalSplit(size_t blocks) {
     return AcStrategyType::DCT16X8;
   } else if (blocks == 4) {
     return AcStrategyType::DCT32X16;
-  } else {
+  } else if (blocks == 8) {
     return AcStrategyType::DCT64X32;
+  } else if (blocks == 16) {
+    return AcStrategyType::DCT128X64;
   }
+  JXL_DASSERT(blocks == 32);
+  return AcStrategyType::DCT256X128;
 }
 
 AcStrategyType AcsHorizontalSplit(size_t blocks) {
@@ -617,9 +663,13 @@ AcStrategyType AcsHorizontalSplit(size_t blocks) {
     return AcStrategyType::DCT8X16;
   } else if (blocks == 4) {
     return AcStrategyType::DCT16X32;
-  } else {
+  } else if (blocks == 8) {
     return AcStrategyType::DCT32X64;
+  } else if (blocks == 16) {
+    return AcStrategyType::DCT64X128;
   }
+  JXL_DASSERT(blocks == 32);
+  return AcStrategyType::DCT128X256;
 }
 
 // The following function tries to merge smaller transforms into
@@ -630,8 +680,9 @@ AcStrategyType AcsHorizontalSplit(size_t blocks) {
 // of blocks X blocks size, where a block is 8x8 pixels.
 Status FindBestFirstLevelDivisionForSquare(
     size_t blocks, bool allow_square_transform, size_t bx, size_t by, size_t cx,
-    size_t cy, const ACSConfig& config, const float* JXL_RESTRICT cmap_factors,
-    AcStrategyImage* JXL_RESTRICT ac_strategy, const float entropy_mul_JXK,
+    size_t cy, size_t stride, const ACSConfig& config,
+    const ColorCorrelationMap& cmap, AcStrategyImage* JXL_RESTRICT ac_strategy,
+    const float entropy_mul_JXK,
     const float entropy_mul_JXJ, float* JXL_RESTRICT entropy_estimate,
     float* block, float* scratch_space, uint32_t* quantized) {
   // We denote J for the larger dimension here, and K for the smaller.
@@ -672,7 +723,7 @@ Status FindBestFirstLevelDivisionForSquare(
   for (size_t dy = 0; dy < blocks; ++dy) {
     for (size_t dx = 0; dx < blocks; ++dx) {
       entropy[dy / blocks_half][dx / blocks_half] +=
-          entropy_estimate[(cy + dy) * 8 + (cx + dx)];
+          entropy_estimate[(cy + dy) * stride + (cx + dx)];
     }
   }
   float entropy_JXK_left = std::numeric_limits<float>::max();
@@ -682,37 +733,35 @@ Status FindBestFirstLevelDivisionForSquare(
   float entropy_JXJ = std::numeric_limits<float>::max();
   if (allow_JXK) {
     if (row0[bx + cx + 0].Strategy() != acs_rawJXK) {
-      JXL_RETURN_IF_ERROR(EstimateEntropy(
-          acsJXK, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-          cmap_factors, block, scratch_space, quantized, entropy_JXK_left));
+      JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+          acsJXK, entropy_mul_JXK, bx + cx, by + cy, config, cmap, block,
+          scratch_space, quantized, entropy_JXK_left));
     }
     if (row0[bx + cx + blocks_half].Strategy() != acs_rawJXK) {
-      JXL_RETURN_IF_ERROR(
-          EstimateEntropy(acsJXK, entropy_mul_JXK, (bx + cx + blocks_half) * 8,
-                          (by + cy + 0) * 8, config, cmap_factors, block,
-                          scratch_space, quantized, entropy_JXK_right));
+      JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+          acsJXK, entropy_mul_JXK, bx + cx + blocks_half, by + cy, config,
+          cmap, block, scratch_space, quantized, entropy_JXK_right));
     }
   }
   if (allow_KXJ) {
     if (row0[bx + cx].Strategy() != acs_rawKXJ) {
-      JXL_RETURN_IF_ERROR(EstimateEntropy(
-          acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-          cmap_factors, block, scratch_space, quantized, entropy_KXJ_top));
+      JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+          acsKXJ, entropy_mul_JXK, bx + cx, by + cy, config, cmap, block,
+          scratch_space, quantized, entropy_KXJ_top));
     }
     if (row1[bx + cx].Strategy() != acs_rawKXJ) {
-      JXL_RETURN_IF_ERROR(
-          EstimateEntropy(acsKXJ, entropy_mul_JXK, (bx + cx + 0) * 8,
-                          (by + cy + blocks_half) * 8, config, cmap_factors,
-                          block, scratch_space, quantized, entropy_KXJ_bottom));
+      JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+          acsKXJ, entropy_mul_JXK, bx + cx, by + cy + blocks_half, config,
+          cmap, block, scratch_space, quantized, entropy_KXJ_bottom));
     }
   }
   if (allow_square_transform) {
     // We control the exploration of the square transform separately so that
     // we can turn it off at high decoding speeds for 32x32, but still allow
     // exploring 16x32 and 32x16.
-    JXL_RETURN_IF_ERROR(EstimateEntropy(
-        acsJXJ, entropy_mul_JXJ, (bx + cx + 0) * 8, (by + cy + 0) * 8, config,
-        cmap_factors, block, scratch_space, quantized, entropy_JXJ));
+    JXL_RETURN_IF_ERROR(EstimateEntropyForTransform(
+        acsJXJ, entropy_mul_JXJ, bx + cx, by + cy, config, cmap, block,
+        scratch_space, quantized, entropy_JXJ));
   }
 
   // Test if this block should have JXK or KXJ transforms,
@@ -723,29 +772,29 @@ Status FindBestFirstLevelDivisionForSquare(
                   std::min(entropy_KXJ_bottom, entropy[1][0] + entropy[1][1]);
   if (entropy_JXJ < costJxN && entropy_JXJ < costNxJ) {
     JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawJXJ));
-    SetEntropyForTransform(cx, cy, acs_rawJXJ, entropy_JXJ, entropy_estimate);
+    SetEntropyForTransform(cx, cy, stride, acs_rawJXJ, entropy_JXJ, entropy_estimate);
   } else if (costJxN < costNxJ) {
     if (entropy_JXK_left < entropy[0][0] + entropy[1][0]) {
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawJXK));
-      SetEntropyForTransform(cx, cy, acs_rawJXK, entropy_JXK_left,
+      SetEntropyForTransform(cx, cy, stride, acs_rawJXK, entropy_JXK_left,
                              entropy_estimate);
     }
     if (entropy_JXK_right < entropy[0][1] + entropy[1][1]) {
       JXL_RETURN_IF_ERROR(
           ac_strategy->Set(bx + cx + blocks_half, by + cy, acs_rawJXK));
-      SetEntropyForTransform(cx + blocks_half, cy, acs_rawJXK,
+      SetEntropyForTransform(cx + blocks_half, cy, stride, acs_rawJXK,
                              entropy_JXK_right, entropy_estimate);
     }
   } else {
     if (entropy_KXJ_top < entropy[0][0] + entropy[0][1]) {
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cx, by + cy, acs_rawKXJ));
-      SetEntropyForTransform(cx, cy, acs_rawKXJ, entropy_KXJ_top,
+      SetEntropyForTransform(cx, cy, stride, acs_rawKXJ, entropy_KXJ_top,
                              entropy_estimate);
     }
     if (entropy_KXJ_bottom < entropy[1][0] + entropy[1][1]) {
       JXL_RETURN_IF_ERROR(
           ac_strategy->Set(bx + cx, by + cy + blocks_half, acs_rawKXJ));
-      SetEntropyForTransform(cx, cy + blocks_half, acs_rawKXJ,
+      SetEntropyForTransform(cx, cy + blocks_half, stride, acs_rawKXJ,
                              entropy_KXJ_bottom, entropy_estimate);
     }
   }
@@ -763,29 +812,23 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // starting from the smallest transforms (16x8 and 8x16).
   // Additional complication: 16x8 and 8x16 are considered
   // simultaneously and fairly against each other.
-  // We are looking at 64x64 squares since the Y-to-X and Y-to-B
-  // maps happen to be at that resolution, and having
-  // integral transforms cross these boundaries leads to
-  // additional complications.
+  // Process a whole AC group so the search can compare transforms up to
+  // 256x256 pixels. Color-correlation factors are averaged over the covered
+  // 64x64-pixel tiles for transforms that span more than one tile.
   const float butteraugli_target = cparams.butteraugli_distance;
   float* JXL_RESTRICT scratch_space = block + 3 * AcStrategy::kMaxCoeffArea;
   size_t bx = rect.x0();
   size_t by = rect.y0();
-  JXL_ENSURE(rect.xsize() <= 8);
-  JXL_ENSURE(rect.ysize() <= 8);
-  size_t tx = bx / kColorTileDimInBlocks;
-  size_t ty = by / kColorTileDimInBlocks;
-  const float cmap_factors[3] = {
-      cmap.base().YtoXRatio(cmap.ytox_map.ConstRow(ty)[tx]),
-      0.0f,
-      cmap.base().YtoBRatio(cmap.ytob_map.ConstRow(ty)[tx]),
-  };
+  JXL_ENSURE(rect.xsize() <= AcStrategy::kMaxCoeffBlocks);
+  JXL_ENSURE(rect.ysize() <= AcStrategy::kMaxCoeffBlocks);
+  const size_t stride = rect.xsize();
   if (cparams.speed_tier > SpeedTier::kHare) return true;
   // First compute the best 8x8 transform for each square. Later, we do not
   // experiment with different combinations, but only use the best of the 8x8s
   // when DCT8X8 is specified in the tree search.
   // 8x8 transforms have 10 variants, but every larger transform is just a DCT.
-  float entropy_estimate[64] = {};
+  float entropy_estimate[AcStrategy::kMaxCoeffBlocks *
+                          AcStrategy::kMaxCoeffBlocks] = {};
   // Favor all 8x8 transforms (against 16x8 and larger transforms)) at
   // low butteraugli_target distances, as in libjxl 0.8.x.
   static const float k8x8mul1 = -0.55;
@@ -798,10 +841,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       AcStrategyType best_of_8x8s;
       JXL_RETURN_IF_ERROR(FindBest8x8Transform(
           8 * (bx + ix), 8 * (by + iy), static_cast<int>(cparams.speed_tier),
-          config, cmap_factors, ac_strategy, block, scratch_space, quantized,
-          &entropy, best_of_8x8s));
+          config, cmap, ac_strategy, block, scratch_space, quantized, &entropy,
+          best_of_8x8s));
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + ix, by + iy, best_of_8x8s));
-      entropy_estimate[iy * 8 + ix] = entropy * mul8x8;
+      entropy_estimate[iy * stride + ix] = entropy * mul8x8;
     }
   }
   // Merge when a larger transform is better than the previously
@@ -842,36 +885,38 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // two DCT16x32s). It might be better to make them more independent,
   // e.g. by not applying the multiplier when storing the new entropy
   // estimates in TryMergeToACSCandidate().
-  const MergeTry kTransformsForMerge[9] = {
+  static constexpr float entropy_mul32X8 = 2.261390410971102f;
+  static constexpr float entropy_mul128X64 = 0.73f;
+  static constexpr float entropy_mul128X128 = 1.0f;
+  static constexpr float entropy_mul256X128 = 0.73f;
+  static constexpr float entropy_mul256X256 = 1.0f;
+  const MergeTry kTransformsForMerge[] = {
+      // Very elongated transforms are the lowest-priority candidates.
+      {AcStrategyType::DCT32X8, 1, 5, 5, entropy_mul32X8},
+      {AcStrategyType::DCT8X32, 1, 5, 5, entropy_mul32X8},
       {AcStrategyType::DCT16X8, 2, 4, 5, entropy_mul16X8},
       {AcStrategyType::DCT8X16, 2, 4, 5, entropy_mul16X8},
-      // FindBestFirstLevelDivisionForSquare looks for DCT16X16 and its
-      // subdivisions. {AcStrategyType::DCT16X16, 3, entropy_mul16X16},
+      // FindBestFirstLevelDivisionForSquare also evaluates DCT16X16.
       {AcStrategyType::DCT16X32, 4, 4, 4, entropy_mul16X32},
       {AcStrategyType::DCT32X16, 4, 4, 4, entropy_mul16X32},
-      // FindBestFirstLevelDivisionForSquare looks for DCT32X32 and its
-      // subdivisions. {AcStrategyType::DCT32X32, 5, 1, 5,
-      // 0.9822994906548809f},
+      // FindBestFirstLevelDivisionForSquare also evaluates DCT32X32.
       {AcStrategyType::DCT64X32, 6, 1, 3, 1.29f},
       {AcStrategyType::DCT32X64, 6, 1, 3, 1.29f},
-      // {AcStrategyType::DCT64X64, 8, 1, 3, 2.0846542128012948f},
+      // DCT128x128 and its two half-size rectangular subdivisions.
+      {AcStrategyType::DCT128X64, 8, 1, 3, entropy_mul128X64},
+      {AcStrategyType::DCT64X128, 8, 1, 3, entropy_mul128X64},
+      // DCT256x256 and its two half-size rectangular subdivisions.
+      {AcStrategyType::DCT256X128, 10, 1, 3, entropy_mul256X128},
+      {AcStrategyType::DCT128X256, 10, 1, 3, entropy_mul256X128},
   };
-  /*
-  These sizes not yet included in merge heuristic:
-  set(AcStrategyType::DCT32X8, 0.0f, 2.261390410971102f);
-  set(AcStrategyType::DCT8X32, 0.0f, 2.261390410971102f);
-  set(AcStrategyType::DCT128X128, 0.0f, 1.0f);
-  set(AcStrategyType::DCT128X64, 0.0f, 0.73f);
-  set(AcStrategyType::DCT64X128, 0.0f, 0.73f);
-  set(AcStrategyType::DCT256X256, 0.0f, 1.0f);
-  set(AcStrategyType::DCT256X128, 0.0f, 0.73f);
-  set(AcStrategyType::DCT128X256, 0.0f, 0.73f);
-  */
 
   // Priority is a tricky kludge to avoid collisions so that transforms
   // don't overlap.
-  uint8_t priority[64] = {};
+  uint8_t priority[AcStrategy::kMaxCoeffBlocks *
+                   AcStrategy::kMaxCoeffBlocks] = {};
   bool enable_32x32 = cparams.decoding_speed_tier < 4;
+  const float entropy_mul128X128_candidate = entropy_mul128X128;
+  const float entropy_mul256X256_candidate = entropy_mul256X256;
   for (auto mt : kTransformsForMerge) {
     if (mt.decoding_speed_tier_max_limit < cparams.decoding_speed_tier) {
       continue;
@@ -882,13 +927,39 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
          cy += acs.covered_blocks_y()) {
       for (size_t cx = 0; cx + acs.covered_blocks_x() - 1 < rect.xsize();
            cx += acs.covered_blocks_x()) {
+        if (cy + 31 < rect.ysize() && cx + 31 < rect.xsize()) {
+          if (mt.type == AcStrategyType::DCT128X256) {
+            if ((cy | cx) % 32 == 0) {
+              JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
+                  32, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
+                  mt.entropy_mul, entropy_mul256X256_candidate,
+                  entropy_estimate, block, scratch_space, quantized));
+            }
+            continue;
+          } else if (mt.type == AcStrategyType::DCT256X128) {
+            continue;
+          }
+        }
+        if (cy + 15 < rect.ysize() && cx + 15 < rect.xsize()) {
+          if (mt.type == AcStrategyType::DCT64X128) {
+            if ((cy | cx) % 16 == 0) {
+              JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
+                  16, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
+                  mt.entropy_mul, entropy_mul128X128_candidate,
+                  entropy_estimate, block, scratch_space, quantized));
+            }
+            continue;
+          } else if (mt.type == AcStrategyType::DCT128X64) {
+            continue;
+          }
+        }
         if (cy + 7 < rect.ysize() && cx + 7 < rect.xsize()) {
           if (cparams.decoding_speed_tier < 4 &&
               mt.type == AcStrategyType::DCT32X64) {
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 8 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  8, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+                  8, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
                   mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
                   scratch_space, quantized));
             }
@@ -912,7 +983,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 4 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  4, enable_32x32, bx, by, cx, cy, config, cmap_factors,
+                  4, enable_32x32, bx, by, cx, cy, stride, config, cmap,
                   ac_strategy, mt.entropy_mul, entropy_mul32X32,
                   entropy_estimate, block, scratch_space, quantized));
             }
@@ -935,7 +1006,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 2 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+                  2, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
                   mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
                   scratch_space, quantized));
             }
@@ -959,7 +1030,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         // and column will get their DCT16X8s and DCT8X16s through the
         // normal integral transform merging process.
         JXL_RETURN_IF_ERROR(
-            TryMergeAcs(mt.type, bx, by, cx, cy, config, cmap_factors,
+            TryMergeAcs(mt.type, bx, by, cx, cy, stride, config, cmap,
                         ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
                         entropy_estimate, block, scratch_space, quantized));
       }
@@ -974,7 +1045,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     for (size_t cx = 0; cx + 1 < rect.xsize(); ++cx) {
       if ((cy | cx) % 2 != 0) {
         JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-            2, true, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+            2, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
             entropy_mul16X8, entropy_mul16X16, entropy_estimate, block,
             scratch_space, quantized));
       }
@@ -988,7 +1059,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         continue;  // Already tried with loop above (DCT16X32 case).
       }
       JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-          4, enable_32x32, bx, by, cx, cy, config, cmap_factors, ac_strategy,
+          4, enable_32x32, bx, by, cx, cy, stride, config, cmap, ac_strategy,
           entropy_mul16X32, entropy_mul32X32, entropy_estimate, block,
           scratch_space, quantized));
     }
@@ -1016,9 +1087,9 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
         matrices->EnsureComputed(memory_manager, 1));  // DCT8 only
   } else {
     uint32_t acs_mask = 0;
-    // All transforms up to 64x64.
-    for (size_t i = 0; i < static_cast<size_t>(AcStrategyType::DCT128X128);
-         i++) {
+    // Precompute the inverse quantization matrices for all supported AC
+    // strategies, including the 128x128 and 256x256 transforms.
+    for (size_t i = 0; i < AcStrategy::kNumValidStrategies; i++) {
       acs_mask |= (1 << i);
     }
     JXL_RETURN_IF_ERROR(matrices->EnsureComputed(memory_manager, acs_mask));

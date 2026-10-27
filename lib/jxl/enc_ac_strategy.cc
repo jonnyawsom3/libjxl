@@ -6,12 +6,12 @@
 #include "lib/jxl/enc_ac_strategy.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 #include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/common.h"
@@ -827,8 +827,11 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // experiment with different combinations, but only use the best of the 8x8s
   // when DCT8X8 is specified in the tree search.
   // 8x8 transforms have 10 variants, but every larger transform is just a DCT.
-  float entropy_estimate[AcStrategy::kMaxCoeffBlocks *
-                          AcStrategy::kMaxCoeffBlocks] = {};
+  // These maps scale with the AC group (up to 32x32 8x8 blocks). Keep them
+  // off the stack: Highway compiles this function for multiple targets and
+  // Clang enforces a small per-function stack-frame limit.
+  std::vector<float> entropy_estimate_storage(stride * rect.ysize(), 0.0f);
+  float* JXL_RESTRICT entropy_estimate = entropy_estimate_storage.data();
   // Favor all 8x8 transforms (against 16x8 and larger transforms)) at
   // low butteraugli_target distances, as in libjxl 0.8.x.
   static const float k8x8mul1 = -0.55;
@@ -876,33 +879,35 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
 
   const float entropy_mul32X32 = 0.94f;
 
-  // The 0.8.x heuristic has fitted weights through 32x32 only. Estimate a
-  // smooth penalty per doubling of coefficient area from the two largest
-  // fitted intervals: 16x16 -> 32x32 spans two area doublings, while
-  // 16x32 -> 32x32 spans one. Extrapolate by area, so e.g. 128x64 receives
-  // two increments over 64x32 (its coefficient area is four times larger).
-  const float square_size_step = entropy_mul32X32 - entropy_mul16X16;
-  const float rectangle_size_step = entropy_mul32X32 - entropy_mul16X32;
-  const float area_doubling_step =
-      0.5f * (0.5f * square_size_step + rectangle_size_step);
-  const float entropy_mul64X64 =
-      entropy_mul32X32 + 2.0f * area_doubling_step;
-  const float entropy_mul128X128 =
-      entropy_mul64X64 + 2.0f * area_doubling_step;
-  const float entropy_mul256X256 =
-      entropy_mul128X128 + 2.0f * area_doubling_step;
-  const float entropy_mul64X32 = entropy_mul32X32 + area_doubling_step;
-  const float entropy_mul128X64 =
-      entropy_mul64X32 + 2.0f * area_doubling_step;
-  const float entropy_mul256X128 =
-      entropy_mul128X64 + 2.0f * area_doubling_step;
-
-  // DCT32x8 / DCT8x32 has no fitted weight in the older heuristic. Its area
-  // lies halfway (in log2 space) between DCT16x8 and DCT16x32. Interpolate
-  // those fitted weights and add a half-step penalty for its 4:1 shape.
+  // The 0.8.x heuristic was fitted only through 32x32. Do not use the
+  // 64x64-and-larger constants from the newer heuristic: those values were
+  // not fitted with, or validated against, the restored entropy estimator.
+  //
+  // Estimate the missing 4:1 transform weight in log2-size space. The size
+  // increment is measured at two neighboring scales (16x16 -> 32x16 and
+  // 16x32 -> 32x32); averaging the two avoids letting a single noisy edge
+  // determine the 32x8 / 8x32 penalty.
+  const float width_step_at_16 = entropy_mul16X32 - entropy_mul16X16;
+  const float width_step_at_32 = entropy_mul32X32 - entropy_mul16X32;
   const float entropy_mul32X8 =
-      0.5f * (entropy_mul16X8 + entropy_mul16X32) +
-      0.5f * area_doubling_step;
+      entropy_mul16X8 + 0.5f * (width_step_at_16 + width_step_at_32);
+
+  // Extrapolate the last measured log-dimension step beyond 32x32. Each
+  // increment represents one doubling of one transform axis, derived solely
+  // from the fitted 16x32 and 32x32 weights. This adds a gradually increasing
+  // cost for larger transforms so a 128x128 or 256x256 block must demonstrate
+  // enough entropy reduction to compensate for the larger footprint. These
+  // weights are explicit extrapolations, not fitted/validated coefficients.
+  const float large_axis_step = entropy_mul32X32 - entropy_mul16X32;
+  const float entropy_mul64X32 = entropy_mul32X32 + large_axis_step;
+  const float entropy_mul64X64 = entropy_mul32X32 + 2.0f * large_axis_step;
+  const float entropy_mul128X64 = entropy_mul32X32 + 3.0f * large_axis_step;
+  const float entropy_mul128X128 =
+      entropy_mul32X32 + 4.0f * large_axis_step;
+  const float entropy_mul256X128 =
+      entropy_mul32X32 + 5.0f * large_axis_step;
+  const float entropy_mul256X256 =
+      entropy_mul32X32 + 6.0f * large_axis_step;
 
   const MergeTry kTransformsForMerge[] = {
       {AcStrategyType::DCT16X8, 2, 4, 5, entropy_mul16X8},
@@ -921,8 +926,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // greedily accept the best entropy reductions first. Trying all horizontal
   // candidates before all vertical candidates would systematically favor one
   // orientation when their footprints overlap.
-  uint8_t priority[AcStrategy::kMaxCoeffBlocks *
-                   AcStrategy::kMaxCoeffBlocks] = {};
+  std::vector<uint8_t> priority_storage(stride * rect.ysize(), 0);
+  uint8_t* priority = priority_storage.data();
   struct ElongatedCandidate {
     uint8_t cx;
     uint8_t cy;
@@ -931,20 +936,23 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     float gain;
     uint8_t tie_break;
   };
+  // Consider every valid origin, not only positions spaced one complete
+  // 4:1 footprint apart. The gain-sorted greedy pass below resolves overlaps.
+  // For each orientation a 32-block group has (32 - 4 + 1) * 32 positions.
+  // Keep candidate storage heap-backed to satisfy the encoder's stack limit.
   constexpr size_t kMaxElongatedCandidates =
-      2 * AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks / 4;
-  std::array<ElongatedCandidate, kMaxElongatedCandidates>
-      elongated_candidates{};
-  size_t num_elongated_candidates = 0;
+      2 * AcStrategy::kMaxCoeffBlocks * (AcStrategy::kMaxCoeffBlocks - 3);
+  std::vector<ElongatedCandidate> elongated_candidates;
+  elongated_candidates.reserve(kMaxElongatedCandidates);
   const AcStrategyType elongated_transforms[] = {
       AcStrategyType::DCT32X8, AcStrategyType::DCT8X32};
   for (const AcStrategyType type : elongated_transforms) {
     const AcStrategy acs = AcStrategy::FromRawStrategy(type);
     const uint8_t orientation = type == AcStrategyType::DCT32X8 ? 0 : 1;
     for (size_t cy = 0; cy + acs.covered_blocks_y() <= rect.ysize();
-         cy += acs.covered_blocks_y()) {
+         ++cy) {
       for (size_t cx = 0; cx + acs.covered_blocks_x() <= rect.xsize();
-           cx += acs.covered_blocks_x()) {
+           ++cx) {
         float entropy_current = 0.0f;
         for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
           for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
@@ -956,17 +964,15 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             acs, entropy_mul32X8, bx + cx, by + cy, config, cmap, block,
             scratch_space, quantized, entropy_candidate));
         if (entropy_candidate >= entropy_current) continue;
-        JXL_DASSERT(num_elongated_candidates < elongated_candidates.size());
-        elongated_candidates[num_elongated_candidates++] = {
+        elongated_candidates.push_back({
             static_cast<uint8_t>(cx), static_cast<uint8_t>(cy), type,
             entropy_candidate,
             entropy_current - entropy_candidate,
-            static_cast<uint8_t>(((cx / 4 + cy) & 1) ^ orientation)};
+            static_cast<uint8_t>(((cx + cy) & 1) ^ orientation)});
       }
     }
   }
-  std::sort(elongated_candidates.begin(),
-            elongated_candidates.begin() + num_elongated_candidates,
+  std::sort(elongated_candidates.begin(), elongated_candidates.end(),
             [](const ElongatedCandidate& a, const ElongatedCandidate& b) {
               if (a.gain != b.gain) return a.gain > b.gain;
               if (a.tie_break != b.tie_break) {
@@ -975,7 +981,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               if (a.cy != b.cy) return a.cy < b.cy;
               return a.cx < b.cx;
             });
-  for (size_t i = 0; i < num_elongated_candidates; ++i) {
+  for (size_t i = 0; i < elongated_candidates.size(); ++i) {
     const ElongatedCandidate& candidate = elongated_candidates[i];
     const AcStrategy acs = AcStrategy::FromRawStrategy(candidate.type);
     bool overlaps = false;
@@ -997,7 +1003,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
     JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + candidate.cx,
                                          by + candidate.cy, candidate.type));
-    entropy_estimate[candidate.cy * stride + candidate.cx] = candidate.entropy;
+    entropy_estimate[candidate.cy * stride + candidate.cx] =
+        candidate.entropy;
   }
   bool enable_32x32 = cparams.decoding_speed_tier < 4;
   for (auto mt : kTransformsForMerge) {
@@ -1128,18 +1135,20 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         }
       }
     } else if (rect.xsize() >= 32 && rect.ysize() >= 16) {
-      // Only the 256x128 orientation can fit in this partial edge group.
+      // DCT128x256 is 32 blocks wide and 16 blocks high in the strategy map.
+      // It is the orientation that fits a group clipped at its bottom edge.
       for (size_t cy = 0; cy + 16 <= rect.ysize(); cy += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT256X128, bx, by, /*cx=*/0, cy, stride, config,
+            AcStrategyType::DCT128X256, bx, by, /*cx=*/0, cy, stride, config,
             cmap, ac_strategy, entropy_mul256X128, /*candidate_priority=*/9,
             &priority[0], entropy_estimate, block, scratch_space, quantized));
       }
     } else if (rect.xsize() >= 16 && rect.ysize() >= 32) {
-      // Transposed counterpart for a group clipped at its right edge.
+      // DCT256x128 is 16 blocks wide and 32 blocks high in the strategy map.
+      // It is the transposed orientation for a group clipped at its right edge.
       for (size_t cx = 0; cx + 16 <= rect.xsize(); cx += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT128X256, bx, by, cx, /*cy=*/0, stride, config,
+            AcStrategyType::DCT256X128, bx, by, cx, /*cy=*/0, stride, config,
             cmap, ac_strategy, entropy_mul256X128, /*candidate_priority=*/9,
             &priority[0], entropy_estimate, block, scratch_space, quantized));
       }

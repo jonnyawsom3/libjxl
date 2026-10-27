@@ -852,7 +852,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   static const float k8x8mul1 = -0.55;
   static const float k8x8mul2 = 1.0;
   static const float k8x8base = 1.4;
-  const float mul8x8 = k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base);
+  // A tiny bias toward retaining the locally selected 8x8 partition helps
+  // preserve detail, without changing the relative ranking of its 10 variants.
+  const float mul8x8 =
+      k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base) - 0.003f;
   for (size_t iy = 0; iy < rect.ysize(); iy++) {
     for (size_t ix = 0; ix < rect.xsize(); ix++) {
       float entropy = 0.0;
@@ -877,52 +880,46 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   static const float k8X16mul1 = -0.55;
   static const float k8X16mul2 = 0.867;
   static const float k8X16base = 1.6;
+  // The 0.8.x curve is a good baseline. Apply a very small size-dependent
+  // bias toward finer partitions: +0.005 per area doubling. This is small
+  // enough to preserve the established behavior while avoiding a sudden
+  // jump from the well-tested <=32x32 range to the speculative large blocks.
   const float entropy_mul16X8 =
-      k8X16mul2 + k8X16mul1 / (butteraugli_target + k8X16base);
+      k8X16mul2 + k8X16mul1 / (butteraugli_target + k8X16base) + 0.005f;
 
   static const float k16X16mul1 = -0.35;
   static const float k16X16mul2 = 0.80;
   static const float k16X16base = 2.0;
   const float entropy_mul16X16 =
-      k16X16mul2 + k16X16mul1 / (butteraugli_target + k16X16base);
+      k16X16mul2 + k16X16mul1 / (butteraugli_target + k16X16base) + 0.010f;
 
   static const float k32X16mul1 = -0.1;
   static const float k32X16mul2 = 0.86;
   static const float k32X16base = 2.5;
   const float entropy_mul16X32 =
-      k32X16mul2 + k32X16mul1 / (butteraugli_target + k32X16base);
+      k32X16mul2 + k32X16mul1 / (butteraugli_target + k32X16base) + 0.015f;
 
-  const float entropy_mul32X32 = 0.94f;
-
-  // The 0.8.x heuristic was fitted only through 32x32. Do not use the
-  // 64x64-and-larger constants from the newer heuristic: those values were
-  // not fitted with, or validated against, the restored entropy estimator.
-  //
-  // Estimate the missing 4:1 transform weight in log2-size space. The size
-  // increment is measured at two neighboring scales (16x16 -> 32x16 and
-  // 16x32 -> 32x32); averaging the two avoids letting a single noisy edge
-  // determine the 32x8 / 8x32 penalty.
+  // 32x32 is also part of the well-performing 0.8.x range; adjust it only
+  // slightly. The following 4:1 weight is interpolated from adjacent size
+  // steps, rather than assigned an independent hand-tuned multiplier.
+  const float entropy_mul32X32 = 0.96f;
   const float width_step_at_16 = entropy_mul16X32 - entropy_mul16X16;
   const float width_step_at_32 = entropy_mul32X32 - entropy_mul16X32;
   const float entropy_mul32X8 =
       entropy_mul16X8 + 0.5f * (width_step_at_16 + width_step_at_32);
 
-  // Extrapolate the last measured log-dimension step beyond 32x32. Each
-  // increment represents one doubling of one transform axis, derived solely
-  // from the fitted 16x32 and 32x32 weights. This adds a gradually increasing
-  // cost for larger transforms so a 128x128 or 256x256 block must demonstrate
-  // enough entropy reduction to compensate for the larger footprint. These
-  // weights are explicit extrapolations, not fitted/validated coefficients.
-  const float large_axis_step = entropy_mul32X32 - entropy_mul16X32;
-  const float entropy_mul64X32 = entropy_mul32X32 + large_axis_step;
-  const float entropy_mul64X64 = entropy_mul32X32 + 2.0f * large_axis_step;
-  const float entropy_mul128X64 = entropy_mul32X32 + 3.0f * large_axis_step;
-  const float entropy_mul128X128 =
-      entropy_mul32X32 + 4.0f * large_axis_step;
-  const float entropy_mul256X128 =
-      entropy_mul32X32 + 5.0f * large_axis_step;
-  const float entropy_mul256X256 =
-      entropy_mul32X32 + 6.0f * large_axis_step;
+  // The 0.8.x fitted values stop at 32x32. The previous interpolation made
+  // 64x32 and larger transforms too easy to select in the block-map comparison.
+  // Use a conservative 64x32 starting penalty and increase it by 0.5 for each
+  // doubling of transform area. These are explicit quality-oriented priors,
+  // not measured or fitted coefficients; they make very large blocks prove a
+  // stronger entropy advantage over the finer partition.
+  const float entropy_mul64X32 = 2.0f;
+  const float entropy_mul64X64 = entropy_mul64X32 + 0.5f;
+  const float entropy_mul128X64 = entropy_mul64X64 + 0.5f;
+  const float entropy_mul128X128 = entropy_mul128X64 + 0.5f;
+  const float entropy_mul256X128 = entropy_mul128X128 + 0.5f;
+  const float entropy_mul256X256 = entropy_mul256X128 + 0.5f;
 
   const MergeTry kTransformsForMerge[] = {
       {AcStrategyType::DCT16X8, 2, 4, 5, entropy_mul16X8},
@@ -1129,21 +1126,22 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         }
       }
     } else if (rect.xsize() >= 32 && rect.ysize() >= 16) {
-      // DCT256x128 is 32 blocks wide and 16 blocks high in the strategy map.
-      // It is the orientation that fits a group clipped at its bottom edge.
+      // DCT128x256 covers 32 blocks horizontally and 16 vertically in the
+      // strategy map (the dimensions in DctSelect are row-major).
+      // It fits a group clipped at its bottom edge.
       for (size_t cy = 0; cy + 16 <= rect.ysize(); cy += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT256X128, bx, by, /*cx=*/0, cy, stride,
+            AcStrategyType::DCT128X256, bx, by, /*cx=*/0, cy, stride,
             rect.ysize(), config, cmap, ac_strategy, entropy_mul256X128,
             /*candidate_priority=*/9, &priority[0], entropy_estimate, block,
             scratch_space, quantized));
       }
     } else if (rect.xsize() >= 16 && rect.ysize() >= 32) {
-      // DCT128x256 is 16 blocks wide and 32 blocks high in the strategy map.
-      // It is the orientation that fits a group clipped at its right edge.
+      // DCT256x128 covers 16 blocks horizontally and 32 vertically in the
+      // strategy map. It fits a group clipped at its right edge.
       for (size_t cx = 0; cx + 16 <= rect.xsize(); cx += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT128X256, bx, by, cx, /*cy=*/0, stride,
+            AcStrategyType::DCT256X128, bx, by, cx, /*cy=*/0, stride,
             rect.ysize(), config, cmap, ac_strategy, entropy_mul256X128,
             /*candidate_priority=*/9, &priority[0], entropy_estimate, block,
             scratch_space, quantized));

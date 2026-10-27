@@ -582,13 +582,22 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
 // bx, by is the AC-strategy region origin in 8x8-block coordinates.
 // cx, cy is the candidate transform's top-left block within that region.
 Status TryMergeAcs(AcStrategyType acs_raw, size_t bx, size_t by, size_t cx,
-                   size_t cy, size_t stride, const ACSConfig& config,
+                   size_t cy, size_t stride, size_t height,
+                   const ACSConfig& config,
                    const ColorCorrelationMap& cmap,
                    AcStrategyImage* JXL_RESTRICT ac_strategy,
                    const float entropy_mul, const uint8_t candidate_priority,
                    uint8_t* priority, float* JXL_RESTRICT entropy_estimate,
                    float* block, float* scratch_space, uint32_t* quantized) {
   AcStrategy acs = AcStrategy::FromRawStrategy(acs_raw);
+  // The transform footprint must fit the current AC group. In particular,
+  // edge groups can be shorter than 256 pixels; do not index the local
+  // entropy/priority maps with a full-size candidate that extends past them.
+  if (cx > stride || cy > height ||
+      acs.covered_blocks_x() > stride - cx ||
+      acs.covered_blocks_y() > height - cy) {
+    return true;
+  }
   float entropy_current = 0;
   for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
     for (size_t ix = 0; ix < acs.covered_blocks_x(); ++ix) {
@@ -680,13 +689,19 @@ AcStrategyType AcsHorizontalSplit(size_t blocks) {
 // of blocks X blocks size, where a block is 8x8 pixels.
 Status FindBestFirstLevelDivisionForSquare(
     size_t blocks, bool allow_square_transform, size_t bx, size_t by, size_t cx,
-    size_t cy, size_t stride, const ACSConfig& config,
+    size_t cy, size_t stride, size_t height, const ACSConfig& config,
     const ColorCorrelationMap& cmap, AcStrategyImage* JXL_RESTRICT ac_strategy,
     const float entropy_mul_JXK,
     const float entropy_mul_JXJ, float* JXL_RESTRICT entropy_estimate,
     float* block, float* scratch_space, uint32_t* quantized) {
   // We denote J for the larger dimension here, and K for the smaller.
   // For example, for 32x32 block splitting, J would be 32, K 16.
+  // Never evaluate a candidate whose square footprint extends beyond this
+  // group's local maps. This matters for partial image-edge groups.
+  if (cx > stride || cy > height || blocks > stride - cx ||
+      blocks > height - cy) {
+    return true;
+  }
   const size_t blocks_half = blocks / 2;
   const AcStrategyType acs_rawJXK = AcsVerticalSplit(blocks);
   const AcStrategyType acs_rawKXJ = AcsHorizontalSplit(blocks);
@@ -981,31 +996,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               if (a.cy != b.cy) return a.cy < b.cy;
               return a.cx < b.cx;
             });
-  for (size_t i = 0; i < elongated_candidates.size(); ++i) {
-    const ElongatedCandidate& candidate = elongated_candidates[i];
-    const AcStrategy acs = AcStrategy::FromRawStrategy(candidate.type);
-    bool overlaps = false;
-    float entropy_current = 0.0f;
-    for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
-      for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
-        const size_t index = (candidate.cy + dy) * stride + candidate.cx + dx;
-        overlaps |= priority[index] >= 1;
-        entropy_current += entropy_estimate[index];
-      }
-    }
-    if (overlaps || candidate.entropy >= entropy_current) continue;
-    for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
-      for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
-        const size_t index = (candidate.cy + dy) * stride + candidate.cx + dx;
-        priority[index] = 1;
-        entropy_estimate[index] = 0.0f;
-      }
-    }
-    JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + candidate.cx,
-                                         by + candidate.cy, candidate.type));
-    entropy_estimate[candidate.cy * stride + candidate.cx] =
-        candidate.entropy;
-  }
+  // Acceptance is deferred until all aligned larger-block candidates have
+  // been considered. A floating 4:1 candidate may otherwise be partially
+  // overwritten by a later 16x8 / 16x32 merge, leaving an invalid AC-strategy
+  // map (the root of the 4:1 transform survives only in part of its footprint).
   bool enable_32x32 = cparams.decoding_speed_tier < 4;
   for (auto mt : kTransformsForMerge) {
     if (mt.decoding_speed_tier_max_limit < cparams.decoding_speed_tier ||
@@ -1023,8 +1017,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           if (mt.type == AcStrategyType::DCT64X128) {
             if ((cy | cx) % 16 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  16, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-                  mt.entropy_mul, entropy_mul128X128,
+                  16, true, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+                  ac_strategy, mt.entropy_mul, entropy_mul128X128,
                   entropy_estimate, block, scratch_space, quantized));
             }
             continue;
@@ -1039,9 +1033,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // aligned 8x8 regions. Floating placements are tried below.
             if ((cy | cx) % 8 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  8, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-                  mt.entropy_mul, entropy_mul64X64, entropy_estimate, block,
-                  scratch_space, quantized));
+                  8, true, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+                  ac_strategy, mt.entropy_mul, entropy_mul64X64, entropy_estimate,
+                  block, scratch_space, quantized));
               continue;
             }
           } else if (mt.type == AcStrategyType::DCT64X32 &&
@@ -1065,8 +1059,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 4 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  4, enable_32x32, bx, by, cx, cy, stride, config, cmap,
-                  ac_strategy, mt.entropy_mul, entropy_mul32X32,
+                  4, enable_32x32, bx, by, cx, cy, stride, rect.ysize(), config,
+                  cmap, ac_strategy, mt.entropy_mul, entropy_mul32X32,
                   entropy_estimate, block, scratch_space, quantized));
             }
             continue;
@@ -1088,9 +1082,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             // We handle both DCT8X16 and DCT16X8 at the same time.
             if ((cy | cx) % 2 == 0) {
               JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-                  2, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-                  mt.entropy_mul, entropy_mul16X16, entropy_estimate, block,
-                  scratch_space, quantized));
+                  2, true, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+                  ac_strategy, mt.entropy_mul, entropy_mul16X16, entropy_estimate,
+                  block, scratch_space, quantized));
             }
             continue;
           } else if (mt.type == AcStrategyType::DCT16X8) {
@@ -1111,10 +1105,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         // when there is an odd number of 8x8 blocks, then the last row
         // and column will get their DCT16X8s and DCT8X16s through the
         // normal integral transform merging process.
-        JXL_RETURN_IF_ERROR(
-            TryMergeAcs(mt.type, bx, by, cx, cy, stride, config, cmap,
-                        ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
-                        entropy_estimate, block, scratch_space, quantized));
+        JXL_RETURN_IF_ERROR(TryMergeAcs(
+            mt.type, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+            ac_strategy, mt.entropy_mul, mt.priority, &priority[0],
+            entropy_estimate, block, scratch_space, quantized));
       }
     }
   }
@@ -1129,30 +1123,72 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       for (size_t cy = 0; cy + 32 <= rect.ysize(); cy += 32) {
         for (size_t cx = 0; cx + 32 <= rect.xsize(); cx += 32) {
           JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-              32, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-              entropy_mul256X128, entropy_mul256X256, entropy_estimate, block,
-              scratch_space, quantized));
+              32, true, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+              ac_strategy, entropy_mul256X128, entropy_mul256X256,
+              entropy_estimate, block, scratch_space, quantized));
         }
       }
     } else if (rect.xsize() >= 32 && rect.ysize() >= 16) {
-      // DCT128x256 is 32 blocks wide and 16 blocks high in the strategy map.
+      // DCT256x128 is 32 blocks wide and 16 blocks high in the strategy map.
       // It is the orientation that fits a group clipped at its bottom edge.
       for (size_t cy = 0; cy + 16 <= rect.ysize(); cy += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT128X256, bx, by, /*cx=*/0, cy, stride, config,
-            cmap, ac_strategy, entropy_mul256X128, /*candidate_priority=*/9,
-            &priority[0], entropy_estimate, block, scratch_space, quantized));
+            AcStrategyType::DCT256X128, bx, by, /*cx=*/0, cy, stride,
+            rect.ysize(), config, cmap, ac_strategy, entropy_mul256X128,
+            /*candidate_priority=*/9, &priority[0], entropy_estimate, block,
+            scratch_space, quantized));
       }
     } else if (rect.xsize() >= 16 && rect.ysize() >= 32) {
-      // DCT256x128 is 16 blocks wide and 32 blocks high in the strategy map.
-      // It is the transposed orientation for a group clipped at its right edge.
+      // DCT128x256 is 16 blocks wide and 32 blocks high in the strategy map.
+      // It is the orientation that fits a group clipped at its right edge.
       for (size_t cx = 0; cx + 16 <= rect.xsize(); cx += 16) {
         JXL_RETURN_IF_ERROR(TryMergeAcs(
-            AcStrategyType::DCT256X128, bx, by, cx, /*cy=*/0, stride, config,
-            cmap, ac_strategy, entropy_mul256X128, /*candidate_priority=*/9,
-            &priority[0], entropy_estimate, block, scratch_space, quantized));
+            AcStrategyType::DCT128X256, bx, by, cx, /*cy=*/0, stride,
+            rect.ysize(), config, cmap, ac_strategy, entropy_mul256X128,
+            /*candidate_priority=*/9, &priority[0], entropy_estimate, block,
+            scratch_space, quantized));
       }
     }
+  }
+
+  // Commit the floating 4:1 candidates only after the aligned hierarchy has
+  // finished. A candidate may replace complete smaller transforms, but it
+  // must never cut through an already selected transform (including a larger
+  // square/rectangle). Check all four boundaries before touching either the
+  // strategy map or the local entropy/priority arrays.
+  for (size_t i = 0; i < elongated_candidates.size(); ++i) {
+    const ElongatedCandidate& candidate = elongated_candidates[i];
+    const AcStrategy acs = AcStrategy::FromRawStrategy(candidate.type);
+    const size_t x0 = bx + candidate.cx;
+    const size_t y0 = by + candidate.cy;
+    const size_t x1 = x0 + acs.covered_blocks_x();
+    const size_t y1 = y0 + acs.covered_blocks_y();
+    if (MultiBlockTransformCrossesHorizontalBoundary(
+            *ac_strategy, x0, y0, x1) ||
+        MultiBlockTransformCrossesHorizontalBoundary(
+            *ac_strategy, x0, y1, x1) ||
+        MultiBlockTransformCrossesVerticalBoundary(*ac_strategy, x0, y0, y1) ||
+        MultiBlockTransformCrossesVerticalBoundary(*ac_strategy, x1, y0, y1)) {
+      continue;
+    }
+    float entropy_current = 0.0f;
+    for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
+      for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
+        entropy_current += entropy_estimate[(candidate.cy + dy) * stride +
+                                            candidate.cx + dx];
+      }
+    }
+    if (candidate.entropy >= entropy_current) continue;
+    for (size_t dy = 0; dy < acs.covered_blocks_y(); ++dy) {
+      for (size_t dx = 0; dx < acs.covered_blocks_x(); ++dx) {
+        const size_t index = (candidate.cy + dy) * stride + candidate.cx + dx;
+        priority[index] = 9;
+        entropy_estimate[index] = 0.0f;
+      }
+    }
+    JXL_RETURN_IF_ERROR(ac_strategy->Set(x0, y0, candidate.type));
+    entropy_estimate[candidate.cy * stride + candidate.cx] =
+        candidate.entropy;
   }
 
   if (cparams.speed_tier >= SpeedTier::kHare) {
@@ -1164,9 +1200,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     for (size_t cx = 0; cx + 1 < rect.xsize(); ++cx) {
       if ((cy | cx) % 2 != 0) {
         JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-            2, true, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-            entropy_mul16X8, entropy_mul16X16, entropy_estimate, block,
-            scratch_space, quantized));
+            2, true, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+            ac_strategy, entropy_mul16X8, entropy_mul16X16, entropy_estimate,
+            block, scratch_space, quantized));
       }
     }
   }
@@ -1178,9 +1214,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         continue;  // Already tried with loop above (DCT16X32 case).
       }
       JXL_RETURN_IF_ERROR(FindBestFirstLevelDivisionForSquare(
-          4, enable_32x32, bx, by, cx, cy, stride, config, cmap, ac_strategy,
-          entropy_mul16X32, entropy_mul32X32, entropy_estimate, block,
-          scratch_space, quantized));
+          4, enable_32x32, bx, by, cx, cy, stride, rect.ysize(), config, cmap,
+          ac_strategy, entropy_mul16X32, entropy_mul32X32, entropy_estimate,
+          block, scratch_space, quantized));
     }
   }
   return true;

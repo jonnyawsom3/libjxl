@@ -1169,9 +1169,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                           1.0f, &initial_quant_masking,
                           &initial_quant_masking1x1));
     if (!streaming_mode) {
-      // libjxl 0.8.x derives the global quantizer scale from the actual AQ
-      // field's median and MAD. The fixed estimate is retained for streamed
-      // groups because their local field is not a whole-frame distribution.
+      // 0.8.x derives the global scale from the actual whole-frame AQ field.
+      // Keep main's fixed estimate for streamed rectangles.
       JXL_RETURN_IF_ERROR(
           quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
     } else {
@@ -1259,10 +1258,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
-  // In 0.8.x, DC CfL was fitted globally after every tile had populated the
-  // frame's DC coefficient buffer. Preserve that scope only when this really
-  // is a buffered full-frame encode; never fit independent chunk-local DC
-  // correlations for streamed encoding.
+  // Restore the 0.8.x frame-global DC CfL fit only when ComputeTile has
+  // accumulated coefficients from the full frame, never from a single group.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
       cparams.speed_tier <= SpeedTier::kHare) {
     JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(

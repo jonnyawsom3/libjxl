@@ -52,8 +52,6 @@ struct CfLHeuristics {
                      const ImageI* raw_quant_field, const Quantizer* quantizer,
                      bool fast, size_t thread, ColorCorrelationMap* cmap);
 
-  // Fit frame-global DC correlation after all full-frame tiles are complete.
-  // Not used by the streamed per-DC-group path.
   Status ComputeDC(bool fast, ColorCorrelationMap* cmap);
 
   JxlMemoryManager* memory_manager;

@@ -149,34 +149,22 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     x = -GetLane(SumOfLanes(df, cb)) /
         (GetLane(SumOfLanes(df, ca)) + num * distance_mul * 0.5f);
   } else {
-    // Match libjxl 0.8.x's finite-difference scale and stabilizer. These
-    // constants belong to this residual objective and should not be mixed with
-    // the friend's weighted-L1 CfL objective.
-    constexpr float eps = 100.0f;
+    constexpr float eps = 1;
     constexpr float kClamp = 20.0f;
-    constexpr float kDerivativeStabilizer = 0.85f;
     CFLFunction fn(values_m, values_s, num, base, distance_mul);
     x = 0;
     // Up to 20 Newton iterations, with approximate derivatives.
+    // Derivatives are approximate due to the high amount of noise in the exact
+    // derivatives.
     for (size_t i = 0; i < 20; i++) {
       float dfpeps;
       float dfmeps;
-      const float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
-      const float ddf = (dfpeps - dfmeps) / (2 * eps);
-      const float step = d_f / (ddf + kDerivativeStabilizer);
+      float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
+      float ddf = (dfpeps - dfmeps) / (2 * eps);
+      float step = d_f / ddf;
       x -= std::min(kClamp, std::max(-kClamp, step));
       if (std::abs(step) < 3e-3) break;
     }
-  }
-  // The 0.8.x shrink-to-zero heuristic was measured to improve density and
-  // suppress chroma oscillation for weak AC correlations.
-  constexpr float kTowardZero = 2.6f;
-  if (x >= kTowardZero) {
-    x -= kTowardZero;
-  } else if (x <= -kTowardZero) {
-    x += kTowardZero;
-  } else {
-    x = 0.0f;
   }
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
@@ -345,9 +333,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   return true;
 }
 
-// Frame-global DC correlation fitting from 0.8.x. This must only be invoked
-// after every tile has populated dc_values; the caller keeps it disabled for
-// streamed DC groups, which are not a whole-frame sample.
+// Frame-global DC correlation fitting from libjxl 0.8.x. The caller invokes
+// this only after all full-frame tiles have populated dc_values.
 void ComputeDC(const ImageF& dc_values, bool fast, int32_t* dc_x,
                int32_t* dc_b) {
   constexpr float kDistanceMultiplierDC = 1e-5f;

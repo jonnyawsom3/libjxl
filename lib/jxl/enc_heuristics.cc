@@ -62,7 +62,102 @@
 #include "lib/jxl/quant_weights.h"
 #include "lib/jxl/render_pipeline/render_pipeline.h"
 
+
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "lib/jxl/enc_heuristics.cc"
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
+
+HWY_BEFORE_NAMESPACE();
 namespace jxl {
+namespace HWY_NAMESPACE {
+namespace {
+
+// SIMD version of the 0.8.x local 3x3-Laplacian estimate. The previous port
+// performed this pixel loop scalarly across the supplied frame/rect, which was
+// a large avoidable cost in the EPF control-field path.
+using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::LoadU;
+using hwy::HWY_NAMESPACE::Mul;
+using hwy::HWY_NAMESPACE::MulAdd;
+using hwy::HWY_NAMESPACE::Set;
+using hwy::HWY_NAMESPACE::StoreU;
+using hwy::HWY_NAMESPACE::Zero;
+
+void ComputeARLaplacianSqrsum(const Image3F& opsin, ImageF* out) {
+  const size_t width = opsin.xsize();
+  const size_t height = opsin.ysize();
+  if (width == 0 || height == 0) return;
+
+  static constexpr float kChannelWeights[3] = {4.35f, 4.35f, 0.287f};
+  static constexpr float kChannelWeightsLapNeg[3] = {
+      -0.125f * kChannelWeights[0], -0.125f * kChannelWeights[1],
+      -0.125f * kChannelWeights[2]};
+  HWY_FULL(float) df;
+
+  for (size_t y = 0; y < height; ++y) {
+    const size_t py = y > 0 ? y - 1 : y;
+    const size_t ny = y + 1 < height ? y + 1 : y;
+    const float* JXL_RESTRICT row_t[3];
+    const float* JXL_RESTRICT row[3];
+    const float* JXL_RESTRICT row_b[3];
+    for (size_t c = 0; c < 3; ++c) {
+      row_t[c] = opsin.ConstPlaneRow(c, py);
+      row[c] = opsin.ConstPlaneRow(c, y);
+      row_b[c] = opsin.ConstPlaneRow(c, ny);
+    }
+    float* JXL_RESTRICT out_row = out->Row(y);
+
+    const auto scalar = [&](size_t x) {
+      const size_t px = x > 0 ? x - 1 : x;
+      const size_t nx = x + 1 < width ? x + 1 : x;
+      float sum_squares = 0.0f;
+      for (size_t c = 0; c < 3; ++c) {
+        const float neighbors =
+            row_t[c][px] + row_t[c][x] + row_t[c][nx] + row[c][px] +
+            row[c][nx] + row_b[c][px] + row_b[c][x] + row_b[c][nx];
+        const float lap = kChannelWeights[c] * row[c][x] +
+                          kChannelWeightsLapNeg[c] * neighbors;
+        sum_squares += lap * lap;
+      }
+      out_row[x] = sum_squares;
+    };
+
+    scalar(0);
+    size_t x = 1;
+    for (; x + Lanes(df) <= width - 1; x += Lanes(df)) {
+      auto sum_squares = Zero(df);
+      for (size_t c = 0; c < 3; ++c) {
+        auto lap = Mul(LoadU(df, row[c] + x), Set(df, kChannelWeights[c]));
+        auto sum_oth0 = LoadU(df, row[c] + x - 1);
+        auto sum_oth1 = LoadU(df, row[c] + x + 1);
+        auto sum_oth2 = LoadU(df, row_t[c] + x - 1);
+        auto sum_oth3 = LoadU(df, row_t[c] + x);
+        sum_oth0 = Add(sum_oth0, LoadU(df, row_t[c] + x + 1));
+        sum_oth1 = Add(sum_oth1, LoadU(df, row_b[c] + x - 1));
+        sum_oth2 = Add(sum_oth2, LoadU(df, row_b[c] + x));
+        sum_oth3 = Add(sum_oth3, LoadU(df, row_b[c] + x + 1));
+        sum_oth0 = Add(sum_oth0, sum_oth1);
+        sum_oth2 = Add(sum_oth2, sum_oth3);
+        sum_oth0 = Add(sum_oth0, sum_oth2);
+        lap = MulAdd(Set(df, kChannelWeightsLapNeg[c]), sum_oth0, lap);
+        sum_squares = MulAdd(lap, lap, sum_squares);
+      }
+      StoreU(sum_squares, df, out_row + x);
+    }
+    for (; x < width; ++x) scalar(x);
+  }
+}
+
+}  // namespace
+}  // namespace HWY_NAMESPACE
+}  // namespace jxl
+HWY_AFTER_NAMESPACE();
+
+#if HWY_ONCE
+namespace jxl {
+
+HWY_EXPORT(ComputeARLaplacianSqrsum);
 
 struct AuxOut;
 
@@ -854,47 +949,13 @@ StatusOr<Image3F> ReconstructImage(
   return std::move(*decoded.color());
 }
 
-float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
-                             const ImageF& mask1x1, size_t by, size_t bx) {
-  Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
-            a.ysize());
-  float err2[3] = {0.0f};
-  for (size_t y = 0; y < rect.ysize(); ++y) {
-    const float* row_a[3] = {
-        rect.ConstPlaneRow(a, 0, y),
-        rect.ConstPlaneRow(a, 1, y),
-        rect.ConstPlaneRow(a, 2, y),
-    };
-    const float* row_b[3] = {
-        rect.ConstPlaneRow(b, 0, y),
-        rect.ConstPlaneRow(b, 1, y),
-        rect.ConstPlaneRow(b, 2, y),
-    };
-    const float* row_mask = rect.ConstRow(mask1x1, y);
-    for (size_t x = 0; x < rect.xsize(); ++x) {
-      float mask = row_mask[x];
-      float mask2 = mask * mask;
-      for (int i = 0; i < 3; ++i) {
-        float diff = row_a[i][x] - row_b[i][x];
-        err2[i] += mask2 * diff * diff;
-      }
-    }
-  }
-  static const double kW[] = {
-      12.339445295782363,
-      1.0,
-      0.2,
-  };
-  float retval = kW[0] * err2[0] + kW[1] * err2[1] + kW[2] * err2[2];
-  return retval;
-}
-
 Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
                            ThreadPool* pool) {
   static_cast<void>(rect);
   static_cast<void>(pool);
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
   const CompressParams& cparams = enc_state->cparams;
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
@@ -923,33 +984,13 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     return true;
   }
 
-  // Squared 3x3 Laplacian, using the weights in the original 0.8.x control
-  // field heuristic.
-  const float channel_weights[3] = {4.35f, 4.35f, 0.287f};
-  std::vector<float> laplacian_sqrsum(width * height, 0.0f);
-  const auto pixel = [&](size_t c, size_t x, size_t y) {
-    return orig_opsin.ConstPlaneRow(c, y)[x];
-  };
-  for (size_t y = 0; y < height; ++y) {
-    const size_t py = y > 0 ? y - 1 : y;
-    const size_t ny = y + 1 < height ? y + 1 : y;
-    for (size_t x = 0; x < width; ++x) {
-      const size_t px = x > 0 ? x - 1 : x;
-      const size_t nx = x + 1 < width ? x + 1 : x;
-      float sum = 0.0f;
-      for (size_t c = 0; c < 3; ++c) {
-        const float w = channel_weights[c];
-        const float center = pixel(c, x, y);
-        const float neighbors =
-            pixel(c, px, py) + pixel(c, x, py) + pixel(c, nx, py) +
-            pixel(c, px, y) + pixel(c, nx, y) + pixel(c, px, ny) +
-            pixel(c, x, ny) + pixel(c, nx, ny);
-        const float lap = w * center - (w * 0.125f) * neighbors;
-        sum += lap * lap;
-      }
-      laplacian_sqrsum[y * width + x] = sum;
-    }
-  }
+  // Use SIMD for the pixel-domain Laplacian. This preserves the old 0.8.x
+  // weights while avoiding the scalar full-frame pass in the previous port.
+  ImageF laplacian_sqrsum;
+  JXL_ASSIGN_OR_RETURN(
+      laplacian_sqrsum, ImageF::Create(memory_manager, width, height));
+  HWY_DYNAMIC_DISPATCH(ComputeARLaplacianSqrsum)(orig_opsin,
+                                                  &laplacian_sqrsum);
 
   const size_t grid_x = 2 * blocks_x;
   const size_t grid_y = 2 * blocks_y;
@@ -967,7 +1008,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     float sum = 0.0f;
     for (size_t y = sy; y < ey; ++y) {
       for (size_t x = sx; x < ex; ++x) {
-        sum += laplacian_sqrsum[y * width + x];
+        sum += laplacian_sqrsum.Row(y)[x];
       }
     }
     return std::sqrt(sum / static_cast<float>((ex - sx) * (ey - sy)));
@@ -1077,7 +1118,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
-  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
@@ -1150,12 +1190,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
-    if (cparams.disable_perceptual_optimizations) {
-      JXL_ASSIGN_OR_RETURN(
-          initial_quant_masking1x1,
-          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
-      FillImage(masking, &initial_quant_masking1x1);
-    }
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   } else {
     // Call this here, as it relies on pre-gaborish values.
@@ -1166,10 +1200,16 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1));
-    float q = 0.39 / cparams.butteraugli_distance;
-    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+                          1.0f, &initial_quant_masking));
+    if (!streaming_mode) {
+      // libjxl 0.8.x calibrates the global scale from the actual AQ field.
+      // This is only valid for a complete frame, not an individual streamed group.
+      JXL_RETURN_IF_ERROR(
+          quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
+    } else {
+      const float q = 0.39f / cparams.butteraugli_distance;
+      quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+    }
   }
 
   // TODO(veluca): do something about animations.
@@ -1194,8 +1234,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking,
-                                          initial_quant_masking1x1, &matrices));
+                                          initial_quant_masking, &matrices));
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
@@ -1251,6 +1290,14 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 
+  // The 0.8.x encoder fitted DC CfL multipliers over the complete frame. Do
+  // not fit chunk-local statistics in streamed encoding.
+  if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
+      cparams.speed_tier <= SpeedTier::kHare) {
+    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
+        cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+  }
+
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
     ImageB& epf_sharpness = shared.epf_sharpness;
@@ -1269,3 +1316,4 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 }
 
 }  // namespace jxl
+#endif  // HWY_ONCE

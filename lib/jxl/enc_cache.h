@@ -71,8 +71,6 @@ struct PassesEncoderState {
   float x_qm_multiplier = 1.0f;
   float b_qm_multiplier = 1.0f;
 
-  ImageF initial_quant_masking1x1;
-
   JxlMemoryManager* memory_manager() const { return shared.memory_manager; }
 };
 

@@ -1007,7 +1007,6 @@ HWY_EXPORT(ProcessRectACS);
 
 Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
                                   const ImageF& quant_field, const ImageF& mask,
-                                  const ImageF& mask1x1,
                                   DequantMatrices* matrices) {
   config.dequant = matrices;
 
@@ -1031,12 +1030,6 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
     config.masking_field_row = mask.Row(0);
     config.masking_field_stride = mask.PixelsPerRow();
   }
-  config.mask1x1_xsize = mask1x1.xsize();
-  if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
-    config.masking1x1_field_row = mask1x1.Row(0);
-    config.masking1x1_field_stride = mask1x1.PixelsPerRow();
-  }
-
   config.src_rows[0] = rect_in.ConstPlaneRow(src, 0, 0);
   config.src_rows[1] = rect_in.ConstPlaneRow(src, 1, 0);
   config.src_rows[2] = rect_in.ConstPlaneRow(src, 2, 0);

@@ -854,41 +854,6 @@ StatusOr<Image3F> ReconstructImage(
   return std::move(*decoded.color());
 }
 
-float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
-                             const ImageF& mask1x1, size_t by, size_t bx) {
-  Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
-            a.ysize());
-  float err2[3] = {0.0f};
-  for (size_t y = 0; y < rect.ysize(); ++y) {
-    const float* row_a[3] = {
-        rect.ConstPlaneRow(a, 0, y),
-        rect.ConstPlaneRow(a, 1, y),
-        rect.ConstPlaneRow(a, 2, y),
-    };
-    const float* row_b[3] = {
-        rect.ConstPlaneRow(b, 0, y),
-        rect.ConstPlaneRow(b, 1, y),
-        rect.ConstPlaneRow(b, 2, y),
-    };
-    const float* row_mask = rect.ConstRow(mask1x1, y);
-    for (size_t x = 0; x < rect.xsize(); ++x) {
-      float mask = row_mask[x];
-      float mask2 = mask * mask;
-      for (int i = 0; i < 3; ++i) {
-        float diff = row_a[i][x] - row_b[i][x];
-        err2[i] += mask2 * diff * diff;
-      }
-    }
-  }
-  static const double kW[] = {
-      12.339445295782363,
-      1.0,
-      0.2,
-  };
-  float retval = kW[0] * err2[0] + kW[1] * err2[1] + kW[2] * err2[2];
-  return retval;
-}
-
 Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
@@ -1077,7 +1042,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
-  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
@@ -1150,12 +1114,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     FillImage(q, &initial_quant_field);
     float masking = 1.0f / (q + 0.001f);
     FillImage(masking, &initial_quant_masking);
-    if (cparams.disable_perceptual_optimizations) {
-      JXL_ASSIGN_OR_RETURN(
-          initial_quant_masking1x1,
-          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
-      FillImage(masking, &initial_quant_masking1x1);
-    }
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   } else {
     // Call this here, as it relies on pre-gaborish values.
@@ -1166,17 +1124,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1));
-    if (!streaming_mode) {
-      // 0.8.x derives the global scale from the actual whole-frame AQ field.
-      // Keep main's fixed estimate for streamed rectangles.
-      JXL_RETURN_IF_ERROR(
-          quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
-    } else {
-      const float q = 0.39f / cparams.butteraugli_distance;
-      quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
-    }
+                          1.0f, &initial_quant_masking));
+    float q = 0.39 / cparams.butteraugli_distance;
+    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
 
   // TODO(veluca): do something about animations.
@@ -1201,8 +1151,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking,
-                                          initial_quant_masking1x1, &matrices));
+                                          initial_quant_masking, &matrices));
 
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
     size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
@@ -1257,14 +1206,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
-
-  // Restore the 0.8.x frame-global DC CfL fit only when ComputeTile has
-  // accumulated coefficients from the full frame, never from a single group.
-  if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
-      cparams.speed_tier <= SpeedTier::kHare) {
-    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
-        cparams.speed_tier >= SpeedTier::kWombat, &cmap));
-  }
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {

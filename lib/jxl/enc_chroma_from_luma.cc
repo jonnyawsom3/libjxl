@@ -333,22 +333,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   return true;
 }
 
-// Frame-global DC correlation fitting from libjxl 0.8.x. The caller invokes
-// this only after all full-frame tiles have populated dc_values.
-void ComputeDC(const ImageF& dc_values, bool fast, int32_t* dc_x,
-               int32_t* dc_b) {
-  constexpr float kDistanceMultiplierDC = 1e-5f;
-  const float* JXL_RESTRICT dc_values_yx = dc_values.Row(0);
-  const float* JXL_RESTRICT dc_values_x = dc_values.Row(1);
-  const float* JXL_RESTRICT dc_values_yb = dc_values.Row(2);
-  const float* JXL_RESTRICT dc_values_b = dc_values.Row(3);
-  *dc_x = FindBestMultiplier(dc_values_yx, dc_values_x, dc_values.xsize(),
-                             0.0f, kDistanceMultiplierDC, fast);
-  *dc_b = FindBestMultiplier(dc_values_yb, dc_values_b, dc_values.xsize(),
-                             jxl::cms::kYToBRatio, kDistanceMultiplierDC,
-                             fast);
-}
-
 // NOLINTNEXTLINE(google-readability-namespace-comments)
 }  // namespace HWY_NAMESPACE
 }  // namespace jxl
@@ -359,7 +343,6 @@ namespace jxl {
 
 HWY_EXPORT(InitDCStorage);
 HWY_EXPORT(ComputeTile);
-HWY_EXPORT(ComputeDC);
 
 Status CfLHeuristics::Init(const Rect& rect) {
   size_t xsize_blocks = rect.xsize() / kBlockDim;
@@ -381,14 +364,6 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
       fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values, scratch);
-}
-
-Status CfLHeuristics::ComputeDC(bool fast, ColorCorrelationMap* cmap) {
-  int32_t dc_x = 0;
-  int32_t dc_b = 0;
-  HWY_DYNAMIC_DISPATCH(ComputeDC)(dc_values, fast, &dc_x, &dc_b);
-  cmap->SetDCMultipliers(dc_x, dc_b);
-  return true;
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,

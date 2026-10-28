@@ -37,9 +37,6 @@ struct ACSConfig {
   size_t quant_field_stride;
   const float* JXL_RESTRICT masking_field_row;
   size_t masking_field_stride;
-  const float* JXL_RESTRICT masking1x1_field_row;
-  size_t masking1x1_field_stride;
-  size_t mask1x1_xsize;
   const float* JXL_RESTRICT src_rows[3];
   size_t src_stride;
   float info_loss_multiplier;
@@ -56,10 +53,6 @@ struct ACSConfig {
     JXL_DASSERT(masking_field_row[by * masking_field_stride + bx] > 0);
     return masking_field_row[by * masking_field_stride + bx];
   }
-  const float* MaskingPtr1x1(size_t bx, size_t by) const {
-    JXL_DASSERT(masking1x1_field_row[by * masking1x1_field_stride + bx] > 0);
-    return &masking1x1_field_row[by * masking1x1_field_stride + bx];
-  }
   float Quant(size_t bx, size_t by) const {
     JXL_DASSERT(quant_field_row[by * quant_field_stride + bx] > 0);
     return quant_field_row[by * quant_field_stride + bx];
@@ -75,7 +68,7 @@ struct AcStrategyHeuristics {
         qmem_per_thread(0) {}
   Status Init(const Image3F& src, const Rect& rect_in,
               const ImageF& quant_field, const ImageF& mask,
-              const ImageF& mask1x1, DequantMatrices* matrices);
+              DequantMatrices* matrices);
   Status PrepareForThreads(std::size_t num_threads);
   Status ProcessRect(const Rect& rect, const ColorCorrelationMap& cmap,
                      AcStrategyImage* ac_strategy, size_t thread);

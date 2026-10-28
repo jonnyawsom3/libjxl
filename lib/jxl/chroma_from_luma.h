@@ -131,6 +131,10 @@ struct ColorCorrelationMap {
 
   const ColorCorrelation& base() const { return base_; }
   Status DecodeDC(BitReader* br) { return base_.DecodeDC(br); }
+  void SetDCMultipliers(int32_t ytox_dc, int32_t ytob_dc) {
+    base_.SetYToXDC(ytox_dc);
+    base_.SetYToBDC(ytob_dc);
+  }
 
   ImageSB ytox_map;
   ImageSB ytob_map;

@@ -149,22 +149,34 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     x = -GetLane(SumOfLanes(df, cb)) /
         (GetLane(SumOfLanes(df, ca)) + num * distance_mul * 0.5f);
   } else {
-    constexpr float eps = 1;
+    // Match libjxl 0.8.x's finite-difference scale and stabilizer. These
+    // constants belong to this residual objective and should not be mixed with
+    // the friend's weighted-L1 CfL objective.
+    constexpr float eps = 100.0f;
     constexpr float kClamp = 20.0f;
+    constexpr float kDerivativeStabilizer = 0.85f;
     CFLFunction fn(values_m, values_s, num, base, distance_mul);
     x = 0;
     // Up to 20 Newton iterations, with approximate derivatives.
-    // Derivatives are approximate due to the high amount of noise in the exact
-    // derivatives.
     for (size_t i = 0; i < 20; i++) {
       float dfpeps;
       float dfmeps;
-      float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
-      float ddf = (dfpeps - dfmeps) / (2 * eps);
-      float step = d_f / ddf;
+      const float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
+      const float ddf = (dfpeps - dfmeps) / (2 * eps);
+      const float step = d_f / (ddf + kDerivativeStabilizer);
       x -= std::min(kClamp, std::max(-kClamp, step));
       if (std::abs(step) < 3e-3) break;
     }
+  }
+  // The 0.8.x shrink-to-zero heuristic was measured to improve density and
+  // suppress chroma oscillation for weak AC correlations.
+  constexpr float kTowardZero = 2.6f;
+  if (x >= kTowardZero) {
+    x -= kTowardZero;
+  } else if (x <= -kTowardZero) {
+    x += kTowardZero;
+  } else {
+    x = 0.0f;
   }
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
@@ -333,6 +345,23 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   return true;
 }
 
+// Frame-global DC correlation fitting from 0.8.x. This must only be invoked
+// after every tile has populated dc_values; the caller keeps it disabled for
+// streamed DC groups, which are not a whole-frame sample.
+void ComputeDC(const ImageF& dc_values, bool fast, int32_t* dc_x,
+               int32_t* dc_b) {
+  constexpr float kDistanceMultiplierDC = 1e-5f;
+  const float* JXL_RESTRICT dc_values_yx = dc_values.Row(0);
+  const float* JXL_RESTRICT dc_values_x = dc_values.Row(1);
+  const float* JXL_RESTRICT dc_values_yb = dc_values.Row(2);
+  const float* JXL_RESTRICT dc_values_b = dc_values.Row(3);
+  *dc_x = FindBestMultiplier(dc_values_yx, dc_values_x, dc_values.xsize(),
+                             0.0f, kDistanceMultiplierDC, fast);
+  *dc_b = FindBestMultiplier(dc_values_yb, dc_values_b, dc_values.xsize(),
+                             jxl::cms::kYToBRatio, kDistanceMultiplierDC,
+                             fast);
+}
+
 // NOLINTNEXTLINE(google-readability-namespace-comments)
 }  // namespace HWY_NAMESPACE
 }  // namespace jxl
@@ -343,6 +372,7 @@ namespace jxl {
 
 HWY_EXPORT(InitDCStorage);
 HWY_EXPORT(ComputeTile);
+HWY_EXPORT(ComputeDC);
 
 Status CfLHeuristics::Init(const Rect& rect) {
   size_t xsize_blocks = rect.xsize() / kBlockDim;
@@ -364,6 +394,14 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
       fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values, scratch);
+}
+
+Status CfLHeuristics::ComputeDC(bool fast, ColorCorrelationMap* cmap) {
+  int32_t dc_x = 0;
+  int32_t dc_b = 0;
+  HWY_DYNAMIC_DISPATCH(ComputeDC)(dc_values, fast, &dc_x, &dc_b);
+  cmap->SetDCMultipliers(dc_x, dc_b);
+  return true;
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,

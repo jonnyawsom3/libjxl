@@ -1168,8 +1168,16 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
                           1.0f, &initial_quant_masking,
                           &initial_quant_masking1x1));
-    float q = 0.39 / cparams.butteraugli_distance;
-    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+    if (!streaming_mode) {
+      // libjxl 0.8.x derives the global quantizer scale from the actual AQ
+      // field's median and MAD. The fixed estimate is retained for streamed
+      // groups because their local field is not a whole-frame distribution.
+      JXL_RETURN_IF_ERROR(
+          quantizer.SetQuantField(quant_dc, initial_quant_field, nullptr));
+    } else {
+      const float q = 0.39f / cparams.butteraugli_distance;
+      quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+    }
   }
 
   // TODO(veluca): do something about animations.
@@ -1250,6 +1258,16 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
+
+  // In 0.8.x, DC CfL was fitted globally after every tile had populated the
+  // frame's DC coefficient buffer. Preserve that scope only when this really
+  // is a buffered full-frame encode; never fit independent chunk-local DC
+  // correlations for streamed encoding.
+  if (!streaming_mode && !cparams.disable_perceptual_optimizations &&
+      cparams.speed_tier <= SpeedTier::kHare) {
+    JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeDC(
+        cparams.speed_tier >= SpeedTier::kWombat, &cmap));
+  }
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {
